@@ -55,7 +55,6 @@ if __name__ == "__main__":
         engine = DynamicInferenceEngine(
             controller,
             context,
-            termination_id=-1,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
         )

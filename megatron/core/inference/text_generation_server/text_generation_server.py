@@ -31,7 +31,6 @@ async def run_text_generation_server(
     rank = torch.distributed.get_rank()
 
     await engine.start_listening_to_data_parallel_coordinator(
-        default_sampling_params,
         inference_coordinator_port=coordinator_port,
         launch_inference_coordinator=True,
     )

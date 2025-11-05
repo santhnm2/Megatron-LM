@@ -16,6 +16,7 @@ from examples.inference.gpt.gpt_dynamic_inference import (
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server import run_text_generation_server
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
 
@@ -40,11 +41,14 @@ if __name__ == "__main__":
         layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape = (
             get_mamba_metadata_from_model(model)
         )
+        decoder = get_attr_wrapped_model(model, "decoder")
+        pp_layer_offset = getattr(decoder, "pp_layer_offset", 0)
 
         context = get_inference_context(
             requests=None,
             sampling_params=None,
             calculate_max_sequence_length_from_requests=False,
+            pp_layer_offset=pp_layer_offset,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,

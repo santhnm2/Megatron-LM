@@ -307,7 +307,6 @@ class TestDynamicInferenceEngine:
             else:
                 layer_spec = get_gpt_layer_local_spec()
 
-
             # GPT model.
             model = GPTModel(
                 config=transformer_config,
@@ -349,7 +348,7 @@ class TestDynamicInferenceEngine:
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 cuda_graph_scope=test_config.cuda_graph_scope,
             )
-        
+
             # Mamba model.
             model = MambaModel(
                 config=transformer_config,
@@ -364,7 +363,7 @@ class TestDynamicInferenceEngine:
             ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
-        
+
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)
 
@@ -395,7 +394,6 @@ class TestDynamicInferenceEngine:
             params_dtype=transformer_config.params_dtype,
             fp8=transformer_config.fp8,
             padded_vocab_size=test_config.vocab_size,
-            fp8="hybrid" if test_config.fp8 else None,
         )
 
         # Inference context.

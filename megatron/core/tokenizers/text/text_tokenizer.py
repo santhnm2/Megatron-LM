@@ -45,6 +45,9 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         else:
             self.chat_template = config.get("chat_template", None)
 
+        if self.chat_template is None and self._tokenizer.chat_template is not None:
+            self.chat_template = self._tokenizer.chat_template
+
     def _restore_model(self, **kwargs) -> MegatronTokenizerTextAbstract:
         """Returns tokenizer library object."""
 

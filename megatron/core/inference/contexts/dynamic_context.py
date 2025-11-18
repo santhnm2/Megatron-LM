@@ -500,9 +500,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Ensure valid num_cuda_graphs.
             num_cuda_graphs = min(max(num_cuda_graphs, 1), self.max_active_requests)
 
+            # Align max_active_requests to the largest multiple of TP size <= max_active_requests
+            tp_aligned_max_active_requests = (
+                math.floor(self.max_active_requests / tp_size) * tp_size
+            )
+
             # Cuda graph step size.
             cuda_graph_rounder = 8
-            self.cuda_graph_step_size = self.max_active_requests / num_cuda_graphs
+            self.cuda_graph_step_size = tp_aligned_max_active_requests / num_cuda_graphs
             self.cuda_graph_step_size = (
                 math.ceil(self.cuda_graph_step_size / cuda_graph_rounder) * cuda_graph_rounder
             )
@@ -511,17 +516,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Cuda graph token counts.
             if num_cuda_graphs == 1:
-                self.cuda_graph_token_counts = [self.max_active_requests]
+                self.cuda_graph_token_counts = [tp_aligned_max_active_requests]
             else:
                 self.cuda_graph_token_counts = list(
                     range(
                         self.cuda_graph_step_size,
-                        self.max_active_requests,
+                        tp_aligned_max_active_requests,
                         self.cuda_graph_step_size,
                     )
                 )
                 if self.cuda_graph_token_counts[-1] != self.max_active_requests:
-                    self.cuda_graph_token_counts.append(self.max_active_requests)
+                    self.cuda_graph_token_counts.append(tp_aligned_max_active_requests)
                 self.cuda_graph_token_counts.reverse()
 
             # Set used for validating active cuda graph token count.

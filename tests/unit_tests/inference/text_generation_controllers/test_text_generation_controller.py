@@ -309,7 +309,8 @@ class TestTextGenerationController:
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        self.text_generation_controller._dynamic_step_sample_logits(logits)
+        self.text_generation_controller._all_logits_cuda = logits
+        self.text_generation_controller._dynamic_step_sample_logits()
         sampled_logits = self.text_generation_controller._sampled_tokens_cuda[:batch_size]
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
@@ -852,7 +853,7 @@ class TestTextGenerationController:
 
             # Calculate top-n logprobs
             top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
-                logits, log_probs_tensor
+                log_probs_tensor
             )
 
             # Validate results
@@ -900,7 +901,7 @@ class TestTextGenerationController:
 
             # Calculate top-n logprobs
             top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
-                logits, log_probs_tensor
+                log_probs_tensor
             )
 
             # Validate results
@@ -1133,10 +1134,9 @@ class TestTextGenerationController:
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
+        self.text_generation_controller._all_logits_cuda = logits
 
-        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-            logits, input_ids
-        )
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
 
         # Verify acceptance counts
         accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
@@ -1258,10 +1258,9 @@ class TestTextGenerationController:
         # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
         # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
 
+        self.text_generation_controller._all_logits_cuda = logits
         try:
-            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-                logits, input_ids
-            )
+            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):
                 pytest.fail("MTP logits were not flattened before calling multinomial sampling.")

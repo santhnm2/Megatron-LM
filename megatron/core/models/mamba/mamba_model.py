@@ -22,6 +22,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
     process_mtp_loss,
+    roll_tensor,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -414,15 +415,36 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None and self.mtp_process:
+        if self.config.mtp_num_layers is not None:
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                # For RL: create labels and loss_mask by shifting to match SFT format.
+                mtp_labels = labels
+                mtp_loss_mask = loss_mask
+                if mtp_labels is None and input_ids is not None:
+                    # Create shifted labels: labels[i] = input_ids[i+1]
+                    mtp_labels, _ = roll_tensor(
+                        input_ids,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.pg_collection.cp,
+                        packed_seq_params=packed_seq_params,
+                    )
+                    # Also roll loss_mask to align with rolled labels
+                    if loss_mask is not None:
+                        mtp_loss_mask, _ = roll_tensor(
+                            loss_mask,
+                            shifts=-1,
+                            dims=-1,
+                            cp_group=self.pg_collection.cp,
+                            packed_seq_params=packed_seq_params,
+                        )
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
-                    labels=labels,
-                    loss_mask=loss_mask,
+                    labels=mtp_labels,
+                    loss_mask=mtp_loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
@@ -433,6 +455,7 @@ class MambaModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
+
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():

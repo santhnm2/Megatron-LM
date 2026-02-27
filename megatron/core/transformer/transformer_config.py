@@ -1099,9 +1099,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.transformer_impl == "inference_optimized":
             if self.moe_expert_capacity_factor is not None:
-                raise ValueError(
-                    "Inference-optimized MoE layers only support dropless MoE "
-                )
+                raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
             if self.moe_router_padding_for_quantization:
                 raise ValueError(
                     "Inference-optimized MoE layers do not support padded routing map for quantization."

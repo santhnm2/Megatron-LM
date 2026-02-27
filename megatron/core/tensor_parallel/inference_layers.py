@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
@@ -57,6 +58,48 @@ def _apply_linear(
     if config.fp8_recipe == "mxfp8":
         return mm_mxfp8(x, weight, **kwargs)
     return torch.matmul(x, weight.t(), **kwargs)
+
+
+class InferenceColumnParallelLinear(TEColumnParallelLinear):
+    """
+    Inference optimized version of TEColumnParallelLinear.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: TransformerConfig,
+        init_method: Callable,
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
+    ):
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
+        super().__init__(
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            gather_output=gather_output,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
+            stride=stride,
+        )
+        self.config = config
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        x = _apply_linear(x, self.weight, self.config)
+        return x, None
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):

@@ -901,7 +901,9 @@ class TextGenerationController:
             dtype=output_tokens_jumbled.dtype,
         )
         token_order = torch.cat(token_order_list, dim=0)
-        # Rearrange output tokens because previously it will be in the order of the sampling_bucket request indices, but now we want to put them according to their corresponding input ids
+        # Rearrange output tokens because previously it will be in the order of the
+        # sampling_bucket request indices, but now we want to put them according to
+        # their corresponding input ids
         output_tokens[token_order] = output_tokens_jumbled
 
         mtp_output_tokens_jumbled = torch.cat(
@@ -913,10 +915,12 @@ class TextGenerationController:
         ### ================ PART 3 This part is to do the following : ================
         # Create the accepted tokens tensor
         # For prefill it is always set to 1
-        # For decode, the first token is always accepted, then we compare with input tokens and accept the next tokens if its a match
+        # For decode, the first token is always accepted, then we compare with input tokens
+        # and accept the next tokens if its a match
         # Then find the index of the last 1 in every request of the accepted tokens tensor
         # Then these are the index of the tokens that will be sent to the next forward pass
-        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted in teh first 3 requests
+        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted
+        # in the first 3 requests
 
         # Assume input ids :                  [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |  d1    d2   | e1    e2    e3   e4]
         # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
@@ -997,10 +1001,12 @@ class TextGenerationController:
         ### ================ PART 4 This part is to do the following : ================
         # To fill the speculative tokens and accepted_token counts
         # For prefill it is always set to 1
-        # For decode, the first token is always accepted, then we compare with input tokens and accept the next tokens if its a match
+        # For decode, the first token is always accepted, then we compare with input tokens and
+        # accept the next tokens if its a match
         # Then find the index of the last 1 in every request of the accepted tokens tensor
         # Then these are the index of the tokens that will be sent to the next forward pass
-        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted in teh first 3 requests
+        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted in
+        # the first 3 requests
 
         # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
         # Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
@@ -1049,7 +1055,8 @@ class TextGenerationController:
             indices_list = []
 
             # e.g torch sample buckets will be
-            # i.e (for all unique comibnation of t, topk, topk what are the associated requests indices (based on the active slices)
+            # i.e (for all unique comibnation of t, topk, topk what are the associated
+            # requests indices (based on the active slices)
             # [ [req at index 0, req at index 2], t1, topk1, topp1 ]]
             # [ [req at index 1, req at index 3, req at index 4] , t2, topk2, topp2]
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
@@ -1373,7 +1380,7 @@ class TextGenerationController:
         mtp_logits = None
         if logits_and_mtp_logits.shape[0] > 1:
             logits = logits_and_mtp_logits[:1]  # [1, seq_len, vocab_size]
-            mtp_logits = logits_and_mtp_logits[1:]  # [num_speculative_tokens, seq_len, vocab_size]\
+            mtp_logits = logits_and_mtp_logits[1:]  # [num_speculative_tokens, seq_len, vocab_size]
         else:
             logits = logits_and_mtp_logits
 

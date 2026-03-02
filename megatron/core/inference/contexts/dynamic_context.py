@@ -1353,8 +1353,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Initialize attention state so that every layer can use it.
 
         Args:
-            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use for constructing the cuda graphs.
-            is_expert_parallel_dummy_cuda_graph_step (bool): Whether this is a dummy expert model parallel step.
+            construct_graph_dimensions (Optional[InferenceBatchDimensions]):
+                The graph config to use for constructing the cuda graphs.
+            is_expert_parallel_dummy_cuda_graph_step (bool):
+                Whether this is a dummy expert model parallel step.
         Return:
             None.
         """
@@ -1621,7 +1623,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
-        """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
+        """
+        Add request to context. At this stage, we assume that the request is valid and can be added,
+        as the checks are done in the schedule function.
 
         Args:
             req (DynamicInferenceRequest): Request to add.
@@ -2085,7 +2089,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             active_requests_mask (Tensor): 1D Mask tensor marking active requests. (Active request length)
             new_tokens (Tensor): Newly sampled tokens, with one token per active request. (Active request length)
-            new_speculative_tokens (Tensor): Newly sampled speculative tokens, with num_speculative tokens per active request. (num_speculative_tokens, active_request_length)
+            new_speculative_tokens (Tensor): Newly sampled speculative tokens,
+                with num_speculative tokens per active request.
+                (num_speculative_tokens, active_request_length)
 
         Return:
             (Tensor) Newly paused request IDs.
@@ -2300,8 +2306,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 :, : self.paused_request_count
             ].clone()
 
-        # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
-        # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
+        # add_ and fill_ calls seems to work as intended with sliced indexing
+        # (i.e. x[3:5].add(...) or x[3:5].fill_) but when another tensor is used
+        # for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
         self.request_kv_length_offsets[self.paused_request_count : self.total_request_count].add_(
             self.request_query_lengths[self.paused_request_count : self.total_request_count]
         )
@@ -2324,11 +2331,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         sampled_tokens = next_tokens[self.paused_request_count : self.total_request_count]
 
         if self.num_speculative_tokens > 0:
-            # new_speculative_tokens has shape [num_spec_tokens, num_requests], slice the request dimension (dim 1)
+            # new_speculative_tokens has shape [num_spec_tokens, num_requests],
+            # slice the request dimension (dim 1)
             sampled_speculative_tokens = new_speculative_tokens[
                 :, self.paused_request_count : self.total_request_count
             ]
-            # This will become [sampled, spec1, spec2, sampled, spec1, spec2 ...] # For every request we will have the sampled token followed by the speculative tokens (i.e next indices)
+            # This will become [sampled, spec1, spec2, sampled, spec1, spec2 ...]
+            # For every request we will have the sampled token followed by the
+            # speculative tokens (i.e next indices)
             next_tokens = torch.vstack(
                 [sampled_tokens.unsqueeze(0), sampled_speculative_tokens]
             ).T.reshape(-1)

@@ -1,4 +1,9 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
+
+# Some of this code was adopted from https://github.com/state-spaces/mamba/
+# This source code is licensed under the Apache license found in the
+# LICENSE file in the root directory of this source tree.
 
 import torch
 import triton

@@ -1,3 +1,9 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+# Some of this code was adopted from https://github.com/Dao-AILab/causal-conv1d/
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import torch
 import triton
 import triton.language as tl
@@ -102,6 +108,8 @@ def causal_conv1d_update_kernel(
     # If circular, we only need to read the base cache sequence length once
     if IS_CIRCULAR:
         base_cache_seqlen = tl.load(cache_seqlens_ptr + batch_id)
+    else:
+        base_cache_seqlen = None
 
     # Loop over the sequence dimension (e.g., speculative tokens)
     for s in range(seq_len):
@@ -214,6 +222,7 @@ def causal_conv1d_update(
     conv_state_indices: torch.Tensor | None,
     intermediate_conv_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Triton implementation of causal_conv1d_update."""
 
     # Check if input is 2D, temporarily treat as 3D for uniform processing
     is_2d = x.dim() == 2

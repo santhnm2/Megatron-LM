@@ -402,7 +402,8 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None:
+        if self.config.mtp_num_layers:
+            assert self.config.mtp_num_layers > 0
             # The new process_mtp_loss function doesn't handle mtp_logits_cache,
             # so we manually generate and cache MTP logits when in inference mode.
             if in_inference_mode:

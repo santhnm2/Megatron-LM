@@ -47,6 +47,7 @@ def causal_conv1d_update_kernel(
     HAS_INT_STATE: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
 ):
+    """Triton implementation of causal_conv1d_update (kernel)."""
     batch_id = tl.program_id(0)
     channel_block_id = tl.program_id(1)
 
@@ -222,7 +223,7 @@ def causal_conv1d_update(
     conv_state_indices: torch.Tensor | None,
     intermediate_conv_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton implementation of causal_conv1d_update."""
+    """Triton implementation of causal_conv1d_update (entrypoint)."""
 
     # Check if input is 2D, temporarily treat as 3D for uniform processing
     is_2d = x.dim() == 2

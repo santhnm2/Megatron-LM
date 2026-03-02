@@ -886,11 +886,12 @@ class TextGenerationController:
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
             )
-            mtp_output_tokens_jumbled_list.append(
-                self._torch_sampling_func(
-                    required_mtp_logits[:, required_indices, :], temp, top_k, top_p
-                )
+            mtp_logits_slice = required_mtp_logits[:, required_indices, :]
+            num_spec, num_reqs, vocab = mtp_logits_slice.shape
+            sampled_mtp = self._torch_sampling_func(
+                mtp_logits_slice.reshape(num_spec * num_reqs, vocab), temp, top_k, top_p
             )
+            mtp_output_tokens_jumbled_list.append(sampled_mtp.reshape(num_spec, num_reqs))
             token_order_list.append(required_indices)
 
         output_tokens_jumbled = torch.cat(output_tokens_jumbled_list, dim=0)

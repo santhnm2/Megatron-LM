@@ -2140,9 +2140,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count != 0:
             assert self.paused_tokens is not None
             next_tokens = torch.cat((self.paused_tokens, new_tokens))
-            new_speculative_tokens = torch.cat(
-                (self.paused_speculative_tokens, new_speculative_tokens), dim=1
-            )
+            if new_speculative_tokens is not None:
+                new_speculative_tokens = torch.cat(
+                    (self.paused_speculative_tokens, new_speculative_tokens), dim=1
+                )
         else:
             next_tokens = new_tokens
 

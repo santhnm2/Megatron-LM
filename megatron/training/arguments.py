@@ -1210,6 +1210,13 @@ def validate_args(args, defaults={}):
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
 
+    if args.use_dist_ckpt and args.ckpt_fully_parallel_load:
+        if args.ckpt_fully_parallel_load_exchange_algo != "broadcast":
+            warn_rank_0(
+                "Currently only the 'broadcast' exchange algorithm is supported for fully parallel load. "
+                "Other algorithms cannot guarantee numerical stability yet."
+            )
+
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
@@ -1220,7 +1227,7 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
-
+        
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -2247,6 +2254,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--dist-ckpt-workers', type=int, default=1,
+                       help='Number of workers for distributed checkpointing. '
+                       'Only used for async save. '
+                       'If set to 1, the checkpointing is performed in a single process.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')

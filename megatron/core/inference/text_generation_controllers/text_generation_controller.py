@@ -972,6 +972,21 @@ class TextGenerationController:
             decode_mask_2d = decode_mask_2d.cummin(dim=1).values
             accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
 
+            # --- DEBUG START ---
+            for req_i in range(num_decode_requests):
+                input_row = decode_inputs[req_i]
+                output_row = decode_outputs[req_i]
+                shifted_row = decode_outputs.roll(1, dims=1)[req_i]
+                mask_row = decode_mask_2d[req_i]
+                n_accepted = mask_row.sum().item() - 1  # subtract 1 for base token
+                print(f"[SPEC DEBUG] Request {req_i}:")
+                print(f"  input_tokens (from prev step):  {input_row.tolist()}")
+                print(f"  output_tokens (sampled now):    {output_row.tolist()}")
+                print(f"  shifted_outputs (for compare):  {shifted_row.tolist()}")
+                print(f"  match_mask (cumulative):        {mask_row.tolist()}")
+                print(f"  spec tokens accepted: {n_accepted}/{self.num_speculative_tokens}")
+            # --- DEBUG END ---
+
         last_one_indices = torch.full(
             (active_request_count,), -1, device=input_tokens_required.device
         )
@@ -1049,6 +1064,16 @@ class TextGenerationController:
 
         # Store the final sampled tokens and MTP tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]
+
+        # --- DEBUG START ---
+        print(f"\n[SPEC DEBUG] === Step Summary ===")
+        print(f"  decode_requests={num_decode_requests}, prefill_requests={num_prefill_requests}")
+        print(f"  last_one_indices: {last_one_indices.tolist()}")
+        print(f"  accepted_mask:    {accepted_tokens_mask.tolist()}")
+        print(f"  final_sampled_tokens (next input): {final_sampled_tokens.tolist()}")
+        print(f"  mtp_tokens (draft for next step):  {mtp_output_tokens[:, last_one_indices].tolist()}")
+        # --- DEBUG END ---
+
         self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
         self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
             :, last_one_indices

@@ -1408,7 +1408,9 @@ class TextGenerationController:
             model_config = get_model_config(unwrapped_model)
             if model_config.transformer_impl == "inference_optimized":
                 context.maybe_initialize_symmetric_memory()
-            return self.inference_wrapped_model.dummy_forward()
+            self.inference_wrapped_model.dummy_forward()
+            self._dummy_serial_mtp_forward()
+            return
 
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
@@ -1424,8 +1426,75 @@ class TextGenerationController:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
 
+        # When speculative decoding is active, the real EP ranks perform serial
+        # MTP forward passes after the main forward pass. MTP layers may contain
+        # MoE sublayers (inherited from the decoder spec), which require EP
+        # all-to-all collectives. The dummy rank must participate in these
+        # collectives to avoid a hang.
+        self._dummy_serial_mtp_forward()
+
         # clear the context of any temporary state from the dummy forward
         context.reset()
+
+    def _dummy_serial_mtp_forward(self):
+        """Run dummy MTP forward passes to participate in EP collectives.
+
+        When speculative decoding is active and MTP layers contain MoE sublayers
+        (inherited from the decoder layer spec), each serial MTP step triggers
+        EP all-to-all collectives. The dummy EP rank must issue matching
+        collective calls so the real ranks do not hang.
+
+        This mirrors the structure of ``_compute_serial_mtp_and_sample``:
+        - On the last PP stage (where MTP resides): run ``compute_mtp_single_step``
+          with dummy tensors so the MoE all-to-all is executed.
+        - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
+          that the real ranks also perform.
+        """
+        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+            return
+        if self.model_config.expert_model_parallel_size <= 1:
+            return
+
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+
+        is_last_stage = is_pipeline_last_stage(self.pp_group)
+        has_mtp = is_last_stage and hasattr(unwrapped_model, 'mtp')
+        if not has_mtp and not self.model_is_pipeline_parallel:
+            # No MTP on this rank and no PP broadcast to participate in.
+            return
+
+        device = torch.cuda.current_device()
+        dtype = self.model_config.params_dtype
+        hidden_size = self.model_config.hidden_size
+        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+
+        dummy_hidden = None
+        if has_mtp:
+            # Minimal dummy tensors — just enough to drive the MTP layer forward
+            # so that the MoE all-to-all collectives are issued.
+            dummy_hidden = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
+            dummy_token_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+            dummy_position_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+
+        for depth in range(num_depths):
+            mtp_logits_2d = None
+            if has_mtp:
+                dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                    hidden_states=dummy_hidden,
+                    next_token_ids=dummy_token_ids,
+                    position_ids=dummy_position_ids,
+                    depth=depth,
+                )
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [1, vocab_size]
+
+            # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
+            if self.model_is_pipeline_parallel:
+                broadcast_from_last_pipeline_stage(
+                    [1, self.vocab_size],
+                    dtype=dtype,
+                    tensor=mtp_logits_2d,
+                    pp_group=self.pp_group,
+                )
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.

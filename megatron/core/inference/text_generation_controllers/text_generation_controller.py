@@ -801,15 +801,11 @@ class TextGenerationController:
                 request_indices, device=logits_2d.device, dtype=torch.long
             )
             spec_token_list.append(
-                self._torch_sampling_func(
-                    logits_2d[request_indices_tensor, :], temp, top_k, top_p
-                )
+                self._torch_sampling_func(logits_2d[request_indices_tensor, :], temp, top_k, top_p)
             )
             indices_list.append(request_indices_tensor)
 
-        spec_tokens = torch.empty(
-            logits_2d.shape[0], device=logits_2d.device, dtype=torch.int64
-        )
+        spec_tokens = torch.empty(logits_2d.shape[0], device=logits_2d.device, dtype=torch.int64)
         for tokens, indices in zip(spec_token_list, indices_list):
             spec_tokens[indices] = tokens
         return spec_tokens
@@ -829,9 +825,8 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
-        has_mtp = (
-            is_pipeline_last_stage(self.pp_group)
-            and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        has_mtp = is_pipeline_last_stage(self.pp_group) and hasattr(
+            unwrapped_model, '_decoder_hidden_states_cache'
         )
 
         if has_mtp:
@@ -839,6 +834,8 @@ class TextGenerationController:
             hidden_states = unwrapped_model._decoder_hidden_states_cache
             last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
             # Shape: [active_request_count, 1, hidden_size]
+        else:
+            last_accepted_hidden = None
 
         # Compute position IDs for the next tokens.
         # After rewind, request_kv_length_offsets has been adjusted. The actual
@@ -1426,6 +1423,11 @@ class TextGenerationController:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
 
+        # Disable MoE padding for MTP computation
+        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            set_decode_expert_padding(unwrapped_model, False)
+
         # When speculative decoding is active, the real EP ranks perform serial
         # MTP forward passes after the main forward pass. MTP layers may contain
         # MoE sublayers (inherited from the decoder spec), which require EP
@@ -1490,10 +1492,7 @@ class TextGenerationController:
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
             if self.model_is_pipeline_parallel:
                 broadcast_from_last_pipeline_stage(
-                    [1, self.vocab_size],
-                    dtype=dtype,
-                    tensor=mtp_logits_2d,
-                    pp_group=self.pp_group,
+                    [1, self.vocab_size], dtype=dtype, tensor=mtp_logits_2d, pp_group=self.pp_group
                 )
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
@@ -1633,6 +1632,12 @@ class TextGenerationController:
             self._dynamic_step_sample_logits_and_verify_tokens(logits, None, input_ids)
             # Phase 2: Rewind KV cache for rejected tokens.
             self._rewind_kv_cache()
+
+            # Disable MoE padding for MTP computation
+            if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
+
             # Phase 3: Compute MTP serially with correct (verified) inputs.
             self._compute_serial_mtp_and_sample()
         else:

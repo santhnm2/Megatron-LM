@@ -1388,7 +1388,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
             self.token_to_request_idx[0:T] = torch.repeat_interleave(
                 torch.arange(
-                    0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
+                    0,
+                    N,
+                    device=self.token_to_request_idx.device,
+                    dtype=self.token_to_request_idx.dtype,
                 ),
                 tokens_per_request,
             )

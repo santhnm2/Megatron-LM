@@ -2056,13 +2056,17 @@ class TestDynamicInferenceEngine:
 
             # Cache hidden states for serial MTP computation
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
-                tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
+                tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+        ):
             n = hidden_states.size(0)
-            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
             logits[:, :, 0] = 100.0  # High probability for token 0
             return hidden_states, logits
 
@@ -2177,15 +2181,19 @@ class TestDynamicInferenceEngine:
 
             # Cache hidden states for serial MTP computation
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
-            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
             logits.scatter_(2, pred_toks.transpose(0, 1).unsqueeze(-1), 100.0)
             return hidden_states, logits
 
@@ -2257,15 +2265,19 @@ class TestDynamicInferenceEngine:
 
             # Cache hidden states for serial MTP computation
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
-            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
             logits.scatter_(2, pred_toks.transpose(0, 1).unsqueeze(-1), 100.0)
             return hidden_states, logits
 
@@ -2338,15 +2350,19 @@ class TestDynamicInferenceEngine:
 
             # Cache hidden states for serial MTP computation
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
-            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
             logits.scatter_(2, pred_toks.transpose(0, 1).unsqueeze(-1), 100.0)
             return hidden_states, logits
 
@@ -2427,15 +2443,19 @@ class TestDynamicInferenceEngine:
 
             # Cache hidden states for serial MTP computation
             model._decoder_hidden_states_cache = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+        ):
             n = hidden_states.size(0)
             # Predict wildly wrong tokens (+ 5) to guarantee rejection
             wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
-            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
             logits.scatter_(2, wrong_toks.transpose(0, 1).unsqueeze(-1), 100.0)
             return hidden_states, logits
 
@@ -2511,13 +2531,17 @@ class TestDynamicInferenceEngine:
 
             # Cache hidden states for serial MTP computation
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+        ):
             n = hidden_states.size(0)
-            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
             logits[:, :, 0] = 100.0  # Force speculative heads to also pick token 0
             return hidden_states, logits
 

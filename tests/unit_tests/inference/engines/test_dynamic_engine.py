@@ -2040,6 +2040,8 @@ class TestDynamicInferenceEngine:
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
 
         # Mock forward to return deterministic data so speculative tokens are always accepted
+        hidden_size = unwrapped_model.config.hidden_size
+
         def mock_mtp_forward(*args, **kwargs):
             tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
 
@@ -2052,17 +2054,20 @@ class TestDynamicInferenceEngine:
             )
             base_logits[:, :, 0] = 100.0  # High probability for token 0
 
-            unwrapped_model._mtp_logits_cache = torch.zeros(
-                3,
-                tokens.size(1),
-                test_config.vocab_size,
-                device=tokens.device,
-                dtype=torch.bfloat16,
+            # Cache hidden states for serial MTP computation
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
             )
-            unwrapped_model._mtp_logits_cache[:, :, 0] = 100.0  # High probability for token 0
             return base_logits
 
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+            n = hidden_states.size(0)
+            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits[:, :, 0] = 100.0  # High probability for token 0
+            return hidden_states, logits
+
         unwrapped_model.forward = mock_mtp_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine._add_request(env.requests[0])
         env.engine.schedule_waiting_requests()
@@ -2157,6 +2162,7 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
 
         # Mock forward to deterministically output an ascending sequence (1->2->3...)
         def mock_deterministic_forward(*args, **kwargs):
@@ -2169,19 +2175,22 @@ class TestDynamicInferenceEngine:
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-            mtp_logits = torch.zeros(
-                2, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            # Cache hidden states for serial MTP computation
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
             )
-            mtp1_toks = (tokens + 2).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[0].scatter_(1, mtp1_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            mtp2_toks = (tokens + 3).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[1].scatter_(1, mtp2_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            unwrapped_model._mtp_logits_cache = mtp_logits
             return base_logits
 
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+            n = hidden_states.size(0)
+            # Predict next_token_ids + 1 (continuing the ascending sequence)
+            pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
+            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits.scatter_(2, pred_toks.transpose(0, 1).unsqueeze(-1), 100.0)
+            return hidden_states, logits
+
         unwrapped_model.forward = mock_deterministic_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         # Add the request formally to ensure all internal state tensors align
         env.engine.add_request(
@@ -2233,6 +2242,7 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
 
         # Mock forward to deterministically output an ascending sequence
         def mock_deterministic_forward(*args, **kwargs):
@@ -2245,19 +2255,22 @@ class TestDynamicInferenceEngine:
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-            mtp_logits = torch.zeros(
-                2, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            # Cache hidden states for serial MTP computation
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
             )
-            mtp1_toks = (tokens + 2).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[0].scatter_(1, mtp1_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            mtp2_toks = (tokens + 3).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[1].scatter_(1, mtp2_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            unwrapped_model._mtp_logits_cache = mtp_logits
             return base_logits
 
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+            n = hidden_states.size(0)
+            # Predict next_token_ids + 1 (continuing the ascending sequence)
+            pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
+            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits.scatter_(2, pred_toks.transpose(0, 1).unsqueeze(-1), 100.0)
+            return hidden_states, logits
+
         unwrapped_model.forward = mock_deterministic_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine.add_request(
             request_id=0,
@@ -2310,6 +2323,7 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
 
         # Mock forward to deterministically output an ascending sequence (1->2->3...)
         def mock_deterministic_forward(*args, **kwargs):
@@ -2322,19 +2336,22 @@ class TestDynamicInferenceEngine:
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-            mtp_logits = torch.zeros(
-                2, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            # Cache hidden states for serial MTP computation
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
             )
-            mtp1_toks = (tokens + 2).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[0].scatter_(1, mtp1_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            mtp2_toks = (tokens + 3).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[1].scatter_(1, mtp2_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            unwrapped_model._mtp_logits_cache = mtp_logits
             return base_logits
 
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+            n = hidden_states.size(0)
+            # Predict next_token_ids + 1 (continuing the ascending sequence)
+            pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
+            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits.scatter_(2, pred_toks.transpose(0, 1).unsqueeze(-1), 100.0)
+            return hidden_states, logits
+
         unwrapped_model.forward = mock_deterministic_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine.add_request(
             request_id=0,
@@ -2391,8 +2408,12 @@ class TestDynamicInferenceEngine:
         )
         env = self._build_test_env(test_config)
 
-        # Mock forward pass to return deterministic disparate logits so
-        # speculative tokens are completely rejected every time.
+        # Mock forward pass to return deterministic base logits.
+        # Speculative tokens will be wrong (predicted by MTP as tokens + 5)
+        # to guarantee rejection every time.
+        model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = model.config.hidden_size
+
         def mock_mtp_forward_reject(*args, **kwargs):
             tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
             b, s = tokens.shape
@@ -2404,23 +2425,22 @@ class TestDynamicInferenceEngine:
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-            # Speculative model consistently predicts wildly wrong tokens to guarantee rejection
-            model = env.engine.controller.inference_wrapped_model.model
-            mtp_logits = torch.zeros(
-                test_config.num_speculative_tokens,
-                s,
-                test_config.vocab_size,
-                device=tokens.device,
-                dtype=torch.bfloat16,
+            # Cache hidden states for serial MTP computation
+            model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
             )
-            wrong_toks = (tokens + 5).clamp(max=test_config.vocab_size - 1)
-            mtp_logits[0].scatter_(1, wrong_toks.squeeze(0).unsqueeze(-1), 100.0)
-            mtp_logits[1].scatter_(1, wrong_toks.squeeze(0).unsqueeze(-1), 100.0)
-
-            model._mtp_logits_cache = mtp_logits
             return base_logits
 
-        env.engine.controller.inference_wrapped_model.model.forward = mock_mtp_forward_reject
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+            n = hidden_states.size(0)
+            # Predict wildly wrong tokens (+ 5) to guarantee rejection
+            wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
+            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits.scatter_(2, wrong_toks.transpose(0, 1).unsqueeze(-1), 100.0)
+            return hidden_states, logits
+
+        model.forward = mock_mtp_forward_reject
+        model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine.add_request(
             request_id=0,
@@ -2476,6 +2496,7 @@ class TestDynamicInferenceEngine:
         print(f"total block count = {env.engine.context.block_allocator.total_count}")
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
 
         # Mock forward pass to return safe, deterministic logits to avoid NaN/Inf crashes
         # in torch.multinomial caused by randomly initialized weights.
@@ -2488,19 +2509,20 @@ class TestDynamicInferenceEngine:
             )
             base_logits[:, :, 0] = 100.0  # Force model to deterministically pick token 0
 
-            mtp_logits = torch.zeros(
-                test_config.num_speculative_tokens,
-                s,
-                test_config.vocab_size,
-                device=tokens.device,
-                dtype=torch.bfloat16,
+            # Cache hidden states for serial MTP computation
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16,
             )
-            mtp_logits[:, :, 0] = 100.0  # Force speculative heads to also pick token 0
-
-            unwrapped_model._mtp_logits_cache = mtp_logits
             return base_logits
 
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True):
+            n = hidden_states.size(0)
+            logits = torch.zeros(n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16)
+            logits[:, :, 0] = 100.0  # Force speculative heads to also pick token 0
+            return hidden_states, logits
+
         unwrapped_model.forward = mock_safe_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         # Add all requests at once. They will all start prefill, but as they generate
         # and request more blocks, the engine will run out of active blocks.

@@ -1008,6 +1008,110 @@ class TextGenerationController:
 
         return last_one_indices, accepted_tokens_mask, input_tokens_required
 
+    def _recompute_mtp_drafts(
+        self, verified_tokens: Tensor, required_logit_indices: Tensor, last_one_indices: Tensor
+    ) -> Tensor:
+        """Re-compute MTP draft tokens using verified output tokens.
+
+        During normal MTP forward pass, draft tokens are computed using stale/wrong
+        embeddings because the input_ids are rolled left and the last position contains
+        padding or previous (unverified) draft tokens. After verification, we know the
+        correct output token at each accepted position, so we re-run the MTP layers
+        with the correct token embeddings to produce better draft predictions.
+
+        Args:
+            verified_tokens: The verified output tokens, shape [num_requests].
+            required_logit_indices: Indices into the sequence dim for required logits.
+            last_one_indices: Indices into required_logit_indices for the last accepted
+                position per request.
+
+        Returns:
+            Tensor of shape [num_speculative_tokens, num_requests] with re-computed
+            draft token IDs.
+        """
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+
+        # Get model components
+        mtp_block = unwrapped_model.mtp  # MultiTokenPredictionBlock
+        embedding = unwrapped_model.embedding  # LanguageModelEmbedding
+        output_layer = unwrapped_model.output_layer  # ColumnParallelLinear
+        if unwrapped_model.share_embeddings_and_output_weights:
+            output_weight = unwrapped_model.shared_embedding_or_output_weight()
+        else:
+            output_weight = None
+
+        # Get cached main model hidden states at the accepted positions.
+        # _main_hidden_states_cache shape: [S, B=1, H]
+        main_hidden = unwrapped_model._main_hidden_states_cache  # [S, 1, H]
+        accepted_positions = required_logit_indices[last_one_indices]  # [num_requests]
+        # Extract hidden states at accepted positions: [num_requests, H]
+        hidden = main_hidden[accepted_positions, 0, :]  # [num_requests, H]
+        # Reshape to MTP expected format: [S=1, B=num_requests, H]
+        hidden = hidden.unsqueeze(0)
+
+        num_requests = verified_tokens.shape[0]
+        num_spec_tokens = self.num_speculative_tokens
+        draft_tokens = torch.empty(
+            num_spec_tokens, num_requests, dtype=verified_tokens.dtype, device=verified_tokens.device
+        )
+
+        current_token = verified_tokens  # [num_requests]
+
+        # Determine which MTP layer(s) to use
+        mtp_use_repeated = mtp_block.mtp_use_repeated_layer
+
+        with torch.no_grad():
+            for k in range(num_spec_tokens):
+                layer_idx = 0 if mtp_use_repeated else k
+                mtp_layer = mtp_block.layers[layer_idx]
+
+                # Embed the current token: [B=num_requests, S=1]
+                token_input = current_token.unsqueeze(1)  # [num_requests, 1]
+                # Create position_ids (0 for single token)
+                pos_ids = torch.zeros_like(token_input)
+                # LanguageModelEmbedding returns [S, B, H] after transpose
+                decoder_input = embedding(input_ids=token_input, position_ids=pos_ids)
+                # decoder_input shape: [1, num_requests, H]
+
+                # Concat embeddings: enorm(decoder_input) + hnorm(hidden) -> eh_proj
+                projected = mtp_layer._concat_embeddings(hidden, decoder_input)
+                # projected shape: [1, num_requests, H]
+
+                # Run transformer layer (seq_len=1, no attention mask needed)
+                if mtp_layer.mtp_layer_pattern is not None:
+                    projected = mtp_layer.mtp_model_layer(
+                        hidden_states=projected,
+                        attention_mask=None,
+                        rotary_pos_emb=None,
+                        inference_context=None,
+                        packed_seq_params=None,
+                    )
+                else:
+                    # GPT path
+                    projected, _ = mtp_layer.mtp_model_layer(
+                        hidden_states=projected,
+                        attention_mask=None,
+                        rotary_pos_emb=None,
+                    )
+
+                # Post-process: final_layernorm
+                projected = mtp_layer._postprocess(projected)
+
+                # Compute logits and sample draft token
+                logits_k, _ = output_layer(
+                    projected, weight=output_weight, runtime_gather_output=True
+                )
+                # logits_k shape: [1, num_requests, vocab_size] or [num_requests, 1, vocab_size]
+                # Greedy sample
+                draft_k = logits_k.squeeze(0).argmax(dim=-1)  # [num_requests]
+                draft_tokens[k] = draft_k
+
+                # Chain for next iteration
+                current_token = draft_k
+                hidden = projected
+
+        return draft_tokens
+
     def _dynamic_step_sample_logits_and_verify_tokens(
         self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
     ):
@@ -1065,19 +1169,16 @@ class TextGenerationController:
         # Store the final sampled tokens and MTP tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]
 
-        # --- DEBUG START ---
-        print(f"\n[SPEC DEBUG] === Step Summary ===")
-        print(f"  decode_requests={num_decode_requests}, prefill_requests={num_prefill_requests}")
-        print(f"  last_one_indices: {last_one_indices.tolist()}")
-        print(f"  accepted_mask:    {accepted_tokens_mask.tolist()}")
-        print(f"  final_sampled_tokens (next input): {final_sampled_tokens.tolist()}")
-        print(f"  mtp_tokens (draft for next step):  {mtp_output_tokens[:, last_one_indices].tolist()}")
-        # --- DEBUG END ---
-
         self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
-        self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
-            :, last_one_indices
-        ]
+
+        # Re-compute MTP draft tokens using the verified output tokens.
+        # The MTP drafts from the forward pass used stale/wrong embeddings (due to
+        # roll_tensor filling the last position with padding), so we re-run the MTP
+        # layers with the correct verified token to get accurate draft predictions.
+        recomputed_drafts = self._recompute_mtp_drafts(
+            final_sampled_tokens, required_logit_indices, last_one_indices
+        )
+        self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = recomputed_drafts
 
         # Extract accepted tokens and counts for decode requests.
         # For prefill it is always set to 1. For decode, the first token is always accepted,

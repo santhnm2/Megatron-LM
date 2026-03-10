@@ -625,6 +625,9 @@ class GPTModel(LanguageModule):
                     output_weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
                 )
+                # Cache main hidden states for MTP draft re-computation after
+                # speculative token verification.
+                self._main_hidden_states_cache = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(

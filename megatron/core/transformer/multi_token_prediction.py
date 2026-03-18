@@ -696,8 +696,11 @@ def process_mtp_loss(
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
-    if config.mtp_detach_heads and output_weight is not None:
-        output_weight = output_weight.detach()
+    if config.mtp_detach_heads:
+        if output_weight is not None:
+            output_weight = output_weight.detach()
+        else:
+            output_weight = output_layer.weight.detach()
 
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
@@ -960,6 +963,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
+        # which happens after detach() with mtp_detach_heads. Activation
+        # checkpointing (CheckpointFunction.apply) requires at least one input tensor
+        # with requires_grad=True to produce a differentiable output, so we ensure it
+        # here to maintain gradient flow to MTP layer parameters.
+        if not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
 
         return input_ids, position_ids, decoder_input, hidden_states
 

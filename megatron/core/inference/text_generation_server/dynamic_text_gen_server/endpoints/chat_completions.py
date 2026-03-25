@@ -16,12 +16,124 @@ logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
 
+_TOKEN_ID_FIELDS_TO_REDACT = {
+    "prompt_tokens",
+    "remaining_prompt_tokens",
+    "generated_tokens",
+    "prompt_token_ids",
+    "generation_token_ids",
+}
+
+_INDEX_FIELDS_TO_REDACT = {
+    "routing_indices",
+    "moe_topk_indices",
+    "prompt_moe_topk_indices",
+}
+
+_HASH_FIELDS_TO_REDACT = {
+    "precomputed_block_hashes",
+}
+
+_NUMERIC_SERIES_FIELDS_TO_REDACT = {
+    "tpot",
+}
+
+
+def _is_int_list_like(value):
+    """Return True for integer lists, including nested integer lists."""
+    if not isinstance(value, list):
+        return False
+    return all(isinstance(item, int) or _is_int_list_like(item) for item in value)
+
+
+def _is_numeric_list_like(value):
+    """Return True for numeric lists, including nested numeric lists."""
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(item, (int, float)) or _is_numeric_list_like(item)
+        for item in value
+    )
+
+
+def _redact_token_id_lists_for_logging(value):
+    """Redact verbose token-id arrays from logs."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if (
+                (
+                    key in _TOKEN_ID_FIELDS_TO_REDACT
+                    or key in _INDEX_FIELDS_TO_REDACT
+                    or key in _HASH_FIELDS_TO_REDACT
+                    or key.endswith("_token_ids")
+                    or key.endswith("_topk_indices")
+                    or key.endswith("_hashes")
+                )
+                and _is_int_list_like(item)
+            ):
+                redacted[key] = "...truncated..."
+            elif (
+                key in _NUMERIC_SERIES_FIELDS_TO_REDACT
+                and _is_numeric_list_like(item)
+            ):
+                redacted[key] = "...truncated..."
+            else:
+                redacted[key] = _redact_token_id_lists_for_logging(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_token_id_lists_for_logging(item) for item in value]
+    return value
+
 
 def _get_field(obj, key, default=None):
     """Read a field from dict-like or object-like values."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+_STRUCTURED_TOOL_ARG_KEYS = {
+    "flights",
+    "passengers",
+    "payment_methods",
+    "payment_history",
+}
+
+_TRANSFER_TOOL_NAME = "transfer_to_human_agents"
+_TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
+_RESERVATION_UPDATE_TOOLS = {
+    "update_reservation_flights",
+    "update_reservation_passengers",
+    "update_reservation_baggages",
+}
+_RESERVATION_DESTRUCTIVE_TOOLS = {"cancel_reservation", "book_reservation"}
+
+
+def _try_parse_jsonish(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except (TypeError, ValueError):
+        return value
+
+
+def _normalize_structured_tool_arguments(arguments):
+    """Coerce known structured tool args from JSON strings to objects/lists."""
+    if not isinstance(arguments, dict):
+        return arguments
+    normalized = dict(arguments)
+    for key in _STRUCTURED_TOOL_ARG_KEYS:
+        if key not in normalized:
+            continue
+        parsed = _try_parse_jsonish(normalized[key])
+        if isinstance(parsed, (dict, list)):
+            normalized[key] = parsed
+    return normalized
 
 
 def _normalize_tool_calls(tool_calls):
@@ -33,7 +145,20 @@ def _normalize_tool_calls(tool_calls):
         fn_args = _get_field(fn, "arguments", "")
         if fn_name is None:
             continue
-        if not isinstance(fn_args, str):
+        if isinstance(fn_args, str):
+            try:
+                parsed_args = json.loads(fn_args)
+            except (TypeError, ValueError):
+                parsed_args = None
+            if isinstance(parsed_args, dict):
+                fn_args = json.dumps(
+                    _normalize_structured_tool_arguments(parsed_args), ensure_ascii=False
+                )
+        elif isinstance(fn_args, dict):
+            fn_args = json.dumps(
+                _normalize_structured_tool_arguments(fn_args), ensure_ascii=False
+            )
+        else:
             try:
                 fn_args = json.dumps(fn_args, ensure_ascii=False)
             except TypeError:
@@ -45,7 +170,46 @@ def _normalize_tool_calls(tool_calls):
                 "function": {"name": str(fn_name), "arguments": fn_args},
             }
         )
-    return normalized
+    return _apply_tool_call_guardrails(normalized)
+
+
+def _apply_tool_call_guardrails(tool_calls):
+    """Apply conservative post-parse guardrails to tool call lists.
+
+    If update-style reservation tools are already present in the same response,
+    suppress cancel+book style calls to avoid destructive replanning patterns.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+
+    call_names = {
+        _get_field(_get_field(call, "function", {}), "name")
+        for call in tool_calls
+        if isinstance(call, dict)
+    }
+    if call_names & _RESERVATION_UPDATE_TOOLS:
+        return [
+            call
+            for call in tool_calls
+            if _get_field(_get_field(call, "function", {}), "name")
+            not in _RESERVATION_DESTRUCTIVE_TOOLS
+        ]
+    return tool_calls
+
+
+def _normalize_assistant_content(message_text, tool_calls):
+    """Normalize assistant content for policy-sensitive tool transitions."""
+    if not isinstance(message_text, str):
+        message_text = "" if message_text is None else str(message_text)
+
+    tool_names = {
+        _get_field(_get_field(call, "function", {}), "name")
+        for call in (tool_calls or [])
+        if isinstance(call, dict)
+    }
+    if _TRANSFER_TOOL_NAME in tool_names:
+        return _TRANSFER_HOLD_MESSAGE
+    return message_text
 
 
 def _coerce_arguments_mapping(arguments):
@@ -92,6 +256,27 @@ def _sanitize_messages_for_template(messages):
             sanitized.append(message)
             continue
         msg_copy = dict(message)
+        content = msg_copy.get("content")
+        # OpenAI-style multimodal/text content may arrive as a list of blocks.
+        # HF/Jinja chat templates used by this server expect plain strings.
+        if isinstance(content, list):
+            text_chunks = []
+            for chunk in content:
+                if isinstance(chunk, dict):
+                    if chunk.get("type") == "text":
+                        text_chunks.append(str(chunk.get("text", "")))
+                    elif "text" in chunk:
+                        text_chunks.append(str(chunk.get("text", "")))
+                elif isinstance(chunk, str):
+                    text_chunks.append(chunk)
+            msg_copy["content"] = "".join(text_chunks)
+        elif isinstance(content, dict):
+            msg_copy["content"] = str(content.get("text", ""))
+        elif content is None:
+            msg_copy["content"] = ""
+        elif not isinstance(content, str):
+            msg_copy["content"] = str(content)
+
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):
             sanitized_tool_calls = []
@@ -271,6 +456,7 @@ try:
                             last_assistant_message_idx = i
                             break
 
+
                     last_assistant_message = (
                         template_messages[last_assistant_message_idx]
                         if last_assistant_message_idx is not None
@@ -308,7 +494,7 @@ try:
 
                         # Replace the prefix tokens with the tokens from the previous generation
                         previous_turn_token_ids = (
-                            last_assistant_message["prompt_token_ids"]
+                            last_assistant_message["prompt_token_ids"] 
                             + last_assistant_message["generation_token_ids"]
                         )
                         prompt_tokens = _replace_prefix_tokens(
@@ -472,9 +658,13 @@ try:
                     message_text, req.get("tools", None), parsers, tools_requested
                 )
 
-            message = {"role": "assistant", "content": message_text}
-            if metadata.get("tool_calls", []):
-                message["tool_calls"] = metadata["tool_calls"]
+            normalized_tool_calls = metadata.get("tool_calls", [])
+            message = {
+                "role": "assistant",
+                "content": _normalize_assistant_content(message_text, normalized_tool_calls),
+            }
+            if normalized_tool_calls:
+                message["tool_calls"] = normalized_tool_calls
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
@@ -509,7 +699,7 @@ try:
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )
             if current_app.config['verbose']:
-                logging.info(result)
+                logging.info(_redact_token_id_lists_for_logging(result))
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -521,7 +711,8 @@ try:
             choices.append(choice_data)
             if choice_data["generation_log_probs"] is None:
                 logger.warning(
-                    "Generation log probs is None for request:\n%s", json.dumps(result, indent=4)
+                    "Generation log probs is None for request:\n%s",
+                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
                 )
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1

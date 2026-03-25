@@ -449,15 +449,6 @@ try:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
-                    eos_token_id = tokenizer.eos_id
-                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-                    warnings.warn(
-                        "Avoiding prefix retokenization."
-                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
-                    )
-
                     # Find the last assistant message
                     last_assistant_message_idx = None
                     for i in reversed(range(len(template_messages))):
@@ -465,13 +456,29 @@ try:
                             last_assistant_message_idx = i
                             break
 
-                    # If there was a previous assistant message, we need to replace the prefix tokens with the tokens from the previous generation
+
+                    last_assistant_message = (
+                        template_messages[last_assistant_message_idx]
+                        if last_assistant_message_idx is not None
+                        else None
+                    )
+
+                    # Only proceed if the last assistant message has the token IDs from a previous generation.
+                    # Dataset-provided conversation history won't have these fields.
                     if (
-                        last_assistant_message_idx is not None and
-                        "prompt_token_ids" in template_messages[last_assistant_message_idx] and
-                        "generation_token_ids" in template_messages[last_assistant_message_idx]
+                        last_assistant_message is not None
+                        and "prompt_token_ids" in last_assistant_message
+                        and "generation_token_ids" in last_assistant_message
                     ):
-                        last_assistant_message = template_messages[last_assistant_message_idx]
+                        eos_token_id = tokenizer.eos_id
+                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+
+                        warnings.warn(
+                            "Avoiding prefix retokenization."
+                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                        )
+
                         messages_to_last_assistant_message = template_messages[
                             : last_assistant_message_idx + 1
                         ]

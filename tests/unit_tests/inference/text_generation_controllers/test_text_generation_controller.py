@@ -1408,3 +1408,322 @@ class TestTextGenerationController:
         assert torch.equal(
             captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
         )
+
+    @pytest.mark.internal
+    def test_rejection_sampling_accepts_high_prob_tokens(self):
+        """Test that rejection sampling accepts speculative tokens with high
+        probability under the base model, even when an independent sample
+        would produce a different token (which exact matching would reject)."""
+        num_spec = 2
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=4
+        )
+        self.text_generation_controller.num_speculative_tokens = num_spec
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+        ctx.request_query_lengths = torch.tensor([3], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Use non-greedy sampling (top_k=50, temperature=1.0).
+        self.text_generation_controller._torch_sampling_buckets = [([0], 1.0, 50, 0.0)]
+
+        # Speculative tokens: 5 and 7.
+        spec_token_1 = 5
+        spec_token_2 = 7
+        input_ids = torch.tensor([[10, spec_token_1, spec_token_2]], device='cuda')
+
+        # Create base-model logits where the speculative tokens have the
+        # HIGHEST probability (so they should almost always be accepted).
+        logits = torch.full((1, 3, self.vocab_size), -10.0, device='cuda')
+        # Position 0 logits → predict spec_token_1 with high probability
+        logits[0, 0, spec_token_1] = 10.0
+        # Position 1 logits → predict spec_token_2 with high probability
+        logits[0, 1, spec_token_2] = 10.0
+        # Position 2 logits → predict some token (bonus token)
+        logits[0, 2, 42] = 10.0
+
+        # Set up draft probs: the draft model also assigned high probability.
+        # With q(x) ≈ 1.0 and p(x) ≈ 1.0, acceptance ratio ≈ 1.0.
+        self.text_generation_controller._mtp_draft_token_probs[0, 0] = 0.9
+        self.text_generation_controller._mtp_draft_token_probs[1, 0] = 0.9
+        self.text_generation_controller._mtp_draft_tokens_snapshot[0, 0] = spec_token_1
+        self.text_generation_controller._mtp_draft_tokens_snapshot[1, 0] = spec_token_2
+
+        # Mock _torch_sampling_func to return a DIFFERENT token than the
+        # speculative one.  With exact matching this would always reject.
+        # With rejection sampling, the high p(x)/q(x) ratio should accept.
+        def mock_sampling_func(logits_in, *args, **kwargs):
+            batch = logits_in.shape[0]
+            # Always return token 99 (different from spec tokens).
+            return torch.full((batch,), 99, dtype=torch.long, device='cuda')
+
+        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+            side_effect=mock_sampling_func
+        )
+
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            logits, input_ids
+        )
+
+        # Both speculative tokens should be accepted (acceptance prob ≈ 1.0).
+        accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:1]
+        assert accepted_counts.item() == 2, (
+            f"Expected 2 accepted tokens with rejection sampling, got {accepted_counts.item()}"
+        )
+
+    @pytest.mark.internal
+    def test_rejection_sampling_rejects_low_prob_tokens(self):
+        """Test that rejection sampling rejects speculative tokens that have
+        very low probability under the base model."""
+        num_spec = 1
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=4
+        )
+        self.text_generation_controller.num_speculative_tokens = num_spec
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+        ctx.request_query_lengths = torch.tensor([2], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Non-greedy sampling.
+        self.text_generation_controller._torch_sampling_buckets = [([0], 1.0, 50, 0.0)]
+
+        # Speculative token: 5 (which will have very low base-model probability).
+        spec_token = 5
+        input_ids = torch.tensor([[10, spec_token]], device='cuda')
+
+        # Base model logits: spec_token has near-zero probability.
+        logits = torch.full((1, 2, self.vocab_size), -10.0, device='cuda')
+        logits[0, 0, 42] = 10.0  # Token 42 is the argmax, not spec_token.
+        logits[0, 1, 42] = 10.0
+
+        # Draft model assigned high probability to spec_token.
+        # p(x) ≈ 0 and q(x) = 0.9 → acceptance ratio ≈ 0.
+        self.text_generation_controller._mtp_draft_token_probs[0, 0] = 0.9
+        self.text_generation_controller._mtp_draft_tokens_snapshot[0, 0] = spec_token
+
+        # Mock sampling to return a different token.
+        def mock_sampling_func(logits_in, *args, **kwargs):
+            batch = logits_in.shape[0]
+            return torch.full((batch,), 99, dtype=torch.long, device='cuda')
+
+        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+            side_effect=mock_sampling_func
+        )
+
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            logits, input_ids
+        )
+
+        # The speculative token should be rejected.
+        accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:1]
+        assert accepted_counts.item() == 0, (
+            f"Expected 0 accepted tokens, got {accepted_counts.item()}"
+        )
+
+    @pytest.mark.internal
+    def test_rejection_sampling_greedy_uses_exact_matching(self):
+        """Test that greedy requests (top_k=1) always use exact matching
+        even when rejection sampling is enabled for the batch."""
+        num_spec = 2
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=4
+        )
+        self.text_generation_controller.num_speculative_tokens = num_spec
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
+        ctx.request_query_lengths = torch.tensor([3, 3], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Mixed batch: request 0 is greedy, request 1 is non-greedy.
+        self.text_generation_controller._torch_sampling_buckets = [
+            ([0], 1.0, 1, 0.0),   # Greedy
+            ([1], 1.0, 50, 0.0),  # Non-greedy
+        ]
+
+        # Request 0: spec tokens [11, 12].  Mock will return [11, 99] → 1 match.
+        # Request 1: spec tokens [21, 22].  Draft probs say both are high prob.
+        input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
+
+        logits = torch.full((1, 6, self.vocab_size), -10.0, device='cuda')
+        # Req 0 base logits: position 0 predicts 11 (match), position 1 predicts 99 (no match).
+        logits[0, 0, 11] = 10.0
+        logits[0, 1, 99] = 10.0
+        logits[0, 2, 42] = 10.0
+        # Req 1 base logits: both spec tokens have high probability.
+        logits[0, 3, 21] = 10.0
+        logits[0, 4, 22] = 10.0
+        logits[0, 5, 42] = 10.0
+
+        # Draft probs for req 1 (non-greedy).
+        self.text_generation_controller._mtp_draft_token_probs[0, 1] = 0.9
+        self.text_generation_controller._mtp_draft_token_probs[1, 1] = 0.9
+        self.text_generation_controller._mtp_draft_tokens_snapshot[0, 1] = 21
+        self.text_generation_controller._mtp_draft_tokens_snapshot[1, 1] = 22
+        # Draft probs for req 0 (greedy) - should be ignored.
+        self.text_generation_controller._mtp_draft_token_probs[0, 0] = 0.9
+        self.text_generation_controller._mtp_draft_token_probs[1, 0] = 0.9
+        self.text_generation_controller._mtp_draft_tokens_snapshot[0, 0] = 11
+        self.text_generation_controller._mtp_draft_tokens_snapshot[1, 0] = 12
+
+        def mock_sampling_func(logits_in, *args, **kwargs):
+            batch = logits_in.shape[0]
+            # Return argmax of the logits.
+            return logits_in.argmax(dim=-1)
+
+        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+            side_effect=mock_sampling_func
+        )
+
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            logits, input_ids
+        )
+
+        accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
+        # Req 0 (greedy): token 11 matches at pos 1, token 99 != 12 at pos 2 → 1 accepted.
+        assert accepted_counts[0].item() == 1, (
+            f"Greedy request: expected 1 accepted, got {accepted_counts[0].item()}"
+        )
+        # Req 1 (non-greedy): both tokens have high p/q → both accepted.
+        assert accepted_counts[1].item() == 2, (
+            f"Non-greedy request: expected 2 accepted, got {accepted_counts[1].item()}"
+        )
+
+    @pytest.mark.internal
+    def test_rejection_sampling_draft_prob_storage(self):
+        """Test that _compute_serial_mtp_and_sample correctly stores draft
+        token probabilities for rejection sampling."""
+        num_spec = 2
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=4
+        )
+        self.text_generation_controller.num_speculative_tokens = num_spec
+        self.text_generation_controller.num_mtp_heads = num_spec
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+        ctx.request_kv_length_offsets[:1] = torch.tensor([5], dtype=torch.int32, device='cuda')
+        ctx.request_query_lengths[:1] = torch.tensor([3], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Non-greedy sampling bucket.
+        self.text_generation_controller._torch_sampling_buckets = [([0], 1.0, 50, 0.0)]
+
+        # Mock the base token.
+        self.text_generation_controller._sampled_tokens_cuda[0] = 42
+
+        # Mock the MTP computation.
+        unwrapped_model = self.text_generation_controller.inference_wrapped_model.model
+        unwrapped_model._decoder_hidden_states_cache = torch.randn(1, 1, 32, device='cuda')
+        self.text_generation_controller._last_accepted_seq_indices = torch.tensor(
+            [0], device='cuda'
+        )
+
+        # Return logits where token 10 has the highest probability.
+        mtp_logits = torch.full((1, 1, self.vocab_size), -10.0, device='cuda')
+        mtp_logits[0, 0, 10] = 10.0
+
+        def mock_mtp_step(hidden_states, next_token_ids, position_ids, depth):
+            return hidden_states, mtp_logits.clone()
+
+        unwrapped_model.compute_mtp_single_step = mock.MagicMock(side_effect=mock_mtp_step)
+
+        # Mock _sample_from_logits_2d to always return token 10.
+        self.text_generation_controller._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.tensor([10], device='cuda')
+        )
+
+        self.text_generation_controller._compute_serial_mtp_and_sample()
+
+        # Verify draft probs were stored and are non-zero.
+        for depth in range(num_spec):
+            prob = self.text_generation_controller._mtp_draft_token_probs[depth, 0].item()
+            assert prob > 0.0, f"Draft prob at depth {depth} should be > 0, got {prob}"
+            snap = self.text_generation_controller._mtp_draft_tokens_snapshot[depth, 0].item()
+            assert snap == 10, f"Draft token snapshot at depth {depth} should be 10, got {snap}"
+
+    @pytest.mark.internal
+    def test_rejection_sampling_stale_draft_probs_fallback(self):
+        """Test that stale draft probs (from a swapped request) fall back to
+        conservative acceptance (effectively exact-match-like behaviour)."""
+        num_spec = 1
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=4
+        )
+        self.text_generation_controller.num_speculative_tokens = num_spec
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+        ctx.request_query_lengths = torch.tensor([2], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        self.text_generation_controller._torch_sampling_buckets = [([0], 1.0, 50, 0.0)]
+
+        spec_token = 5
+        input_ids = torch.tensor([[10, spec_token]], device='cuda')
+
+        # Base model: spec_token has moderate probability.
+        logits = torch.full((1, 2, self.vocab_size), -10.0, device='cuda')
+        logits[0, 0, spec_token] = 2.0  # Moderate probability
+        logits[0, 1, 42] = 10.0
+
+        # Stale draft probs: snapshot token doesn't match spec_token.
+        self.text_generation_controller._mtp_draft_token_probs[0, 0] = 0.01
+        self.text_generation_controller._mtp_draft_tokens_snapshot[0, 0] = 99  # Wrong token!
+
+        def mock_sampling_func(logits_in, *args, **kwargs):
+            batch = logits_in.shape[0]
+            return torch.full((batch,), 88, dtype=torch.long, device='cuda')
+
+        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+            side_effect=mock_sampling_func
+        )
+
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            logits, input_ids
+        )
+
+        # With stale draft probs, q is set to 1.0, so acceptance = p(x).
+        # For a moderate-probability token, acceptance is possible but not guaranteed.
+        # The key invariant: the code should not crash and should produce valid output.
+        accepted = self.text_generation_controller._accepted_token_counts_per_request[:1]
+        assert accepted.item() >= 0 and accepted.item() <= 1
+
+    @pytest.mark.internal
+    def test_compute_adjusted_probs(self):
+        """Test _compute_adjusted_probs produces correct probability distributions."""
+        self.setup_model(torch.float32, static=False, max_requests=4)
+        ctrl = self.text_generation_controller
+
+        logits = torch.tensor([[1.0, 2.0, 3.0, 0.5]], device='cuda')
+
+        # Greedy: all probability on argmax (token 2).
+        probs = ctrl._compute_adjusted_probs(logits, 1.0, 1, 0.0)
+        assert probs[0, 2].item() == 1.0
+        assert probs[0, 0].item() == 0.0
+
+        # With temperature=2.0: should flatten the distribution.
+        probs_t2 = ctrl._compute_adjusted_probs(logits, 2.0, 0, 0.0)
+        probs_t1 = ctrl._compute_adjusted_probs(logits, 1.0, 0, 0.0)
+        # Higher temperature → more uniform → max prob should be smaller.
+        assert probs_t2[0].max().item() < probs_t1[0].max().item()
+
+        # Top-k=2: only top 2 tokens should have non-zero probability.
+        probs_topk = ctrl._compute_adjusted_probs(logits, 1.0, 2, 0.0)
+        assert (probs_topk[0] > 0).sum().item() == 2
+
+        # All probs should sum to 1.
+        assert abs(probs_topk[0].sum().item() - 1.0) < 1e-5

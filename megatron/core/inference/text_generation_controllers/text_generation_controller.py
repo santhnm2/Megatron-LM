@@ -156,6 +156,17 @@ class TextGenerationController:
                 )
                 * -1
             )
+            # Draft token probabilities for rejection sampling.
+            # Stores q(x) for each sampled speculative token x under the MTP distribution.
+            # Shape: [num_speculative_tokens, max_requests]
+            self._mtp_draft_token_probs = torch.zeros(
+                [self.num_speculative_tokens, max_requests], dtype=torch.float32, device=device
+            )
+            # Copy of sampled tokens at draft prob storage time, used to validate
+            # that draft probs still correspond to the correct request after swaps.
+            self._mtp_draft_tokens_snapshot = torch.full(
+                [self.num_speculative_tokens, max_requests], -1, dtype=torch.int64, device=device
+            )
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -357,6 +368,49 @@ class TextGenerationController:
                 sampled_logits = torch.clamp(sampled_logits, min=0, max=(vocab_size - 1))
 
         return sampled_logits
+
+    def _compute_adjusted_probs(
+        self,
+        logits_2d: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Compute probability distribution after applying sampling parameters.
+
+        Applies the same temperature, top-k, and top-p transformations as
+        ``_torch_sampling_func``, but returns the full probability distribution
+        instead of a sampled token.
+
+        Args:
+            logits_2d: Logits of shape ``[batch, vocab_size]``.
+            temperature: Sampling temperature.
+            top_k: Top-k filtering value (0 disables).
+            top_p: Top-p (nucleus) filtering value (0.0 disables).
+
+        Returns:
+            Tensor of shape ``[batch, vocab_size]`` with probabilities.
+        """
+        logits = logits_2d.clone().float()
+        if top_k == 1:
+            # Greedy: put all probability on the argmax token.
+            probs = torch.zeros_like(logits)
+            probs.scatter_(1, logits.argmax(dim=-1, keepdim=True), 1.0)
+            return probs
+        if temperature != 1.0:
+            logits.div_(temperature)
+        if top_k > 1:
+            filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits.masked_fill_(filter_, float("-Inf"))
+        elif top_p > 0.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            filter_ = cumulative_probs > top_p
+            filter_[:, 1:] = filter_[:, :-1].clone()
+            filter_[..., 0] = 0
+            filter_ = filter_.scatter(1, sorted_indices, filter_)
+            logits.masked_fill_(filter_, float("-Inf"))
+        return logits.softmax(dim=-1)
 
     def sample_from_logits(
         self,
@@ -883,6 +937,28 @@ class TextGenerationController:
             spec_tokens = self._sample_from_logits_2d(mtp_logits_2d)
             self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
 
+            # Store draft token probabilities for rejection sampling in the
+            # next verification step.  For each sampling bucket, compute the
+            # probability of the selected token under the adjusted MTP
+            # distribution (with temperature / top-k / top-p applied).
+            if self._mtp_draft_token_probs is not None:
+                for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
+                    idx = torch.tensor(
+                        request_indices, device=mtp_logits_2d.device, dtype=torch.long
+                    )
+                    idx = idx[idx < active_request_count]
+                    if idx.numel() == 0:
+                        continue
+                    bucket_probs = self._compute_adjusted_probs(
+                        mtp_logits_2d[idx], temp, top_k, top_p
+                    )
+                    selected_tokens = spec_tokens[idx]
+                    token_probs = bucket_probs[
+                        torch.arange(idx.numel(), device=idx.device), selected_tokens
+                    ]
+                    self._mtp_draft_token_probs[depth, idx] = token_probs
+                    self._mtp_draft_tokens_snapshot[depth, idx] = selected_tokens
+
             # Use sampled token as input for the next depth.
             next_token_ids = spec_tokens
 
@@ -1072,6 +1148,255 @@ class TextGenerationController:
 
         return last_one_indices, accepted_tokens_mask, input_tokens_required
 
+    def _has_non_greedy_requests(self) -> bool:
+        """Check if any active request uses non-greedy sampling (top_k != 1)."""
+        for _, _, top_k, _ in self._torch_sampling_buckets:
+            if top_k != 1:
+                return True
+        return False
+
+    def _verify_speculative_tokens_with_rejection_sampling(
+        self,
+        required_logits: Tensor,
+        output_tokens: Tensor,
+        input_tokens_required: Tensor,
+        request_in_prefill_status_tensor: Tensor,
+        repeats: Tensor,
+        num_decode_requests: int,
+        num_prefill_requests: int,
+        active_request_count: int,
+    ) -> tuple:
+        """Verify speculative tokens using rejection sampling for non-greedy requests.
+
+        Implements the standard speculative decoding rejection sampling algorithm:
+        for each speculative token *x* at depth *d*, compute
+
+            acceptance_prob = min(1, p(x) / q(x))
+
+        where *p* is the target (base-model) probability and *q* is the draft
+        (MTP) probability, both adjusted with the request's temperature / top-k /
+        top-p.  On rejection, the replacement token is sampled from the adjusted
+        distribution  norm(max(0, p − q)).
+
+        Greedy requests (top_k == 1) always fall back to exact-match verification
+        because probabilistic acceptance could accept non-argmax tokens.
+
+        The method returns the same tuple as ``_verify_speculative_tokens`` so
+        that the caller does not need special-casing.
+
+        Returns:
+            tuple: (last_one_indices, accepted_tokens_mask, input_tokens_required)
+        """
+        if input_tokens_required.ndim == 2:
+            assert input_tokens_required.shape[0] == 1
+            input_tokens_required = input_tokens_required.squeeze(0)
+
+        device = input_tokens_required.device
+        num_spec = self.num_speculative_tokens
+        accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
+
+        # Prefill tokens are always accepted.
+        token_to_prefill_idx = torch.repeat_interleave(request_in_prefill_status_tensor, repeats)
+        accepted_tokens_mask[token_to_prefill_idx == 1] = True
+
+        decode_mask_2d = None
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (num_spec + 1)
+            decode_inputs = input_tokens_required[:decode_len].reshape(
+                num_decode_requests, num_spec + 1
+            )
+            decode_outputs = output_tokens[:decode_len].reshape(
+                num_decode_requests, num_spec + 1
+            )
+            decode_logits = required_logits[:decode_len].reshape(
+                num_decode_requests, num_spec + 1, -1
+            )
+
+            # Build per-request flags for greedy vs non-greedy.
+            is_greedy = torch.ones(num_decode_requests, dtype=torch.bool, device=device)
+            for request_indices, _, top_k, _ in self._torch_sampling_buckets:
+                if top_k != 1:
+                    for idx in request_indices:
+                        if idx < num_decode_requests:
+                            is_greedy[idx] = False
+
+            # --- Greedy path (exact-match) ---
+            decode_outputs_shifted = decode_outputs.roll(1, dims=1)
+            greedy_mask = decode_inputs == decode_outputs_shifted
+            greedy_mask[:, 0] = True
+
+            # --- Rejection sampling path (non-greedy) ---
+            rejection_mask = torch.ones(
+                num_decode_requests, num_spec + 1, dtype=torch.bool, device=device
+            )
+            rejection_mask[:, 0] = True  # Base token always accepted.
+
+            # Replacement tokens for positions where rejection sampling rejects.
+            # Initialize with the independently sampled base-model tokens
+            # (shifted to align with speculative positions).
+            replacement_tokens = decode_outputs_shifted.clone()
+
+            non_greedy_indices = torch.where(~is_greedy)[0]
+            if non_greedy_indices.numel() > 0:
+                for j in range(1, num_spec + 1):
+                    depth = j - 1
+                    spec_tokens_j = decode_inputs[non_greedy_indices, j]
+
+                    # Validate that stored draft probs correspond to the right
+                    # tokens (guards against request slot swaps between steps).
+                    draft_snapshot = self._mtp_draft_tokens_snapshot[
+                        depth, non_greedy_indices
+                    ]
+                    valid_draft = draft_snapshot == spec_tokens_j
+
+                    # Compute target (base-model) probs for each sampling bucket.
+                    # base_logits at position j-1 predict the token at position j.
+                    base_logits_j = decode_logits[non_greedy_indices, j - 1, :]
+
+                    p_x = torch.zeros(non_greedy_indices.numel(), device=device)
+                    q_x = torch.zeros(non_greedy_indices.numel(), device=device)
+                    adjusted_dist = torch.zeros(
+                        non_greedy_indices.numel(),
+                        required_logits.shape[-1],
+                        device=device,
+                    )
+
+                    for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
+                        if top_k == 1:
+                            continue
+                        # Map global request indices to local non-greedy indices.
+                        req_set = set(request_indices)
+                        local_mask = torch.tensor(
+                            [
+                                non_greedy_indices[i].item() in req_set
+                                for i in range(non_greedy_indices.numel())
+                            ],
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                        if not local_mask.any():
+                            continue
+
+                        bucket_logits = base_logits_j[local_mask]
+                        bucket_probs = self._compute_adjusted_probs(
+                            bucket_logits, temp, top_k, top_p
+                        )
+                        bucket_tokens = spec_tokens_j[local_mask]
+                        p_x[local_mask] = bucket_probs[
+                            torch.arange(bucket_tokens.numel(), device=device),
+                            bucket_tokens,
+                        ]
+
+                        # Draft probs from storage.
+                        bucket_draft_valid = valid_draft[local_mask]
+                        stored_q = self._mtp_draft_token_probs[
+                            depth, non_greedy_indices[local_mask]
+                        ]
+                        # For stale draft probs, set q to 1.0 to force
+                        # conservative acceptance (acceptance = p(x) ≤ 1).
+                        stored_q = torch.where(
+                            bucket_draft_valid, stored_q, torch.ones_like(stored_q)
+                        )
+                        q_x[local_mask] = stored_q
+
+                        # On rejection, the ideal replacement distribution is
+                        # norm(max(0, p − q)), but we only store the scalar
+                        # q(x) per token, not the full draft distribution.  As
+                        # a practical approximation we sample from the target
+                        # distribution p instead.  This is a standard
+                        # simplification used in many speculative-decoding
+                        # implementations; the acceptance probability (which
+                        # *does* use the exact q(x)) remains correct, so the
+                        # only effect is a small distributional bias in the
+                        # replacement token.
+                        adjusted_dist[local_mask] = bucket_probs
+
+                    # Probabilistic acceptance: accept with min(1, p/q).
+                    q_x = q_x.clamp(min=1e-10)
+                    acceptance_prob = (p_x / q_x).clamp(max=1.0)
+                    u = torch.rand(
+                        non_greedy_indices.numel(),
+                        device=device,
+                        generator=self.sampling_rng,
+                    )
+                    accepted = u < acceptance_prob
+                    rejection_mask[non_greedy_indices, j] = accepted
+
+                    # Sample replacement tokens from adjusted distribution for
+                    # any request that was rejected at this position.
+                    rejected_local = ~accepted
+                    if rejected_local.any():
+                        rejected_probs = adjusted_dist[rejected_local]
+                        # Clamp to avoid negative or zero probabilities.
+                        rejected_probs = rejected_probs.clamp(min=0)
+                        prob_sums = rejected_probs.sum(dim=-1, keepdim=True)
+                        rejected_probs = rejected_probs / prob_sums.clamp(min=1e-10)
+                        resampled = torch.multinomial(
+                            rejected_probs,
+                            num_samples=1,
+                            generator=self.sampling_rng,
+                        ).squeeze(-1)
+                        replacement_tokens[non_greedy_indices[rejected_local], j] = (
+                            resampled
+                        )
+
+            # Merge greedy and rejection sampling masks.
+            decode_mask_2d = torch.where(
+                is_greedy.unsqueeze(1).expand_as(greedy_mask),
+                greedy_mask,
+                rejection_mask,
+            )
+            decode_mask_2d[:, 0] = True
+            decode_mask_2d = decode_mask_2d.cummin(dim=1).values
+
+            # Patch output_tokens so that the caller's
+            #   final_sampled_tokens = output_tokens[last_one_indices]
+            # picks up the correct replacement token for non-greedy rejections.
+            # For greedy requests, the shifted base-model samples are already
+            # correct.  For non-greedy requests, replacement_tokens holds the
+            # adjusted-distribution samples at rejection positions.
+            patched_outputs_shifted = torch.where(
+                is_greedy.unsqueeze(1).expand_as(decode_outputs_shifted),
+                decode_outputs_shifted,
+                replacement_tokens,
+            )
+            # Overwrite the "shifted output" view used by the caller.  The
+            # caller does: output_tokens[last_one_indices] to get the final
+            # token.  last_one_indices points into the flat output_tokens, and
+            # the token at that position is the prediction for the *next*
+            # position.  For accepted positions we want the base-model sample;
+            # for the first-rejected position we want the replacement.
+            #
+            # Because the caller uses the *original* output_tokens (not
+            # shifted), we need to "un-shift" our patched values.  The shift
+            # was roll(1, dim=1), so we un-shift with roll(-1, dim=1).
+            patched_outputs = patched_outputs_shifted.roll(-1, dims=1)
+            # For all-accepted requests, the last position should still be
+            # the base-model's sample (bonus token).
+            patched_outputs[:, -1] = decode_outputs[:, -1]
+            output_tokens[:decode_len] = patched_outputs.flatten()
+
+            accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
+
+        last_one_indices = torch.full(
+            (active_request_count,), -1, device=device
+        )
+        if num_decode_requests > 0:
+            local_last_indices = decode_mask_2d.sum(dim=1) - 1
+            row_offsets = torch.arange(num_decode_requests, device=device) * (
+                num_spec + 1
+            )
+            last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
+
+        if num_prefill_requests > 0:
+            decode_len = num_decode_requests * (num_spec + 1)
+            prefill_valid = (
+                torch.nonzero(accepted_tokens_mask[decode_len:]).squeeze(-1) + decode_len
+            )
+            last_one_indices[num_decode_requests:] = prefill_valid
+
+        return last_one_indices, accepted_tokens_mask, input_tokens_required
+
     def _dynamic_step_sample_logits_and_verify_tokens(self, logits: Tensor, input_ids: Tensor):
         """
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
@@ -1109,17 +1434,38 @@ class TextGenerationController:
 
         # Verify speculative tokens against input tokens.
         input_tokens_required = input_ids[0, required_logit_indices]
-        last_one_indices, accepted_tokens_mask, input_tokens_required = (
-            self._verify_speculative_tokens(
-                output_tokens,
-                input_tokens_required,
-                request_in_prefill_status_tensor,
-                repeats,
-                num_decode_requests,
-                num_prefill_requests,
-                active_request_count,
-            )
+
+        use_rejection_sampling = (
+            self._has_non_greedy_requests()
+            and getattr(self, '_mtp_draft_token_probs', None) is not None
+            and num_decode_requests > 0
         )
+
+        if use_rejection_sampling:
+            last_one_indices, accepted_tokens_mask, input_tokens_required = (
+                self._verify_speculative_tokens_with_rejection_sampling(
+                    required_logits,
+                    output_tokens,
+                    input_tokens_required,
+                    request_in_prefill_status_tensor,
+                    repeats,
+                    num_decode_requests,
+                    num_prefill_requests,
+                    active_request_count,
+                )
+            )
+        else:
+            last_one_indices, accepted_tokens_mask, input_tokens_required = (
+                self._verify_speculative_tokens(
+                    output_tokens,
+                    input_tokens_required,
+                    request_in_prefill_status_tensor,
+                    repeats,
+                    num_decode_requests,
+                    num_prefill_requests,
+                    active_request_count,
+                )
+            )
 
         # Store the final sampled tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]

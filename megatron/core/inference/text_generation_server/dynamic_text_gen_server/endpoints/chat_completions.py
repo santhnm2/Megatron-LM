@@ -24,19 +24,11 @@ _TOKEN_ID_FIELDS_TO_REDACT = {
     "generation_token_ids",
 }
 
-_INDEX_FIELDS_TO_REDACT = {
-    "routing_indices",
-    "moe_topk_indices",
-    "prompt_moe_topk_indices",
-}
+_INDEX_FIELDS_TO_REDACT = {"routing_indices", "moe_topk_indices", "prompt_moe_topk_indices"}
 
-_HASH_FIELDS_TO_REDACT = {
-    "precomputed_block_hashes",
-}
+_HASH_FIELDS_TO_REDACT = {"precomputed_block_hashes"}
 
-_NUMERIC_SERIES_FIELDS_TO_REDACT = {
-    "tpot",
-}
+_NUMERIC_SERIES_FIELDS_TO_REDACT = {"tpot"}
 
 
 def _is_int_list_like(value):
@@ -50,10 +42,7 @@ def _is_numeric_list_like(value):
     """Return True for numeric lists, including nested numeric lists."""
     if not isinstance(value, list):
         return False
-    return all(
-        isinstance(item, (int, float)) or _is_numeric_list_like(item)
-        for item in value
-    )
+    return all(isinstance(item, (int, float)) or _is_numeric_list_like(item) for item in value)
 
 
 def _redact_token_id_lists_for_logging(value):
@@ -62,21 +51,15 @@ def _redact_token_id_lists_for_logging(value):
         redacted = {}
         for key, item in value.items():
             if (
-                (
-                    key in _TOKEN_ID_FIELDS_TO_REDACT
-                    or key in _INDEX_FIELDS_TO_REDACT
-                    or key in _HASH_FIELDS_TO_REDACT
-                    or key.endswith("_token_ids")
-                    or key.endswith("_topk_indices")
-                    or key.endswith("_hashes")
-                )
-                and _is_int_list_like(item)
-            ):
+                key in _TOKEN_ID_FIELDS_TO_REDACT
+                or key in _INDEX_FIELDS_TO_REDACT
+                or key in _HASH_FIELDS_TO_REDACT
+                or key.endswith("_token_ids")
+                or key.endswith("_topk_indices")
+                or key.endswith("_hashes")
+            ) and _is_int_list_like(item):
                 redacted[key] = "...truncated..."
-            elif (
-                key in _NUMERIC_SERIES_FIELDS_TO_REDACT
-                and _is_numeric_list_like(item)
-            ):
+            elif key in _NUMERIC_SERIES_FIELDS_TO_REDACT and _is_numeric_list_like(item):
                 redacted[key] = "...truncated..."
             else:
                 redacted[key] = _redact_token_id_lists_for_logging(item)
@@ -92,13 +75,6 @@ def _get_field(obj, key, default=None):
         return obj.get(key, default)
     return getattr(obj, key, default)
 
-
-_STRUCTURED_TOOL_ARG_KEYS = {
-    "flights",
-    "passengers",
-    "payment_methods",
-    "payment_history",
-}
 
 _TRANSFER_TOOL_NAME = "transfer_to_human_agents"
 _TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
@@ -122,13 +98,61 @@ def _try_parse_jsonish(value):
         return value
 
 
-def _normalize_structured_tool_arguments(arguments):
-    """Coerce known structured tool args from JSON strings to objects/lists."""
+def _extract_declared_types(schema):
+    """Recursively extract declared JSON-schema type names."""
+    declared = set()
+    if not isinstance(schema, dict):
+        return declared
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        declared.add(schema_type.strip().lower())
+    elif isinstance(schema_type, list):
+        for item in schema_type:
+            if isinstance(item, str):
+                declared.add(item.strip().lower())
+
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        options = schema.get(combinator)
+        if isinstance(options, list):
+            for option in options:
+                declared.update(_extract_declared_types(option))
+    return declared
+
+
+def _get_tool_argument_schemas(tools):
+    """Build function-name to argument-schema mapping from request tools."""
+    schemas = {}
+    if not isinstance(tools, list):
+        return schemas
+
+    for tool in tools:
+        function = _get_field(tool, "function", {}) or {}
+        function_name = _get_field(function, "name")
+        params = _get_field(function, "parameters", {})
+        if not isinstance(function_name, str) or not isinstance(params, dict):
+            continue
+        if isinstance(params.get("properties"), dict):
+            schemas[function_name] = params.get("properties")
+        else:
+            schemas[function_name] = params
+    return schemas
+
+
+def _normalize_structured_tool_arguments(arguments, function_name, tool_argument_schemas):
+    """Coerce structured (array/object) args from JSON strings to native types."""
     if not isinstance(arguments, dict):
         return arguments
+
+    function_schema = tool_argument_schemas.get(function_name, {})
+    if not isinstance(function_schema, dict):
+        return arguments
+
     normalized = dict(arguments)
-    for key in _STRUCTURED_TOOL_ARG_KEYS:
-        if key not in normalized:
+    for key in normalized:
+        param_schema = function_schema.get(key)
+        declared_types = _extract_declared_types(param_schema)
+        if not (declared_types & {"array", "arr", "object", "dict", "list"}):
             continue
         parsed = _try_parse_jsonish(normalized[key])
         if isinstance(parsed, (dict, list)):
@@ -136,8 +160,9 @@ def _normalize_structured_tool_arguments(arguments):
     return normalized
 
 
-def _normalize_tool_calls(tool_calls):
+def _normalize_tool_calls(tool_calls, tools=None):
     """Normalize tool calls to OpenAI-compatible JSON primitives."""
+    tool_argument_schemas = _get_tool_argument_schemas(tools)
     normalized = []
     for call in tool_calls or []:
         fn = _get_field(call, "function", {}) or {}
@@ -152,11 +177,15 @@ def _normalize_tool_calls(tool_calls):
                 parsed_args = None
             if isinstance(parsed_args, dict):
                 fn_args = json.dumps(
-                    _normalize_structured_tool_arguments(parsed_args), ensure_ascii=False
+                    _normalize_structured_tool_arguments(
+                        parsed_args, fn_name, tool_argument_schemas
+                    ),
+                    ensure_ascii=False,
                 )
         elif isinstance(fn_args, dict):
             fn_args = json.dumps(
-                _normalize_structured_tool_arguments(fn_args), ensure_ascii=False
+                _normalize_structured_tool_arguments(fn_args, fn_name, tool_argument_schemas),
+                ensure_ascii=False,
             )
         else:
             try:
@@ -391,7 +420,9 @@ try:
             prev_text = message_text
             parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
             if "tool_calls" in new_info:
-                new_info["tool_calls"] = _normalize_tool_calls(new_info.get("tool_calls", []))
+                new_info["tool_calls"] = _normalize_tool_calls(
+                    new_info.get("tool_calls", []), tools=tools
+                )
                 if not tools_requested:
                     # Ignore incidental tool-call syntax in plain chat mode.
                     parsed_text = prev_text
@@ -492,17 +523,27 @@ try:
                             **chat_template_kwargs,
                         )
 
-                        # Replace the prefix tokens with the tokens from the previous generation
-                        previous_turn_token_ids = (
-                            last_assistant_message["prompt_token_ids"] 
-                            + last_assistant_message["generation_token_ids"]
-                        )
-                        prompt_tokens = _replace_prefix_tokens(
-                            eos_token_id,
-                            previous_turn_token_ids,
-                            retokenized_previous_turn_token_ids,
-                            prompt_tokens,
-                        )
+                        # Replace the prefix tokens with the tokens from the previous generation.
+                        # If prior token IDs are unavailable, fall back to normal retokenized prompt
+                        # instead of failing the request.
+                        prompt_token_ids = last_assistant_message.get("prompt_token_ids")
+                        generation_token_ids = last_assistant_message.get("generation_token_ids")
+
+                        if isinstance(prompt_token_ids, list) and isinstance(
+                            generation_token_ids, list
+                        ):
+                            previous_turn_token_ids = prompt_token_ids + generation_token_ids
+                            prompt_tokens = _replace_prefix_tokens(
+                                eos_token_id,
+                                previous_turn_token_ids,
+                                retokenized_previous_turn_token_ids,
+                                prompt_tokens,
+                            )
+                        else:
+                            logger.warning(
+                                "Last assistant message missing prompt_token_ids/"
+                                "generation_token_ids; skipping prefix replacement."
+                            )
 
             else:
                 warnings.warn(
@@ -655,7 +696,7 @@ try:
 
             if parsers:
                 message_text, metadata = apply_parsers(
-                    message_text, req.get("tools", None), parsers, tools_requested
+                    message_text, tools, parsers, tools_requested
                 )
 
             normalized_tool_calls = metadata.get("tool_calls", [])

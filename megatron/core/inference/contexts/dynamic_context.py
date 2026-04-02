@@ -19,6 +19,8 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
+    compute_kv_block_size_bytes,
+    compute_mamba_memory_per_request,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -356,43 +358,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
         self.block_size_tokens = inference_config.block_size_tokens
         if self.cache_mla_latent:
-            #   one vector  c_t  (rank)  +  optional RoPE phase slice
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
-            self.block_size_bytes = (
-                kv_dtype_size_bytes
-                * self.num_attention_layers
-                * self.block_size_tokens
-                * self.kv_reduced_dim
-            )
-        else:
-            self.block_size_bytes = (
-                kv_dtype_size_bytes
-                * 2  # key, value
-                * self.num_attention_layers
-                * self.block_size_tokens
-                * self.num_attention_heads_per_partition
-                * self.hidden_size_per_attention_head
-            )
+        self.block_size_bytes = compute_kv_block_size_bytes(
+            kv_dtype_size=kv_dtype_size_bytes,
+            num_attention_layers=self.num_attention_layers,
+            block_size_tokens=self.block_size_tokens,
+            cache_mla_latent=self.cache_mla_latent,
+            kv_reduced_dim=getattr(self, 'kv_reduced_dim', 0),
+            heads_per_partition=self.num_attention_heads_per_partition,
+            head_size=self.hidden_size_per_attention_head,
+        )
         assert self.block_size_bytes > 0
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
-                math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+            mamba_states_memory_per_request = compute_mamba_memory_per_request(
+                inference_config.mamba_inference_state_config,
+                self.num_mamba_layers,
+                self.num_speculative_tokens,
             )
-            mamba_states_memory_per_request += (
-                math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-            )
-            mamba_states_memory_per_request *= self.num_mamba_layers
-            if self.num_speculative_tokens > 0:
-                # Add memory for intermediate conv and SSM states
-                intermediate_memory_per_request = (
-                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-                )
-                intermediate_memory_per_request *= self.num_mamba_layers
-                intermediate_memory_per_request *= self.num_speculative_tokens + 1
-                mamba_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level

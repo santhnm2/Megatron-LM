@@ -1,14 +1,111 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+import math
+import warnings
+from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+if TYPE_CHECKING:
+    from megatron.core.transformer import TransformerConfig
+
+
+def compute_kv_block_size_bytes(
+    *,
+    kv_dtype_size: int,
+    num_attention_layers: int,
+    block_size_tokens: int,
+    cache_mla_latent: bool,
+    kv_reduced_dim: int = 0,
+    heads_per_partition: int = 0,
+    head_size: int = 0,
+) -> int:
+    """Compute the byte size of a single KV cache block.
+
+    This is the single source of truth used by both ``InferenceConfig``
+    and ``DynamicInferenceContext``.
+    """
+    if cache_mla_latent:
+        return kv_dtype_size * num_attention_layers * block_size_tokens * kv_reduced_dim
+    return (
+        kv_dtype_size
+        * 2  # key + value
+        * num_attention_layers
+        * block_size_tokens
+        * heads_per_partition
+        * head_size
+    )
+
+
+def compute_mamba_memory_per_request(
+    mamba_config: "MambaInferenceStateConfig",
+    num_mamba_layers: int,
+    num_speculative_tokens: int = 0,
+) -> int:
+    """Compute the per-request Mamba state memory in bytes.
+
+    This is the single source of truth used by both ``InferenceConfig``
+    and ``DynamicInferenceContext``.
+    """
+    if num_mamba_layers == 0:
+        return 0
+
+    conv_bytes = math.prod(mamba_config.conv_states_shape) * mamba_config.conv_states_dtype.itemsize
+    ssm_bytes = math.prod(mamba_config.ssm_states_shape) * mamba_config.ssm_states_dtype.itemsize
+    per_layer = conv_bytes + ssm_bytes
+
+    total = per_layer * num_mamba_layers
+    if num_speculative_tokens > 0:
+        total += per_layer * num_mamba_layers * (num_speculative_tokens + 1)
+    return total
+
+
+def measure_peak_activation_memory(
+    model: MegatronModule,
+    max_tokens: int,
+    tp_size: int = 1,
+) -> int:
+    """Measure peak transient activation memory by running a dummy forward pass.
+
+    Runs the model with ``max_tokens`` tokens (no inference context, no KV cache)
+    and returns the peak GPU memory increase observed during the forward pass.
+
+    Args:
+        model: The model, already on GPU and in eval mode.
+        max_tokens: Number of tokens in the dummy forward pass.
+        tp_size: Tensor-parallel size. The token count is rounded up to a
+            multiple of ``tp_size`` for sequence-parallel compatibility.
+
+    Returns:
+        Peak activation memory in bytes.
+    """
+    num_tokens = max(tp_size, max_tokens)
+    num_tokens = ((num_tokens + tp_size - 1) // tp_size) * tp_size
+
+    device = torch.cuda.current_device()
+    tokens = torch.zeros((1, num_tokens), dtype=torch.long, device=device)
+    position_ids = torch.zeros((1, num_tokens), dtype=torch.long, device=device)
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    baseline = torch.cuda.memory_allocated()
+
+    with torch.inference_mode():
+        model(tokens, position_ids, attention_mask=None)
+
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+
+    del tokens, position_ids
+    torch.cuda.empty_cache()
+
+    return max(0, peak - baseline)
 
 
 @dataclass
@@ -122,6 +219,11 @@ class InferenceConfig:
     """
     Config for inference.
 
+    When ``model_config`` is provided, fields left as ``None`` are auto-computed
+    from the model architecture and available GPU memory.  Fields set explicitly
+    are used as-is (an exception is raised if the constraints are impossible to
+    satisfy).
+
     NOTE: Must remain mutually exclusive with the `TransformerConfig`.
     """
 
@@ -131,9 +233,11 @@ class InferenceConfig:
     block_size_tokens: int = 256
     """Size of KV cache block size."""
 
-    buffer_size_gb: int = 20
+    buffer_size_gb: Optional[float] = None
     """
     Buffer size reserved on the GPU for the KV cache.
+    Auto-computed from GPU memory when ``model_config`` is provided and this is
+    ``None``.  Must be set explicitly when ``model_config`` is not provided.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
@@ -152,20 +256,23 @@ class InferenceConfig:
 
     mamba_memory_ratio: Optional[float] = None
     """
-    Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
-    state tensors for each KV cache block. Only used for hybrid models.
+    Percentage of memory buffer to allocate for Mamba states.  Auto-computed as
+    the natural proportion of Mamba-to-total per-request memory when
+    ``model_config`` is provided and this is ``None``.  Only used for hybrid
+    models.
     """
 
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.
-    This is primarily limited by the combination of `buffer_size_gb` and `max_sequence_length`.
+    Auto-computed to maximise throughput within the memory budget when
+    ``model_config`` is provided and this is ``None``.
     """
 
-    max_tokens: Optional[int] = None
+    max_tokens: int = 16384
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation
-    memory usage. (Defaults to 16384).
+    memory usage.
     """
 
     unified_memory_level: int = 0
@@ -193,7 +300,7 @@ class InferenceConfig:
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
-    """ 
+    """
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
     """
 
@@ -309,9 +416,175 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
-    def __post_init__(self):
+    # =================================
+    # Auto-configuration inputs (not stored on the instance)
+    # =================================
+    model_config: InitVar[Optional["TransformerConfig"]] = None
+    """When provided, ``None``-valued fields (``buffer_size_gb``,
+    ``mamba_memory_ratio``, ``max_requests``) are auto-computed from
+    the model architecture and available GPU memory."""
+
+    model: InitVar[Optional[MegatronModule]] = None
+    """Optional model instance (on GPU, eval mode).  When provided alongside
+    ``model_config``, a dummy forward pass measures peak activation memory so
+    the KV-cache buffer fills remaining GPU memory exactly."""
+
+    gpu_memory_fraction: InitVar[float] = 0.90
+    """Fraction of free GPU memory to use for the KV-cache buffer.  Only used
+    when ``model`` is *not* provided."""
+
+    gpu_memory_budget_gb: InitVar[Optional[float]] = None
+    """Explicit GPU memory budget in GB.  Overrides both GPU probing and
+    activation measurement.  Useful for offline planning."""
+
+    def __post_init__(self, model_config, model, gpu_memory_fraction, gpu_memory_budget_gb):
+        # --- static validation ---
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if model_config is None:
+            # Legacy path: no auto-computation, require buffer_size_gb.
+            if self.buffer_size_gb is None:
+                raise ValueError(
+                    "buffer_size_gb must be set explicitly when model_config "
+                    "is not provided."
+                )
+            return
+
+        # --- auto-configuration from model_config ---
+        from megatron.core.transformer import MLATransformerConfig
+
+        is_mla = (
+            isinstance(model_config, MLATransformerConfig)
+            and model_config.cache_mla_latents
+        )
+        kv_dtype_size = model_config.params_dtype.itemsize
+        num_kv_heads = model_config.num_query_groups or model_config.num_attention_heads
+        tp_size = model_config.tensor_model_parallel_size
+        pp_size = model_config.pipeline_model_parallel_size
+
+        # Layer counts.
+        if self.mamba_inference_state_config is not None:
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+            ltl = self.mamba_inference_state_config.layer_type_list
+            num_attn_layers = max(
+                1, sum(1 for lt in ltl if lt == Symbols.ATTENTION) // pp_size
+            )
+            num_mamba_layers = max(
+                0, sum(1 for lt in ltl if lt == Symbols.MAMBA) // pp_size
+            )
+        else:
+            num_attn_layers = model_config.num_layers // pp_size
+            num_mamba_layers = 0
+
+        # Per-block KV cache bytes.
+        head_size = model_config.kv_channels or (
+            model_config.hidden_size // model_config.num_attention_heads
+        )
+        heads_per_partition = (
+            num_kv_heads // tp_size if num_kv_heads >= tp_size else 1
+        )
+        block_size_bytes = compute_kv_block_size_bytes(
+            kv_dtype_size=kv_dtype_size,
+            num_attention_layers=num_attn_layers,
+            block_size_tokens=self.block_size_tokens,
+            cache_mla_latent=is_mla,
+            kv_reduced_dim=(
+                model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
+                if is_mla else 0
+            ),
+            heads_per_partition=heads_per_partition,
+            head_size=head_size,
+        )
+
+        # Per-request Mamba state bytes.
+        mamba_bytes_per_request = 0
+        if self.mamba_inference_state_config is not None:
+            mamba_bytes_per_request = compute_mamba_memory_per_request(
+                self.mamba_inference_state_config,
+                num_mamba_layers,
+                self.num_speculative_tokens,
+            )
+
+        # --- mamba_memory_ratio ---
+        if self.mamba_memory_ratio is None and mamba_bytes_per_request > 0:
+            blocks_per_request = math.ceil(
+                self.max_sequence_length / self.block_size_tokens
+            )
+            kv_per_request = blocks_per_request * block_size_bytes
+            self.mamba_memory_ratio = mamba_bytes_per_request / (
+                kv_per_request + mamba_bytes_per_request
+            )
+
+        # --- buffer_size_gb ---
+        if self.buffer_size_gb is None:
+            if gpu_memory_budget_gb is not None:
+                budget_bytes = int(gpu_memory_budget_gb * 1024**3)
+            elif model is not None:
+                activation_bytes = measure_peak_activation_memory(
+                    model, self.max_tokens, tp_size=tp_size,
+                )
+                free_mem, _ = torch.cuda.mem_get_info()
+                budget_bytes = max(0, free_mem - activation_bytes)
+            else:
+                try:
+                    free_mem, _ = torch.cuda.mem_get_info()
+                    budget_bytes = int(free_mem * gpu_memory_fraction)
+                except (RuntimeError, AssertionError):
+                    raise RuntimeError(
+                        "Cannot determine GPU memory.  Pass buffer_size_gb or "
+                        "gpu_memory_budget_gb explicitly."
+                    )
+
+            # Reserve Mamba prefix-caching memory.
+            if self.prefix_caching_mamba_gb is not None and self.prefix_caching_mamba_gb > 0:
+                budget_bytes = max(
+                    0, budget_bytes - int(self.prefix_caching_mamba_gb * 1024**3)
+                )
+
+            self.buffer_size_gb = budget_bytes / (1024**3)
+
+        # --- max_requests ---
+        if self.max_requests is None:
+            budget_bytes = int(self.buffer_size_gb * 1024**3)
+            REQUEST_ROUNDER = 4
+
+            if self.mamba_memory_ratio is not None:
+                kv_budget = int(budget_bytes * (1.0 - self.mamba_memory_ratio))
+                mamba_budget = int(budget_bytes * self.mamba_memory_ratio)
+                block_count = max(2, kv_budget // block_size_bytes)
+                mamba_max = int(mamba_budget // mamba_bytes_per_request)
+                computed = min(block_count - 1, mamba_max)
+            else:
+                effective = block_size_bytes + mamba_bytes_per_request
+                block_count = max(2, budget_bytes // effective)
+                computed = block_count - 1
+
+            computed = (computed // tp_size) * tp_size
+            computed = (computed // REQUEST_ROUNDER) * REQUEST_ROUNDER
+            self.max_requests = max(REQUEST_ROUNDER, computed)
+
+        # --- validate explicit max_requests fits the budget ---
+        else:
+            blocks_per_request = math.ceil(
+                self.max_sequence_length / self.block_size_tokens
+            )
+            blocks_needed = self.max_requests * blocks_per_request + 1
+            if self.mamba_memory_ratio is not None:
+                kv_needed = blocks_needed * block_size_bytes
+                needed_bytes = int(kv_needed / (1.0 - self.mamba_memory_ratio))
+            else:
+                needed_bytes = blocks_needed * (
+                    block_size_bytes + mamba_bytes_per_request
+                )
+            budget_bytes = int(self.buffer_size_gb * 1024**3)
+            if needed_bytes > budget_bytes:
+                raise ValueError(
+                    f"max_requests={self.max_requests} requires "
+                    f"{needed_bytes / 1024**3:.1f} GB but buffer_size_gb is "
+                    f"{self.buffer_size_gb:.1f} GB."
+                )

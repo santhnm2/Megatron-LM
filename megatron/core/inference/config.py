@@ -523,6 +523,7 @@ class InferenceConfig:
             )
 
         # --- buffer_size_gb ---
+        activation_bytes = None
         if self.buffer_size_gb is None:
             if gpu_memory_budget_gb is not None:
                 budget_bytes = int(gpu_memory_budget_gb * 1024**3)
@@ -591,24 +592,69 @@ class InferenceConfig:
                     f"{self.buffer_size_gb:.1f} GB."
                 )
 
-        self._log_config()
+        self._log_config(
+            activation_bytes=activation_bytes,
+            block_size_bytes=block_size_bytes,
+            num_attn_layers=num_attn_layers,
+            num_mamba_layers=num_mamba_layers,
+            mamba_bytes_per_request=mamba_bytes_per_request,
+        )
 
-    def _log_config(self):
-        """Log the resolved inference configuration."""
+    def _log_config(
+        self,
+        *,
+        activation_bytes=None,
+        block_size_bytes=None,
+        num_attn_layers=None,
+        num_mamba_layers=None,
+        mamba_bytes_per_request=None,
+    ):
+        """Log the resolved inference configuration on rank 0."""
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
         lines = [
             "InferenceConfig:",
-            f"  buffer_size_gb      = {self.buffer_size_gb}",
-            f"  max_requests        = {self.max_requests}",
-            f"  max_tokens          = {self.max_tokens}",
-            f"  max_sequence_length = {self.max_sequence_length}",
-            f"  block_size_tokens   = {self.block_size_tokens}",
+            f"  buffer_size_gb        = {self.buffer_size_gb}",
+            f"  max_requests          = {self.max_requests}",
+            f"  max_tokens            = {self.max_tokens}",
+            f"  max_sequence_length   = {self.max_sequence_length}",
+            f"  block_size_tokens     = {self.block_size_tokens}",
         ]
+        if block_size_bytes is not None:
+            lines.append(f"  kv_block_size_bytes   = {block_size_bytes}")
+            if self.buffer_size_gb is not None and self.mamba_memory_ratio is not None:
+                kv_budget = int(
+                    self.buffer_size_gb * 1024**3 * (1.0 - self.mamba_memory_ratio)
+                )
+            elif self.buffer_size_gb is not None:
+                kv_budget = int(self.buffer_size_gb * 1024**3)
+            else:
+                kv_budget = 0
+            if kv_budget > 0:
+                num_kv_blocks = kv_budget // block_size_bytes
+                lines.append(f"  num_kv_blocks         = {num_kv_blocks}")
+        if num_attn_layers is not None:
+            lines.append(f"  num_attention_layers  = {num_attn_layers}")
+        if activation_bytes is not None:
+            lines.append(
+                f"  activation_memory     = {activation_bytes / 1024**3:.2f} GB"
+            )
         if self.mamba_memory_ratio is not None:
-            lines.append(f"  mamba_memory_ratio  = {self.mamba_memory_ratio:.4f}")
+            lines.append(f"  mamba_memory_ratio    = {self.mamba_memory_ratio:.4f}")
+        if num_mamba_layers is not None and num_mamba_layers > 0:
+            mc = self.mamba_inference_state_config
+            lines.append(f"  num_mamba_layers      = {num_mamba_layers}")
+            lines.append(f"  mamba_bytes_per_req   = {mamba_bytes_per_request}")
+            lines.append(f"  mamba_conv_shape      = {mc.conv_states_shape}")
+            lines.append(f"  mamba_ssm_shape       = {mc.ssm_states_shape}")
+            lines.append(f"  mamba_conv_dtype      = {mc.conv_states_dtype}")
+            lines.append(f"  mamba_ssm_dtype       = {mc.ssm_states_dtype}")
+            lines.append(f"  mamba_chunk_size      = {mc.mamba_chunk_size}")
         if self.num_speculative_tokens > 0:
             lines.append(f"  num_speculative_tokens = {self.num_speculative_tokens}")
         if self.prefix_caching_mamba_gb is not None:
             lines.append(f"  prefix_caching_mamba_gb = {self.prefix_caching_mamba_gb}")
         if self.num_cuda_graphs is not None:
-            lines.append(f"  num_cuda_graphs     = {self.num_cuda_graphs}")
+            lines.append(f"  num_cuda_graphs       = {self.num_cuda_graphs}")
         logging.info("\n".join(lines))

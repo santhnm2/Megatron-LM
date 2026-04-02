@@ -1444,7 +1444,6 @@ def validate_args(args, defaults={}):
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
     if args.inference_dynamic_batching:
-        assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
@@ -1790,8 +1789,10 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
-                       type=float, default=40.,
+                       type=float, default=None,
                        help='Amount of on-GPU memory allocated for the KV cache. '
+                       'When not specified, the buffer size is auto-computed from '
+                       'available GPU memory. '
                        'The total amount of memory allocated for the KV cache '
                        '(CPU + GPU memory) depends on the value set for the '
                        'unified virtual memory (UVM) level (via '

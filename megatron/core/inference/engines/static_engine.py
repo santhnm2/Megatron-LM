@@ -53,7 +53,7 @@ class StaticInferenceEngine(AbstractEngine):
         max_batch_size: Optional[int] = None,
         random_seed: Optional[int] = None,
         legacy=False,
-        buffer_size_gb: Optional[float] = 40,
+        buffer_size_gb: Optional[float] = None,
     ):
         self.legacy = legacy
         if legacy:
@@ -108,6 +108,7 @@ class StaticInferenceEngine(AbstractEngine):
                         num_cuda_graphs=1,
                         block_size_tokens=256,
                         unified_memory_level=0,
+                        model_config=self.config,
                     ),
                 )
 

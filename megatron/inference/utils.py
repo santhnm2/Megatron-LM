@@ -328,6 +328,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
             )
 
     return InferenceConfig(
+        model_config=get_attr_wrapped_model(model, "config", allow_none=False),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,

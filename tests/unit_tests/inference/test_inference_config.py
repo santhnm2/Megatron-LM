@@ -21,8 +21,8 @@ from tests.unit_tests.test_utilities import Utils
 
 def _make_tiny_gpt_model():
     """Build a tiny GPT model on GPU for tests that need a real model."""
-    from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
 
     config = TransformerConfig(
         num_layers=2,
@@ -127,7 +127,7 @@ class TestComputeHelpers:
         )
         base = compute_mamba_memory_per_request(config, num_mamba_layers=4)
         with_spec = compute_mamba_memory_per_request(
-            config, num_mamba_layers=4, num_speculative_tokens=3,
+            config, num_mamba_layers=4, num_speculative_tokens=3
         )
         assert with_spec > base
         # Speculative adds (spec+1) * per_layer * num_layers.
@@ -180,9 +180,7 @@ class TestAutoConfigurePureTransformer:
     def test_basic(self):
         model_config = self._make_model_config()
         config = InferenceConfig(
-            model_config=model_config,
-            max_sequence_length=4096,
-            gpu_memory_budget_gb=20.0,
+            model_config=model_config, max_sequence_length=4096, gpu_memory_budget_gb=20.0
         )
         assert config.max_sequence_length == 4096
         assert config.block_size_tokens == 256
@@ -196,9 +194,7 @@ class TestAutoConfigurePureTransformer:
         budget_gb = 20.0
 
         config = InferenceConfig(
-            model_config=model_config,
-            max_sequence_length=4096,
-            gpu_memory_budget_gb=budget_gb,
+            model_config=model_config, max_sequence_length=4096, gpu_memory_budget_gb=budget_gb
         )
 
         # Reproduce the expected calculation.
@@ -227,14 +223,10 @@ class TestAutoConfigurePureTransformer:
         model_config_gqa = self._make_model_config(num_query_groups=8)
 
         config_mha = InferenceConfig(
-            model_config=model_config_mha,
-            max_sequence_length=4096,
-            gpu_memory_budget_gb=20.0,
+            model_config=model_config_mha, max_sequence_length=4096, gpu_memory_budget_gb=20.0
         )
         config_gqa = InferenceConfig(
-            model_config=model_config_gqa,
-            max_sequence_length=4096,
-            gpu_memory_budget_gb=20.0,
+            model_config=model_config_gqa, max_sequence_length=4096, gpu_memory_budget_gb=20.0
         )
         assert config_gqa.max_requests >= config_mha.max_requests
 
@@ -245,7 +237,15 @@ class TestAutoConfigureHybridMamba:
     @staticmethod
     def _make_mamba_config():
         return MambaInferenceStateConfig(
-            layer_type_list=[Symbols.MAMBA, Symbols.MAMBA, Symbols.ATTENTION, Symbols.MAMBA, Symbols.MAMBA, Symbols.ATTENTION] * 4,
+            layer_type_list=[
+                Symbols.MAMBA,
+                Symbols.MAMBA,
+                Symbols.ATTENTION,
+                Symbols.MAMBA,
+                Symbols.MAMBA,
+                Symbols.ATTENTION,
+            ]
+            * 4,
             conv_states_shape=(128, 4),
             ssm_states_shape=(128, 64),
             conv_states_dtype=torch.bfloat16,
@@ -409,9 +409,7 @@ class TestAutoConfigureEdgeCases:
     def test_auto_configure_from_gpu_memory(self):
         """Without explicit budget, buffer_size_gb is derived from real GPU memory."""
         model_config = self._make_model_config()
-        config = InferenceConfig(
-            model_config=model_config, max_sequence_length=2048,
-        )
+        config = InferenceConfig(model_config=model_config, max_sequence_length=2048)
         assert config.buffer_size_gb > 0
         assert config.max_requests > 0
 

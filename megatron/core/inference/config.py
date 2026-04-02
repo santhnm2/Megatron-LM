@@ -11,7 +11,7 @@ import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
 if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
@@ -67,11 +67,7 @@ def compute_mamba_memory_per_request(
     return total
 
 
-def measure_peak_activation_memory(
-    model: MegatronModule,
-    max_tokens: int,
-    tp_size: int = 1,
-) -> int:
+def measure_peak_activation_memory(model: MegatronModule, max_tokens: int, tp_size: int = 1) -> int:
     """Measure peak transient activation memory by running a dummy forward pass.
 
     Runs the model with ``max_tokens`` tokens (no inference context, no KV cache)
@@ -438,7 +434,9 @@ class InferenceConfig:
     """Explicit GPU memory budget in GB.  Overrides both GPU probing and
     activation measurement.  Useful for offline planning."""
 
-    def __post_init__(self, model_config, model, gpu_memory_fraction, gpu_memory_budget_gb):
+    def __post_init__(self, model, gpu_memory_fraction, gpu_memory_budget_gb):
+        self.model_config = get_model_config(model)
+
         # --- static validation ---
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
@@ -450,8 +448,7 @@ class InferenceConfig:
             # Legacy path: no auto-computation, require buffer_size_gb.
             if self.buffer_size_gb is None:
                 raise ValueError(
-                    "buffer_size_gb must be set explicitly when model_config "
-                    "is not provided."
+                    "buffer_size_gb must be set explicitly when model_config " "is not provided."
                 )
             self._log_config()
             return
@@ -459,10 +456,7 @@ class InferenceConfig:
         # --- auto-configuration from model_config ---
         from megatron.core.transformer import MLATransformerConfig
 
-        is_mla = (
-            isinstance(model_config, MLATransformerConfig)
-            and model_config.cache_mla_latents
-        )
+        is_mla = isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         kv_dtype_size = model_config.params_dtype.itemsize
         num_kv_heads = model_config.num_query_groups or model_config.num_attention_heads
         tp_size = model_config.tensor_model_parallel_size
@@ -473,12 +467,8 @@ class InferenceConfig:
             from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 
             ltl = self.mamba_inference_state_config.layer_type_list
-            num_attn_layers = max(
-                1, sum(1 for lt in ltl if lt == Symbols.ATTENTION) // pp_size
-            )
-            num_mamba_layers = max(
-                0, sum(1 for lt in ltl if lt == Symbols.MAMBA) // pp_size
-            )
+            num_attn_layers = max(1, sum(1 for lt in ltl if lt == Symbols.ATTENTION) // pp_size)
+            num_mamba_layers = max(0, sum(1 for lt in ltl if lt == Symbols.MAMBA) // pp_size)
         else:
             num_attn_layers = model_config.num_layers // pp_size
             num_mamba_layers = 0
@@ -487,17 +477,14 @@ class InferenceConfig:
         head_size = model_config.kv_channels or (
             model_config.hidden_size // model_config.num_attention_heads
         )
-        heads_per_partition = (
-            num_kv_heads // tp_size if num_kv_heads >= tp_size else 1
-        )
+        heads_per_partition = num_kv_heads // tp_size if num_kv_heads >= tp_size else 1
         block_size_bytes = compute_kv_block_size_bytes(
             kv_dtype_size=kv_dtype_size,
             num_attention_layers=num_attn_layers,
             block_size_tokens=self.block_size_tokens,
             cache_mla_latent=is_mla,
             kv_reduced_dim=(
-                model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
-                if is_mla else 0
+                model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim if is_mla else 0
             ),
             heads_per_partition=heads_per_partition,
             head_size=head_size,
@@ -507,16 +494,12 @@ class InferenceConfig:
         mamba_bytes_per_request = 0
         if self.mamba_inference_state_config is not None:
             mamba_bytes_per_request = compute_mamba_memory_per_request(
-                self.mamba_inference_state_config,
-                num_mamba_layers,
-                self.num_speculative_tokens,
+                self.mamba_inference_state_config, num_mamba_layers, self.num_speculative_tokens
             )
 
         # --- mamba_memory_ratio ---
         if self.mamba_memory_ratio is None and mamba_bytes_per_request > 0:
-            blocks_per_request = math.ceil(
-                self.max_sequence_length / self.block_size_tokens
-            )
+            blocks_per_request = math.ceil(self.max_sequence_length / self.block_size_tokens)
             kv_per_request = blocks_per_request * block_size_bytes
             self.mamba_memory_ratio = mamba_bytes_per_request / (
                 kv_per_request + mamba_bytes_per_request
@@ -524,15 +507,23 @@ class InferenceConfig:
 
         # --- buffer_size_gb ---
         activation_bytes = None
+        print(
+            f"self.buffer_size_gb={self.buffer_size_gb}, gpu_memory_budget_gb={gpu_memory_budget_gb}"
+        )
         if self.buffer_size_gb is None:
             if gpu_memory_budget_gb is not None:
                 budget_bytes = int(gpu_memory_budget_gb * 1024**3)
             elif model is not None:
                 activation_bytes = measure_peak_activation_memory(
-                    model, self.max_tokens, tp_size=tp_size,
+                    model, self.max_tokens, tp_size=tp_size
+                )
+                print(
+                    f"Measured activation_bytes={activation_bytes} bytes with max_tokens={self.max_tokens}"
                 )
                 free_mem, _ = torch.cuda.mem_get_info()
+                print(f"Free mem={free_mem} bytes")
                 budget_bytes = max(0, free_mem - activation_bytes)
+                print(f"Budget bytes={budget_bytes} bytes")
             else:
                 try:
                     free_mem, _ = torch.cuda.mem_get_info()
@@ -545,9 +536,7 @@ class InferenceConfig:
 
             # Reserve Mamba prefix-caching memory.
             if self.prefix_caching_mamba_gb is not None and self.prefix_caching_mamba_gb > 0:
-                budget_bytes = max(
-                    0, budget_bytes - int(self.prefix_caching_mamba_gb * 1024**3)
-                )
+                budget_bytes = max(0, budget_bytes - int(self.prefix_caching_mamba_gb * 1024**3))
 
             self.buffer_size_gb = budget_bytes / (1024**3)
 
@@ -573,17 +562,13 @@ class InferenceConfig:
 
         # --- validate explicit max_requests fits the budget ---
         else:
-            blocks_per_request = math.ceil(
-                self.max_sequence_length / self.block_size_tokens
-            )
+            blocks_per_request = math.ceil(self.max_sequence_length / self.block_size_tokens)
             blocks_needed = self.max_requests * blocks_per_request + 1
             if self.mamba_memory_ratio is not None:
                 kv_needed = blocks_needed * block_size_bytes
                 needed_bytes = int(kv_needed / (1.0 - self.mamba_memory_ratio))
             else:
-                needed_bytes = blocks_needed * (
-                    block_size_bytes + mamba_bytes_per_request
-                )
+                needed_bytes = blocks_needed * (block_size_bytes + mamba_bytes_per_request)
             budget_bytes = int(self.buffer_size_gb * 1024**3)
             if needed_bytes > budget_bytes:
                 raise ValueError(
@@ -624,9 +609,7 @@ class InferenceConfig:
         if block_size_bytes is not None:
             lines.append(f"  kv_block_size_bytes   = {block_size_bytes}")
             if self.buffer_size_gb is not None and self.mamba_memory_ratio is not None:
-                kv_budget = int(
-                    self.buffer_size_gb * 1024**3 * (1.0 - self.mamba_memory_ratio)
-                )
+                kv_budget = int(self.buffer_size_gb * 1024**3 * (1.0 - self.mamba_memory_ratio))
             elif self.buffer_size_gb is not None:
                 kv_budget = int(self.buffer_size_gb * 1024**3)
             else:
@@ -637,9 +620,7 @@ class InferenceConfig:
         if num_attn_layers is not None:
             lines.append(f"  num_attention_layers  = {num_attn_layers}")
         if activation_bytes is not None:
-            lines.append(
-                f"  activation_memory     = {activation_bytes / 1024**3:.2f} GB"
-            )
+            lines.append(f"  activation_memory     = {activation_bytes / 1024**3:.2f} GB")
         if self.mamba_memory_ratio is not None:
             lines.append(f"  mamba_memory_ratio    = {self.mamba_memory_ratio:.4f}")
         if num_mamba_layers is not None and num_mamba_layers > 0:

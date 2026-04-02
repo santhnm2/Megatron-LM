@@ -1822,7 +1822,7 @@ def _add_inference_args(parser):
                        'By default, `max_requests` is set to the number of '
                        'blocks in the context\'s memory buffer.')
     group.add_argument('--inference-dynamic-batching-max-tokens',
-                       type=int, default=None,
+                       type=int, default=16384,
                        help='Override the inference context\'s default `max_tokens`.')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
@@ -1895,9 +1895,6 @@ def _add_inference_args(parser):
                        help='GPU memory budget (in GB) for the Mamba state cache '
                        'used by prefix caching on hybrid models. When set, Mamba '
                        'states at block boundaries are cached for reuse.')
-    group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
-                       type=int, default=16384,
-                       help='Maximum number of tokens to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')

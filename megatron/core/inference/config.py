@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import math
 import warnings
 from dataclasses import InitVar, dataclass
@@ -452,6 +453,7 @@ class InferenceConfig:
                     "buffer_size_gb must be set explicitly when model_config "
                     "is not provided."
                 )
+            self._log_config()
             return
 
         # --- auto-configuration from model_config ---
@@ -588,3 +590,25 @@ class InferenceConfig:
                     f"{needed_bytes / 1024**3:.1f} GB but buffer_size_gb is "
                     f"{self.buffer_size_gb:.1f} GB."
                 )
+
+        self._log_config()
+
+    def _log_config(self):
+        """Log the resolved inference configuration."""
+        lines = [
+            "InferenceConfig:",
+            f"  buffer_size_gb      = {self.buffer_size_gb}",
+            f"  max_requests        = {self.max_requests}",
+            f"  max_tokens          = {self.max_tokens}",
+            f"  max_sequence_length = {self.max_sequence_length}",
+            f"  block_size_tokens   = {self.block_size_tokens}",
+        ]
+        if self.mamba_memory_ratio is not None:
+            lines.append(f"  mamba_memory_ratio  = {self.mamba_memory_ratio:.4f}")
+        if self.num_speculative_tokens > 0:
+            lines.append(f"  num_speculative_tokens = {self.num_speculative_tokens}")
+        if self.prefix_caching_mamba_gb is not None:
+            lines.append(f"  prefix_caching_mamba_gb = {self.prefix_caching_mamba_gb}")
+        if self.num_cuda_graphs is not None:
+            lines.append(f"  num_cuda_graphs     = {self.num_cuda_graphs}")
+        logging.info("\n".join(lines))

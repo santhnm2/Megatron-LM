@@ -17,6 +17,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -277,11 +278,17 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
 @torch.inference_mode()
 def _measure_activation_memory(model: MegatronModule, max_tokens: int) -> int:
-    """Run a dummy forward pass and return the peak activation memory in bytes.
+    """Run a dummy inference forward pass and return the peak activation memory in bytes.
 
-    Uses ``max_tokens`` as the input size to match the worst-case prefill
-    activation footprint.
+    Uses a :class:`StaticInferenceContext` so that the forward pass exercises
+    the inference code-path (including any kernel autotuning, e.g. Triton).
+    ``max_tokens`` is used as the sequence length to match the worst-case
+    prefill activation footprint.
     """
+    inference_context = StaticInferenceContext(
+        max_batch_size=1, max_sequence_length=max_tokens,
+    )
+
     torch.cuda.reset_peak_memory_stats()
     mem_before = torch.cuda.memory_allocated()
 
@@ -291,10 +298,13 @@ def _measure_activation_memory(model: MegatronModule, max_tokens: int) -> int:
     position_ids = torch.zeros(
         (1, max_tokens), dtype=torch.long, device=torch.cuda.current_device()
     )
-    model(tokens, position_ids, attention_mask=None)
+    model(tokens, position_ids, attention_mask=None, inference_context=inference_context)
 
     peak_memory = torch.cuda.max_memory_allocated()
     activation_memory = peak_memory - mem_before
+
+    # Free the KV cache allocated by the static context during the forward pass.
+    del inference_context
 
     log_single_rank(
         logger,

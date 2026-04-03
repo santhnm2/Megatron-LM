@@ -625,6 +625,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         log_lines = [
             "DynamicInferenceContext: configuration summary",
+            f"  buffer_size_gb:          {self.config.buffer_size_gb}",
             f"  max_requests:            {self.max_requests}",
             f"  max_tokens:              {self.max_tokens}",
             f"  max_sequence_length:     {self.max_sequence_length}",

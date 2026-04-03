@@ -1796,17 +1796,20 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
-                       type=float, default=40.,
+                       type=float, default=None,
                        help='Amount of on-GPU memory allocated for the KV cache. '
                        'The total amount of memory allocated for the KV cache '
                        '(CPU + GPU memory) depends on the value set for the '
                        'unified virtual memory (UVM) level (via '
-                       '`--inference-dynamic-batching-unified-memory-level`).'
+                       '`--inference-dynamic-batching-unified-memory-level`). '
                        'If the UVM level is 0, then only GPU memory is used and '
                        'the total memory equals `buffer_size_gb`. If the UVM '
                        'level is 1, then additional memory is utilized on the '
                        'CPU and the total memory equals `buffer_size_gb + '
-                       'paused_buffer_size_gb`.')
+                       'paused_buffer_size_gb`. '
+                       'If not specified, the buffer size is automatically '
+                       'estimated from available GPU memory after a dummy '
+                       'forward pass to measure activation memory.')
     group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
                        type=float, default=None,
                        help='Amount of memory reserved for paused requests in '
@@ -1826,9 +1829,11 @@ def _add_inference_args(parser):
                        help='Override the inference context\'s `max_requests`. '
                        'By default, `max_requests` is set to the number of '
                        'blocks in the context\'s memory buffer.')
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
     group.add_argument('--inference-dynamic-batching-max-tokens',
-                       type=int, default=None,
-                       help='Override the inference context\'s default `max_tokens`.')
+                       type=int, default=DynamicInferenceContext.DEFAULT_MAX_TOKENS,
+                       help='Max number of tokens for forward passes, primarily '
+                       'limited by prefill activation memory usage.')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
                        help='Maximum number of cuda graphs to capture, where the '

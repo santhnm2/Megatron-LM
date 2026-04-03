@@ -17,7 +17,7 @@ class StaticInferenceContext(BaseInferenceContext):
     def __init__(
         self, max_batch_size: int, max_sequence_length: int, use_flashinfer_fused_rope: bool = None
     ):
-        config = InferenceConfig(materialize_only_last_token_logits=True)
+        config = InferenceConfig(materialize_only_last_token_logits=True, buffer_size_gb=0)
         super().__init__(inference_config=config)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size

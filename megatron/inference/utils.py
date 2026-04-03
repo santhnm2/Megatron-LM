@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
 from gpt_builders import gpt_builder
@@ -274,6 +275,36 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
+@torch.inference_mode()
+def _measure_activation_memory(model: MegatronModule, max_tokens: int) -> int:
+    """Run a dummy forward pass and return the peak activation memory in bytes.
+
+    Uses ``max_tokens`` as the input size to match the worst-case prefill
+    activation footprint.
+    """
+    torch.cuda.reset_peak_memory_stats()
+    mem_before = torch.cuda.memory_allocated()
+
+    tokens = torch.zeros(
+        (1, max_tokens), dtype=torch.long, device=torch.cuda.current_device()
+    )
+    position_ids = torch.zeros(
+        (1, max_tokens), dtype=torch.long, device=torch.cuda.current_device()
+    )
+    model(tokens, position_ids, attention_mask=None)
+
+    peak_memory = torch.cuda.max_memory_allocated()
+    activation_memory = peak_memory - mem_before
+
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"Dummy forward pass activation memory: {activation_memory / 1024**3:.2f} GB "
+        f"(peak={peak_memory / 1024**3:.2f} GB, before={mem_before / 1024**3:.2f} GB)",
+    )
+    return activation_memory
+
+
 def get_inference_config_from_model_and_args(model: MegatronModule, args):
     """Returns a `InferenceConfig` constructed from the model and command line arguments."""
 
@@ -327,10 +358,19 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
                 "wandb module is available. Inference logging will be disabled.",
             )
 
+    # If buffer_size_gb is not explicitly set, run a dummy forward pass to measure
+    # peak activation memory so InferenceConfig can auto-size the KV-cache buffer.
+    activation_memory_bytes = None
+    if args.inference_dynamic_batching_buffer_size_gb is None:
+        activation_memory_bytes = _measure_activation_memory(
+            model, args.inference_dynamic_batching_max_tokens
+        )
+
     return InferenceConfig(
         verbose=True,
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        activation_memory_bytes=activation_memory_bytes,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
         mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(

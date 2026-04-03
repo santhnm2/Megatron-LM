@@ -131,11 +131,13 @@ class InferenceConfig:
     block_size_tokens: int = 256
     """Size of KV cache block size."""
 
-    buffer_size_gb: int = 20
+    buffer_size_gb: Optional[float] = None
     """
     Buffer size reserved on the GPU for the KV cache.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
+    If None, the buffer size is automatically estimated based on available GPU memory after a dummy
+    forward pass to measure activation memory.
     """
 
     paused_buffer_size_gb: Optional[int] = None
@@ -313,10 +315,40 @@ class InferenceConfig:
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
 
-    def __post_init__(self, verbose: bool):
+    activation_memory_bytes: InitVar[Optional[int]] = None
+    """Peak activation memory measured via a dummy forward pass (in bytes).
+    When ``buffer_size_gb`` is None this value is used together with the current
+    GPU memory state to automatically size the KV-cache buffer.  This is an
+    InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool, activation_memory_bytes: Optional[int]):
         self._verbose = verbose
+        if self.buffer_size_gb is None:
+            self.buffer_size_gb = self._estimate_buffer_size_gb(activation_memory_bytes)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+    @staticmethod
+    def _estimate_buffer_size_gb(activation_memory_bytes: Optional[int]) -> float:
+        """Estimate KV-cache buffer size from available GPU memory.
+
+        Uses free GPU memory minus a safety margin for activations (2x the
+        measured activation memory, or 1 GB if not measured).
+        """
+        free_memory, _ = torch.cuda.mem_get_info()
+        safety_margin = (
+            2 * activation_memory_bytes if activation_memory_bytes is not None else 1 * 1024**3
+        )
+        usable_bytes = free_memory - safety_margin
+        buffer_size_gb = usable_bytes / 1024**3
+        if buffer_size_gb <= 0:
+            raise RuntimeError(
+                f"Not enough free GPU memory to allocate a KV-cache buffer. "
+                f"Free memory: {free_memory / 1024**3:.2f} GB, "
+                f"activation safety margin: {safety_margin / 1024**3:.2f} GB. "
+                f"Set --inference-dynamic-batching-buffer-size-gb explicitly."
+            )
+        return buffer_size_gb

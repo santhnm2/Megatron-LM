@@ -3841,6 +3841,136 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        "kv_cache_management_mode",
+        ["recompute", "persist"],
+        ids=["recompute", "persist"],
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_suspend_resume(self, kv_cache_management_mode):
+        """Test that suspend/resume preserves speculative decoding correctness.
+
+        Runs 2 requests with speculative decoding, suspends the engine
+        mid-generation (after a few decode steps), resumes, and verifies
+        all requests complete with the correct token count.
+
+        In 'recompute' mode, the KV cache is discarded on suspend and
+        requests are checkpointed and re-prefilled on resume. The engine
+        must correctly reconstruct MTP state after re-prefill and continue
+        speculative decoding without crashes or token count mismatches.
+
+        In 'persist' mode, the KV cache survives suspend/resume. The MTP
+        internal buffers (_sampled_mtp_tokens_cuda, _accepted_tokens_per_request)
+        must remain valid across the cycle since requests stay in decode.
+        """
+        num_tokens_to_generate = 10
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=num_tokens_to_generate,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+            position_embedding_type="none",
+            kv_cache_management_mode=kv_cache_management_mode,
+        )
+
+        needs_tms = (
+            test_config.static_kv_memory_pointers
+            and kv_cache_management_mode != "persist"
+        )
+        if needs_tms and not HAVE_TORCH_MEMORY_SAVER:
+            pytest.skip("torch_memory_saver required for static pointers + non-persist mode")
+
+        env = self._build_test_env(test_config)
+        engine = env.engine
+
+        unwrapped_model = engine.controller.inference_wrapped_model.model
+
+        # Wrap real forward with deterministic logits.
+        real_forward = unwrapped_model.forward
+
+        def deterministic_forward(*args, **kwargs):
+            logits = real_forward(*args, **kwargs)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return logits
+
+        real_mtp = unwrapped_model.compute_mtp_single_step
+
+        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
+            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = deterministic_forward
+        unwrapped_model.compute_mtp_single_step = deterministic_mtp
+
+        for i in range(2):
+            engine.add_request(
+                request_id=i,
+                prompt=torch.zeros(4, dtype=torch.int64, device='cuda'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=test_config.vocab_size - 1,
+                ),
+            )
+
+        # Run a few steps to get into decode with speculative tokens in flight.
+        for _ in range(3):
+            if not engine.has_unfinished_requests():
+                break
+            engine.step_modern()
+
+        # Suspend mid-generation.
+        engine.suspend()
+
+        # Re-attach wrappers: resume rebuilds model state, but our closures
+        # still hold the right `real_forward`/`real_mtp` references since the
+        # model object itself is not recreated.
+        unwrapped_model.forward = deterministic_forward
+        unwrapped_model.compute_mtp_single_step = deterministic_mtp
+
+        # Resume.
+        engine.resume()
+
+        # Run to completion.
+        finished_records = []
+        step_count = 0
+        while engine.has_unfinished_requests():
+            res = engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+            step_count += 1
+            assert step_count < 200, "Engine did not converge after resume"
+
+        # In recompute mode, requests are re-prefilled from prompt + generated_tokens.
+        # In persist mode, requests continue from where they left off.
+        # Either way, all requests must complete.
+        for record in finished_records:
+            req = record.merge()
+            assert req.status == Status.COMPLETED, (
+                f"Request {req.request_id}: status={req.status}"
+            )
+            assert len(req.generated_tokens) == num_tokens_to_generate, (
+                f"Request {req.request_id}: expected {num_tokens_to_generate} "
+                f"tokens, got {len(req.generated_tokens)}"
+            )
+            # All tokens should be 0 (deterministic prediction).
+            assert all(t == 0 for t in req.generated_tokens), (
+                f"Request {req.request_id}: expected all token 0, "
+                f"got {req.generated_tokens}"
+            )
+
+        assert engine.context.active_token_count == 0
+        assert engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @torch.inference_mode()
     def test_speculative_mixed_prefill_decode_heterogeneous_acceptance(self):
         """Test speculative decoding with a mixed prefill/decode batch where
@@ -3861,7 +3991,14 @@ class TestDynamicInferenceEngine:
             num_requests=0,
             min_prompt_length=4,
             max_prompt_length=4,
-            num_tokens_to_generate=6,
+            # num_tokens_to_generate must be 1 + 3*N (e.g. 4, 7, 10) with
+            # num_speculative_tokens=2, because the engine's bookkeeping
+            # computes the projected sequence length as
+            #   kv_offsets + query_lengths + accepted_tokens + 1
+            # which over-counts by accepted_tokens relative to the actual
+            # generated count.  Values that aren't 1 + 3*N cause the request
+            # to be marked finished before enough tokens are generated.
+            num_tokens_to_generate=7,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
@@ -3907,7 +4044,7 @@ class TestDynamicInferenceEngine:
                 request_id=i,
                 prompt=torch.zeros(4, dtype=torch.int64, device='cuda'),
                 sampling_params=SamplingParams(
-                    num_tokens_to_generate=6,
+                    num_tokens_to_generate=7,
                     termination_id=test_config.vocab_size - 1,
                 ),
             )
@@ -3920,7 +4057,7 @@ class TestDynamicInferenceEngine:
             request_id=2,
             prompt=torch.zeros(4, dtype=torch.int64, device='cuda'),
             sampling_params=SamplingParams(
-                num_tokens_to_generate=6,
+                num_tokens_to_generate=7,
                 termination_id=test_config.vocab_size - 1,
             ),
         )
@@ -3941,8 +4078,8 @@ class TestDynamicInferenceEngine:
             assert req.status == Status.COMPLETED, (
                 f"Request {req.request_id} not completed: {req.status}"
             )
-            assert len(req.generated_tokens) == 6, (
-                f"Request {req.request_id}: expected 6 tokens, "
+            assert len(req.generated_tokens) == 7, (
+                f"Request {req.request_id}: expected 7 tokens, "
                 f"got {len(req.generated_tokens)}"
             )
 

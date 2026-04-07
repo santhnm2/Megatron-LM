@@ -408,15 +408,20 @@ class TestDynamicInferenceEngine:
             )
 
             # Mamba model.
+            # When speculative tokens are configured, append MTP depth sections
+            # to the hybrid layer pattern so the model creates MTP blocks.
+            mtp_suffix = "/M" * test_config.num_speculative_tokens
+            if pp_size == 1:
+                mamba_pattern = "M*-" + mtp_suffix
+            else:
+                mamba_pattern = "M*-|M*-" + mtp_suffix
             model = MambaModel(
                 config=transformer_config,
                 mamba_stack_spec=mamba_stack_spec,
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
-                hybrid_layer_pattern=(
-                    "M*-" if pp_size == 1 else "M*-|M*-"
-                ),  # 3 or 6 layers (2 PP stages)
+                hybrid_layer_pattern=mamba_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()

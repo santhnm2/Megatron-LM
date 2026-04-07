@@ -2845,12 +2845,23 @@ class TestDynamicInferenceEngine:
             assert trimmed == 2
 
     @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "acceptance_mode",
+        ["all_rejected", "all_accepted"],
+        ids=["all_rejected", "all_accepted"],
+    )
     @torch.inference_mode()
-    def test_speculative_sequence_length_double_counting(self):
+    def test_speculative_sequence_length_double_counting(self, acceptance_mode):
         """Test to verify active_sequence_lengths is not double-counted.
 
         If active sequence length is double-counted during speculative decoding,
         the request will terminate prematurely before generating the requested tokens.
+
+        The 'all_rejected' variant exercises the path where accepted_tokens=0
+        (the + 1 term in the bookkeeping is correct by itself).
+        The 'all_accepted' variant is the critical case: with accepted_tokens=2,
+        a faulty formula that adds accepted_tokens on top of the KV length will
+        over-count by 2 per step, finishing the request after only 4 of 6 tokens.
         """
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -2864,44 +2875,68 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=False,
             use_fixed_output_lengths=False,
             context_max_tokens=512,
+            position_embedding_type="none",
         )
         env = self._build_test_env(test_config)
 
-        # Mock forward pass to return deterministic base logits.
-        # Speculative tokens will be wrong (predicted by MTP as tokens + 5)
-        # to guarantee rejection every time.
         model = env.engine.controller.inference_wrapped_model.model
         hidden_size = model.config.hidden_size
 
-        def mock_mtp_forward_reject(*args, **kwargs):
-            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
-            b, s = tokens.shape
+        if acceptance_mode == "all_rejected":
+            # Mock forward pass to return deterministic base logits.
+            # Speculative tokens will be wrong (predicted by MTP as tokens + 5)
+            # to guarantee rejection every time.
+            def mock_mtp_forward(*args, **kwargs):
+                tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+                b, s = tokens.shape
 
-            # Base model correctly predicts tokens + 1
-            base_logits = torch.zeros(
-                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
-            )
-            next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
-            base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
+                base_logits = torch.zeros(
+                    b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+                )
+                next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+                base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-            # Cache hidden states for serial MTP computation
-            model._decoder_hidden_states_cache = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
-            )
-            return base_logits
+                model._decoder_hidden_states_cache = torch.zeros(
+                    s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+                )
+                return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
-            n = hidden_states.size(0)
-            # Predict wildly wrong tokens (+ 5) to guarantee rejection
-            wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
-            logits = torch.zeros(
-                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
-            )
-            logits.scatter_(2, wrong_toks.transpose(0, 1).unsqueeze(-1), 100.0)
-            return hidden_states, logits
+            def mock_compute_mtp(*args_mtp, **kwargs_mtp):
+                hidden_states = args_mtp[0] if args_mtp else kwargs_mtp["hidden_states"]
+                next_token_ids = args_mtp[1] if len(args_mtp) > 1 else kwargs_mtp["next_token_ids"]
+                n = hidden_states.size(0)
+                wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
+                logits = torch.zeros(
+                    n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+                )
+                logits.scatter_(2, wrong_toks.transpose(0, 1).unsqueeze(-1), 100.0)
+                return hidden_states, logits
 
-        model.forward = mock_mtp_forward_reject
-        model.compute_mtp_single_step = mock_compute_mtp_single_step
+            model.forward = mock_mtp_forward
+            model.compute_mtp_single_step = mock_compute_mtp
+        else:
+            # Wrap real forward and MTP: run the actual model, then overwrite
+            # logits so both base and MTP predict token 0 → all accepted.
+            real_forward = model.forward
+
+            def deterministic_forward(*args, **kwargs):
+                logits = real_forward(*args, **kwargs)
+                logits.zero_()
+                logits[..., 0] = 100.0
+                return logits
+
+            real_mtp = model.compute_mtp_single_step
+
+            def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
+                hidden_states, logits = real_mtp(
+                    hidden_states, next_token_ids, position_ids, depth
+                )
+                logits.zero_()
+                logits[..., 0] = 100.0
+                return hidden_states, logits
+
+            model.forward = deterministic_forward
+            model.compute_mtp_single_step = deterministic_mtp
 
         env.engine.add_request(
             request_id=0,
@@ -4064,14 +4099,7 @@ class TestDynamicInferenceEngine:
             num_requests=0,
             min_prompt_length=4,
             max_prompt_length=4,
-            # num_tokens_to_generate must be 1 + 3*N (e.g. 4, 7, 10) with
-            # num_speculative_tokens=2, because the engine's bookkeeping
-            # computes the projected sequence length as
-            #   kv_offsets + query_lengths + accepted_tokens + 1
-            # which over-counts by accepted_tokens relative to the actual
-            # generated count.  Values that aren't 1 + 3*N cause the request
-            # to be marked finished before enough tokens are generated.
-            num_tokens_to_generate=7,
+            num_tokens_to_generate=6,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
@@ -4117,7 +4145,7 @@ class TestDynamicInferenceEngine:
                 request_id=i,
                 prompt=torch.zeros(4, dtype=torch.int64, device='cuda'),
                 sampling_params=SamplingParams(
-                    num_tokens_to_generate=7,
+                    num_tokens_to_generate=6,
                     termination_id=test_config.vocab_size - 1,
                 ),
             )
@@ -4151,8 +4179,8 @@ class TestDynamicInferenceEngine:
             assert req.status == Status.COMPLETED, (
                 f"Request {req.request_id} not completed: {req.status}"
             )
-            assert len(req.generated_tokens) == 7, (
-                f"Request {req.request_id}: expected 7 tokens, "
+            assert len(req.generated_tokens) == 6, (
+                f"Request {req.request_id}: expected 6 tokens, "
                 f"got {len(req.generated_tokens)}"
             )
 

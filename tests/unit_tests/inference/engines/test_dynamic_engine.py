@@ -2392,30 +2392,25 @@ class TestDynamicInferenceEngine:
     def test_speculative_max_sequence_length_boundary(self):
         """Speculative decode step that overshoots max_sequence_length completes.
 
-        Setup: prompt fills max_sequence_length - 1, so only 1 real token can
-        be generated.  With num_speculative_tokens=2 the decode step writes
-        KV-cache entries and computes attention at positions max_sequence_length
-        and max_sequence_length+1, which overshoot the original limit.
+        The request must survive past prefill into a real decode step so that
+        the main model forward actually processes speculative-token positions
+        that exceed ``max_sequence_length``.  With ``num_tokens_to_generate=2``
+        the request is not terminated after prefill (``active_seq_len = 8 < 9``),
+        so the engine runs a decode step whose input tokens span positions
+        ``[7, 8, 9]``.  Position 9 equals ``max_sequence_length`` and, without
+        the ``_max_kv_sequence_length`` padding, the RoPE embedding table would
+        only cover positions ``0 .. max_sequence_length - 1``, causing an
+        out-of-bounds access during the real attention forward pass.
 
-        block_size_tokens is chosen so that the speculative overshoot crosses a
-        block boundary: ceil(max_sequence_length / block_size) == 1 but
-        ceil((max_sequence_length + num_speculative_tokens) / block_size) == 2.
-        Without the extra capacity provisioned by ``_max_kv_sequence_length``,
-        ``max_kv_block_count`` would be 1 and the block-table write for the
-        second block would be an out-of-bounds access.
-
-        The **real** model forward (including Flash-Attention) runs so that any
-        out-of-bounds KV-cache or RoPE access surfaces as a CUDA error.
-        Only ``compute_mtp_single_step`` is mocked for deterministic speculative
-        tokens.  Greedy sampling (top_k=1) avoids NaN/Inf from random weights.
+        Only ``compute_mtp_single_step`` is mocked (for deterministic speculative
+        tokens); the real model forward — including RoPE application and
+        Flash-Attention kernels — runs on the overshooting positions.
+        Greedy sampling (top_k=1) avoids NaN/Inf from random weights.
         """
         num_speculative_tokens = 2
         prompt_length = 7
-        max_sequence_length = 8  # only 1 token of headroom
-        num_tokens_to_generate = 1
-        # Block size chosen so that max_sequence_length fits in exactly 1 block
-        # but max_sequence_length + num_speculative_tokens requires 2 blocks.
-        block_size = 8
+        max_sequence_length = 9  # 2 tokens of headroom so request survives past prefill
+        num_tokens_to_generate = 2
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # add request manually with top_k=1
@@ -2426,15 +2421,13 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=False,
-            context_block_size_tokens=block_size,
         )
 
         env = self._build_test_env(test_config)
         model = env.engine.controller.inference_wrapped_model.model
-        hidden_size = model.config.hidden_size
 
         # Mock only compute_mtp_single_step.  The real model.forward (and its
-        # Flash-Attention kernels) runs with position IDs that overshoot
+        # RoPE / Flash-Attention kernels) runs with position IDs that overshoot
         # max_sequence_length.
         def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
@@ -2459,21 +2452,14 @@ class TestDynamicInferenceEngine:
             ),
         )
 
-        # Verify the extra capacity is provisioned and that the block-size
-        # choice actually makes the fix load-bearing: without the speculative
-        # padding the block count would be too small.
+        # Verify the extra capacity is provisioned.
         context = env.engine.context
         assert context._max_kv_sequence_length == max_sequence_length + num_speculative_tokens
-        assert context.max_kv_block_count >= math.ceil(
-            (max_sequence_length + num_speculative_tokens) / block_size
-        )
-        # Sanity-check: without the fix the block count would be 1, not 2.
-        assert math.ceil(max_sequence_length / block_size) < math.ceil(
-            (max_sequence_length + num_speculative_tokens) / block_size
-        ), "block_size must be chosen so that speculative overshoot crosses a block boundary"
 
-        # Run to completion — OOB KV-cache / RoPE access would surface as a
-        # CUDA illegal-memory-access error here.
+        # Run to completion.  The decode step processes positions [7, 8, 9].
+        # Without _max_kv_sequence_length padding the RoPE table would only
+        # cover positions 0..8, so position 9 would be an OOB access that
+        # surfaces as a CUDA illegal-memory-access or IndexError here.
         finished_records = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()

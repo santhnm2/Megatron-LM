@@ -2693,6 +2693,129 @@ class TestDynamicInferenceEngine:
             f"Full output: {finished_req.generated_tokens}"
         )
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "prompt_length,num_tokens_to_generate,num_speculative_tokens",
+        [
+            # Generates 5 tokens with spec=3 → step produces 4 tokens at a time.
+            # After prefill, first decode step emits 4 tokens (seq 4→8), second step
+            # would push to 12 but only 1 more is needed → must trim to exactly 5.
+            (4, 5, 3),
+            # Generates 2 tokens with spec=3 → step produces 4 tokens at a time.
+            # After prefill, single decode step would emit 4 tokens but only 2 are
+            # needed → must trim aggressively on the very first decode.
+            (4, 2, 3),
+            # Generates 1 token with spec=2 → step produces 3 tokens at a time.
+            # Only 1 token is needed; the 2 speculative tokens must be discarded.
+            (4, 1, 2),
+            # Generates 7 tokens with spec=2 → step produces 3 tokens at a time.
+            # 7 is not divisible by 3, so the final step must trim the excess token.
+            (4, 7, 2),
+        ],
+        ids=[
+            "overshoot_second_step",
+            "overshoot_first_step",
+            "single_token_generation",
+            "non_divisible_boundary",
+        ],
+    )
+    @torch.inference_mode()
+    def test_speculative_tokens_exceed_max_sequence_length(
+        self, prompt_length, num_tokens_to_generate, num_speculative_tokens
+    ):
+        """Test that speculative decoding correctly trims output when speculative
+        tokens would push the sequence beyond max_sequence_length.
+
+        Exercises the real model forward pass (attention, KV cache, MTP layers)
+        but substitutes deterministic logits after the forward to ensure all
+        speculative tokens are accepted and the boundary trimming logic is
+        actually exercised.
+        """
+        max_sequence_length = prompt_length + num_tokens_to_generate
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            max_sequence_length=max_sequence_length,
+            num_speculative_tokens=num_speculative_tokens,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        # Wrap the real forward: run the actual model (attention, KV cache, etc.)
+        # then replace the output logits with deterministic values so all
+        # speculative tokens are accepted and sampling is predictable.
+        real_forward = unwrapped_model.forward
+
+        def deterministic_forward(*args, **kwargs):
+            logits = real_forward(*args, **kwargs)
+            # Overwrite with deterministic logits: always predict token 0.
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return logits
+
+        # Wrap the real MTP step similarly.
+        real_mtp = unwrapped_model.compute_mtp_single_step
+
+        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
+            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = deterministic_forward
+        unwrapped_model.compute_mtp_single_step = deterministic_mtp
+
+        prompt = torch.zeros(prompt_length, dtype=torch.int64, device='cuda')
+        env.engine.add_request(
+            request_id=0,
+            prompt=prompt,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=num_tokens_to_generate,
+                termination_id=test_config.vocab_size - 1,  # Won't trigger naturally
+            ),
+        )
+
+        finished_records = []
+        step_count = 0
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+            step_count += 1
+            assert step_count < 100, "Engine did not converge"
+
+        assert len(finished_records) == 1
+        finished_req = finished_records[0].merge()
+
+        assert finished_req.status == Status.COMPLETED, (
+            f"Expected COMPLETED, got {finished_req.status}"
+        )
+        assert len(finished_req.generated_tokens) == num_tokens_to_generate, (
+            f"Expected exactly {num_tokens_to_generate} generated tokens, "
+            f"got {len(finished_req.generated_tokens)}. "
+            f"Speculative tokens were not correctly trimmed at the "
+            f"max_sequence_length boundary. "
+            f"Output: {finished_req.generated_tokens}"
+        )
+
+        # All tokens should be 0 (the deterministic prediction).
+        assert all(t == 0 for t in finished_req.generated_tokens), (
+            f"Expected all tokens to be 0, got {finished_req.generated_tokens}"
+        )
+
+        # Verify engine state is clean after completion.
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
+
     @pytest.mark.parametrize("detokenize_stop_sequence", [True, False])
     def test_detokenize_stop_sequence_flag(self, detokenize_stop_sequence):
         """Test that _check_stop_words_for_request_post_append strips or keeps

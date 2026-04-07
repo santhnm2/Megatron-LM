@@ -2397,6 +2397,13 @@ class TestDynamicInferenceEngine:
         KV-cache entries and computes attention at positions max_sequence_length
         and max_sequence_length+1, which overshoot the original limit.
 
+        block_size_tokens is chosen so that the speculative overshoot crosses a
+        block boundary: ceil(max_sequence_length / block_size) == 1 but
+        ceil((max_sequence_length + num_speculative_tokens) / block_size) == 2.
+        Without the extra capacity provisioned by ``_max_kv_sequence_length``,
+        ``max_kv_block_count`` would be 1 and the block-table write for the
+        second block would be an out-of-bounds access.
+
         The **real** model forward (including Flash-Attention) runs so that any
         out-of-bounds KV-cache or RoPE access surfaces as a CUDA error.
         Only ``compute_mtp_single_step`` is mocked for deterministic speculative
@@ -2406,6 +2413,9 @@ class TestDynamicInferenceEngine:
         prompt_length = 7
         max_sequence_length = 8  # only 1 token of headroom
         num_tokens_to_generate = 1
+        # Block size chosen so that max_sequence_length fits in exactly 1 block
+        # but max_sequence_length + num_speculative_tokens requires 2 blocks.
+        block_size = 8
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # add request manually with top_k=1
@@ -2416,6 +2426,7 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=False,
+            context_block_size_tokens=block_size,
         )
 
         env = self._build_test_env(test_config)
@@ -2448,13 +2459,18 @@ class TestDynamicInferenceEngine:
             ),
         )
 
-        # Verify the extra capacity is provisioned.
+        # Verify the extra capacity is provisioned and that the block-size
+        # choice actually makes the fix load-bearing: without the speculative
+        # padding the block count would be too small.
         context = env.engine.context
         assert context._max_kv_sequence_length == max_sequence_length + num_speculative_tokens
         assert context.max_kv_block_count >= math.ceil(
-            (max_sequence_length + num_speculative_tokens)
-            / test_config.context_block_size_tokens
+            (max_sequence_length + num_speculative_tokens) / block_size
         )
+        # Sanity-check: without the fix the block count would be 1, not 2.
+        assert math.ceil(max_sequence_length / block_size) < math.ceil(
+            (max_sequence_length + num_speculative_tokens) / block_size
+        ), "block_size must be chosen so that speculative overshoot crosses a block boundary"
 
         # Run to completion — OOB KV-cache / RoPE access would surface as a
         # CUDA illegal-memory-access error here.

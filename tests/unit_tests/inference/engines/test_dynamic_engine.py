@@ -144,6 +144,7 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    position_embedding_type: str = "learned_absolute"
 
     def __post_init__(self):
 
@@ -365,6 +366,7 @@ class TestDynamicInferenceEngine:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type=test_config.position_embedding_type,
             ).cuda()
         elif test_config.model_provider == "mamba":
             pp_size = test_config.pipeline_model_parallel_size
@@ -2745,6 +2747,9 @@ class TestDynamicInferenceEngine:
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
+            # Disable positional embeddings so speculative position IDs
+            # beyond max_sequence_length don't cause out-of-bounds lookups.
+            position_embedding_type="none",
         )
         env = self._build_test_env(test_config)
 

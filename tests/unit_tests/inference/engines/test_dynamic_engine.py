@@ -2385,6 +2385,91 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.total_request_count == 0
 
     @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_max_sequence_length_boundary(self):
+        """Speculative decode step that overshoots max_sequence_length completes.
+
+        Setup: prompt fills max_sequence_length - 1, so only 1 real token can
+        be generated.  With num_speculative_tokens=2 the decode step writes
+        KV-cache entries and computes attention at positions max_sequence_length
+        and max_sequence_length+1, which overshoot the original limit.
+
+        The **real** model forward (including Flash-Attention) runs so that any
+        out-of-bounds KV-cache or RoPE access surfaces as a CUDA error.
+        Only ``compute_mtp_single_step`` is mocked for deterministic speculative
+        tokens.  Greedy sampling (top_k=1) avoids NaN/Inf from random weights.
+        """
+        num_speculative_tokens = 2
+        prompt_length = 7
+        max_sequence_length = 8  # only 1 token of headroom
+        num_tokens_to_generate = 1
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,  # add request manually with top_k=1
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            max_sequence_length=max_sequence_length,
+            model_provider="gpt",
+            num_speculative_tokens=num_speculative_tokens,
+            materialize_only_last_token_logits=False,
+        )
+
+        env = self._build_test_env(test_config)
+        model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = model.config.hidden_size
+
+        # Mock only compute_mtp_single_step.  The real model.forward (and its
+        # Flash-Attention kernels) runs with position IDs that overshoot
+        # max_sequence_length.
+        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+            n = hidden_states.size(0)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size,
+                device=hidden_states.device, dtype=torch.bfloat16,
+            )
+            logits[:, :, 0] = 100.0
+            return hidden_states, logits
+
+        model.compute_mtp_single_step = mock_mtp
+
+        env.engine.add_request(
+            request_id=0,
+            prompt=torch.randint(
+                0, test_config.vocab_size - 1, (prompt_length,), device='cuda',
+            ),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=num_tokens_to_generate,
+                termination_id=test_config.vocab_size - 1,
+                top_k=1,
+            ),
+        )
+
+        # Verify the extra capacity is provisioned.
+        context = env.engine.context
+        assert context._max_kv_sequence_length == max_sequence_length + num_speculative_tokens
+        assert context.max_kv_block_count >= math.ceil(
+            (max_sequence_length + num_speculative_tokens)
+            / test_config.context_block_size_tokens
+        )
+
+        # Run to completion — OOB KV-cache / RoPE access would surface as a
+        # CUDA illegal-memory-access error here.
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        finished_req = finished_records[0].merge()
+        assert finished_req.status == Status.COMPLETED
+        assert len(finished_req.generated_tokens) == num_tokens_to_generate
+        assert context.active_token_count == 0
+        assert context.total_request_count == 0
+
+    @pytest.mark.internal
     @torch.inference_mode()
     def test_speculative_block_boundary_crossing(self):
         """Test to verify KV cache block boundary crossing logic.

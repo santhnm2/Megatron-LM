@@ -521,8 +521,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = model_config.params_dtype
         self.max_sequence_length = inference_config.max_sequence_length
 
+        # When speculative decoding is active, a decode step produces
+        # (1 + num_speculative_tokens) tokens. The last speculative positions
+        # can overshoot max_sequence_length before the termination
+        # check runs (which happens *after* the forward pass). To avoid
+        # out-of-bounds KV-cache writes and RoPE table lookups, provision the
+        # metadata for the extra positions. The termination / truncation
+        # logic in the engine still uses the *original* max_sequence_length via
+        # request_output_lengths, so no extra tokens are ever surfaced to the caller.
+        self._max_kv_sequence_length = (
+            self.max_sequence_length + self.num_speculative_tokens
+        )
+
         # Block ids.
-        self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
+        self.max_kv_block_count = math.ceil(
+            self._max_kv_sequence_length / self.block_size_tokens
+        )
 
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
@@ -561,7 +575,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
+            max_seqlen=self._max_kv_sequence_length,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
@@ -569,7 +583,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
+            max_seqlen=self._max_kv_sequence_length,
         )
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay

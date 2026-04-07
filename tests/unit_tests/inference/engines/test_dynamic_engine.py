@@ -4158,7 +4158,7 @@ class TestDynamicInferenceEngine:
             request_id=2,
             prompt=torch.zeros(4, dtype=torch.int64, device='cuda'),
             sampling_params=SamplingParams(
-                num_tokens_to_generate=7,
+                num_tokens_to_generate=6,
                 termination_id=test_config.vocab_size - 1,
             ),
         )

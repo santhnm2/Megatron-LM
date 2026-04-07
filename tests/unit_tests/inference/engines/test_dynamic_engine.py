@@ -144,6 +144,7 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    position_embedding_type: str = "learned_absolute"
 
     def __post_init__(self):
 
@@ -365,6 +366,7 @@ class TestDynamicInferenceEngine:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type=test_config.position_embedding_type,
             ).cuda()
         elif test_config.model_provider == "mamba":
             pp_size = test_config.pipeline_model_parallel_size
@@ -2421,6 +2423,11 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=False,
+            # RoPE (not learned absolute) so the fix under test —
+            # _max_kv_sequence_length sizing the RoPE table — is what
+            # prevents the OOB.  Learned position embeddings have a
+            # separate fixed table that is not covered by this fix.
+            position_embedding_type="rope",
         )
 
         env = self._build_test_env(test_config)

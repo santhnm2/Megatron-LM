@@ -3971,6 +3971,79 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        "num_tokens_to_generate",
+        [5, 6, 8, 9],
+        ids=["gen5", "gen6", "gen8", "gen9"],
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_finish_detection_accuracy(self, num_tokens_to_generate):
+        """Verify that requests generate exactly num_tokens_to_generate tokens
+        with speculative decoding, even when the requested count does not align
+        with 1 + (num_speculative_tokens + 1) * N.
+
+        With num_speculative_tokens=2 and all speculative tokens accepted,
+        each decode step commits 3 tokens (2 accepted + 1 new base).
+        Token counts of the form 1 + 3*N (i.e. 4, 7, 10 ...) align exactly
+        with step boundaries.  Counts in between (5, 6, 8, 9 ...) require
+        the engine to correctly detect that the request still needs more
+        tokens after a full-acceptance decode step.
+
+        This test fails if the bookkeeping in
+        _dynamic_step_context_bookkeeping double-counts accepted speculative
+        tokens when computing the projected sequence length.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=num_tokens_to_generate,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+            position_embedding_type="none",
+        )
+        env = self._build_test_env(test_config)
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+
+        # Deterministic forward: always predict token 0.
+        real_forward = unwrapped_model.forward
+
+        def deterministic_forward(*args, **kwargs):
+            logits = real_forward(*args, **kwargs)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return logits
+
+        # Deterministic MTP: also predict token 0 → all speculative tokens accepted.
+        real_mtp = unwrapped_model.compute_mtp_single_step
+
+        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
+            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = deterministic_forward
+        unwrapped_model.compute_mtp_single_step = deterministic_mtp
+
+        env.engine._add_request(env.requests[0])
+        env.engine.schedule_waiting_requests()
+
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern()
+
+        req = env.requests[0]
+        assert req.status == Status.COMPLETED
+        assert len(req.generated_tokens) == num_tokens_to_generate, (
+            f"Expected {num_tokens_to_generate} tokens, "
+            f"got {len(req.generated_tokens)}: {req.generated_tokens}"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @torch.inference_mode()
     def test_speculative_mixed_prefill_decode_heterogeneous_acceptance(self):
         """Test speculative decoding with a mixed prefill/decode batch where

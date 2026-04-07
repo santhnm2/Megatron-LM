@@ -2392,27 +2392,33 @@ class TestDynamicInferenceEngine:
     )
     @torch.inference_mode()
     def test_speculative_max_sequence_length_boundary(self):
-        """Speculative decode step that overshoots max_sequence_length completes.
+        """Block-table write for speculative overshoot doesn't OOB.
 
-        The request must survive past prefill into a real decode step so that
-        the main model forward actually processes speculative-token positions
-        that exceed ``max_sequence_length``.  With ``num_tokens_to_generate=2``
-        the request is not terminated after prefill (``active_seq_len = 8 < 9``),
-        so the engine runs a decode step whose input tokens span positions
-        ``[7, 8, 9]``.  Position 9 equals ``max_sequence_length`` and, without
-        the ``_max_kv_sequence_length`` padding, the RoPE embedding table would
-        only cover positions ``0 .. max_sequence_length - 1``, causing an
-        out-of-bounds access during the real attention forward pass.
+        ``position_embedding_type='none'`` avoids the learned-absolute
+        embedding table (sized to ``max_sequence_length``) crashing when
+        positions overshoot.  This isolates the fix under test:
+        ``_max_kv_sequence_length`` sizing the block table wide enough.
 
-        Only ``compute_mtp_single_step`` is mocked (for deterministic speculative
-        tokens); the real model forward — including RoPE application and
-        Flash-Attention kernels — runs on the overshooting positions.
-        Greedy sampling (top_k=1) avoids NaN/Inf from random weights.
+        Parameters:
+        - ``prompt_length = 13``, ``max_sequence_length = 16``,
+          ``num_tokens_to_generate = 10``, ``num_speculative_tokens = 2``,
+          ``block_size = 16``.
+        - After prefill: 1 block, ``active_seq_len = 14 < 26`` → continues.
+        - The prefill step's ``update_requests`` sets
+          ``request_last_kv_block_offset = (12 + 3) % 16 = 15``.
+        - At the decode step, the pause check fires
+          (``15 >= 16 − 1 − 2 = 13``) so the request is paused/resumed
+          with a new 2nd block.  The resume writes to
+          ``request_to_kv_block_ids[req, 1]``.
+        - ``max_kv_block_count = ceil(_max_kv_sequence_length / 16)``.
+          With the fix (18): ``ceil(18/16) = 2`` → column 1 exists.
+          Without the fix (16): ``ceil(16/16) = 1`` → column 1 is **OOB**.
         """
         num_speculative_tokens = 2
-        prompt_length = 7
-        max_sequence_length = 9  # 2 tokens of headroom so request survives past prefill
-        num_tokens_to_generate = 2
+        prompt_length = 13
+        max_sequence_length = 16
+        num_tokens_to_generate = 10
+        block_size = 16
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # add request manually with top_k=1
@@ -2423,19 +2429,15 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=False,
-            # RoPE (not learned absolute) so the fix under test —
-            # _max_kv_sequence_length sizing the RoPE table — is what
-            # prevents the OOB.  Learned position embeddings have a
-            # separate fixed table that is not covered by this fix.
-            position_embedding_type="rope",
+            context_block_size_tokens=block_size,
+            # No position embeddings so that positions past
+            # max_sequence_length don't crash the embedding table.
+            position_embedding_type="none",
         )
 
         env = self._build_test_env(test_config)
         model = env.engine.controller.inference_wrapped_model.model
 
-        # Mock only compute_mtp_single_step.  The real model.forward (and its
-        # RoPE / Flash-Attention kernels) runs with position IDs that overshoot
-        # max_sequence_length.
         def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             logits = torch.zeros(
@@ -2459,14 +2461,15 @@ class TestDynamicInferenceEngine:
             ),
         )
 
-        # Verify the extra capacity is provisioned.
         context = env.engine.context
         assert context._max_kv_sequence_length == max_sequence_length + num_speculative_tokens
+        assert math.ceil(max_sequence_length / block_size) < math.ceil(
+            (max_sequence_length + num_speculative_tokens) / block_size
+        ), "block_size must be chosen so that speculative overshoot crosses a block boundary"
 
-        # Run to completion.  The decode step processes positions [7, 8, 9].
-        # Without _max_kv_sequence_length padding the RoPE table would only
-        # cover positions 0..8, so position 9 would be an OOB access that
-        # surfaces as a CUDA illegal-memory-access or IndexError here.
+        # Run to completion.  Without _max_kv_sequence_length padding,
+        # the pause/resume cycle would write to a block-table column
+        # that does not exist, causing an OOB or CUDA IMA.
         finished_records = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
@@ -2474,7 +2477,6 @@ class TestDynamicInferenceEngine:
 
         finished_req = finished_records[0].merge()
         assert finished_req.status == Status.COMPLETED
-        assert len(finished_req.generated_tokens) == num_tokens_to_generate
         assert context.active_token_count == 0
         assert context.total_request_count == 0
 

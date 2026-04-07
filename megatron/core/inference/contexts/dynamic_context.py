@@ -525,10 +525,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # (1 + num_speculative_tokens) tokens. The last speculative positions
         # can overshoot max_sequence_length before the termination
         # check runs (which happens *after* the forward pass). To avoid
-        # out-of-bounds KV-cache writes and RoPE table lookups, provision the
-        # metadata for the extra positions. The termination / truncation
-        # logic in the engine still uses the *original* max_sequence_length via
-        # request_output_lengths, so no extra tokens are ever surfaced to the caller.
+        # out-of-bounds KV-cache writes, provision the block table and
+        # attention metadata for the extra positions. The termination /
+        # truncation logic in the engine still uses the *original*
+        # max_sequence_length via request_output_lengths, so no extra
+        # tokens are ever surfaced to the caller.
         self._max_kv_sequence_length = (
             self.max_sequence_length + self.num_speculative_tokens
         )

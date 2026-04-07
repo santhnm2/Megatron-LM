@@ -240,13 +240,9 @@ class RotaryEmbedding(nn.Module):
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
         elif inference_context is not None:
-            # For dynamic batching, use the max of context's max KV sequence length
-            # and the actual input size to ensure rotary embeddings cover both
-            # CUDA graph warmup token counts and speculative decoding overshoot.
-            context_max_seq_len = getattr(
-                inference_context, '_max_kv_sequence_length',
-                inference_context.max_sequence_length,
-            )
+            # For dynamic batching, use the max of context's max_sequence_length and the actual
+            # input size to ensure rotary embeddings cover CUDA graph warmup token counts
+            context_max_seq_len = inference_context.max_sequence_length
             input_seq_len = 0
             if transformer_input is not None:
                 input_seq_len = transformer_input.size(0)

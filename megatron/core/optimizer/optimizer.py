@@ -101,10 +101,13 @@ class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
+    Provides a consistent interface for gradient management, parameter 
+    access, and state-dict handling across different optimization types.
+
     Args:
-        optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
-        config (OptimizerConfig): configuration object for optimizer.
-        init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        optimizer (torch.optim.Optimizer): The base PyTorch optimizer.
+        config (OptimizerConfig): The optimizer configuration.
+        init_state_fn (Callable, optional): Function to initialize optimizer state.
     """
 
     def __init__(
@@ -134,28 +137,29 @@ class MegatronOptimizer(ABC):
                     params.append(param)
         return params
 
-    def _filter_grads_for_norm(
-        self,
-        params: List[torch.nn.Parameter],
-        param_filter: Optional[Callable[[torch.nn.Parameter], bool]] = None,
-    ) -> List[torch.Tensor]:
-        """Filter parameter gradients for norm computation.
+    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        
+        """Collects gradients for norm calculation, filtering duplicates.
 
-        Filter parameters based on:
-          - param_filter predicate, when provided.
-          - grad should not be None.
-          - parameter should not be shared (i.e., grads shouldn't be double counted while
-            computing norms).
-          - should not be a replica due to tensor model parallelism.
+        This method filters parameters based on whether the gradient is not None, 
+        the parameter is not shared (to avoid double-counting gradients), and 
+        the parameter is not a replica due to tensor model parallelism.
+
+        Returns:
+            List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
         """
         grads_for_norm = []
         for param in params:
-            if param_filter is not None and not param_filter(param):
-                continue
-            if getattr(param, "__fsdp_param__", False):
-                grad = param.grad._local_tensor if param.grad is not None else None
-            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+                if (
+                    getattr(param, "__fsdp_param__", False)
+                    and grad is not None
+                    and hasattr(grad, "_local_tensor")
+                ):
+                    grad = grad._local_tensor
+            elif getattr(param, "__fsdp_param__", False):
+                grad = param.grad._local_tensor if param.grad is not None else None
             else:
                 grad = param.grad
             grad_not_none = grad is not None

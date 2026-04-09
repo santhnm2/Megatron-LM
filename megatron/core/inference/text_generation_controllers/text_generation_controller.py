@@ -192,10 +192,9 @@ class TextGenerationController:
         dtype = self.model_config.params_dtype
         device = torch.cuda.current_device()
 
-        # Collect all padded batch sizes that need warmup.  This includes
-        # the decode request counts from CUDA graph dimensions *and* the
-        # dummy EP batch shape (padded_count = tp_size with SP, else 1)
-        # used by _dummy_serial_mtp_forward on ranks with no real requests.
+        # Collect all unique padded batch sizes that need warmup from the
+        # decode request counts in CUDA graph dimensions.  Dummy EP forwards
+        # run eagerly (see _dummy_serial_mtp_forward) and do not need warmup.
         seen: set = set()
         padded_sizes: list = []
         for dim in context.cuda_graph_batch_dimensions_list:
@@ -208,13 +207,6 @@ class TextGenerationController:
             if padded not in seen:
                 seen.add(padded)
                 padded_sizes.append(padded)
-
-        # Dummy EP shape: _dummy_serial_mtp_forward uses padded_count = tp_size
-        # (with SP) or 1 (without SP).
-        dummy_padded = tp_size if sp_enabled else 1
-        if dummy_padded not in seen:
-            seen.add(dummy_padded)
-            padded_sizes.append(dummy_padded)
 
         for padded in padded_sizes:
             hidden_dim0 = padded // tp_size if sp_enabled else padded
@@ -1769,6 +1761,16 @@ class TextGenerationController:
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
+        # Disable MTP CUDA graphs for the dummy forward.  Work ranks replay
+        # graphs captured at their (larger) batch size; replaying a different
+        # graph here would issue mismatched NCCL collectives and hang.
+        mtp_layers = []
+        if has_mtp and hasattr(unwrapped_model, 'mtp'):
+            for layer in unwrapped_model.mtp.layers:
+                if hasattr(layer, 'mtp_model_layer'):
+                    layer.mtp_model_layer._mtp_skip_cudagraph = True
+                    mtp_layers.append(layer.mtp_model_layer)
+
         for depth in range(num_depths):
             mtp_logits_2d = None
             if has_mtp:
@@ -1788,6 +1790,10 @@ class TextGenerationController:
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
                 )
+
+        # Restore CUDA graph eligibility for MTP layers.
+        for layer in mtp_layers:
+            layer._mtp_skip_cudagraph = False
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.

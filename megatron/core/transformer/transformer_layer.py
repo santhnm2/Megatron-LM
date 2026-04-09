@@ -1261,11 +1261,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return True
         # MTP layers during inference: standalone TransformerLayers (not inside a
         # TransformerBlock) that use shape-based graph matching without inference_context.
+        # Skipped when _mtp_skip_cudagraph is set (dummy EP forwards must run eagerly
+        # so their collectives don't conflict with work-rank graph replays).
         if (
             hasattr(self, 'cudagraph_manager')
             and getattr(self, 'is_mtp_layer', False)
             and torch.is_inference_mode_enabled()
             and kwargs.get('attention_mask') is None
+            and not getattr(self, '_mtp_skip_cudagraph', False)
         ):
             return True
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None

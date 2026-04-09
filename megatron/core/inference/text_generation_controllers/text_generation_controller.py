@@ -192,7 +192,12 @@ class TextGenerationController:
         dtype = self.model_config.params_dtype
         device = torch.cuda.current_device()
 
+        # Collect all padded batch sizes that need warmup.  This includes
+        # the decode request counts from CUDA graph dimensions *and* the
+        # dummy EP batch shape (padded_count = tp_size with SP, else 1)
+        # used by _dummy_serial_mtp_forward on ranks with no real requests.
         seen: set = set()
+        padded_sizes: list = []
         for dim in context.cuda_graph_batch_dimensions_list:
             req_count = dim.decode_req_count
             if req_count == 0:
@@ -200,10 +205,18 @@ class TextGenerationController:
             padded = req_count
             if sp_enabled:
                 padded += (tp_size - req_count % tp_size) % tp_size
-            if padded in seen:
-                continue
-            seen.add(padded)
+            if padded not in seen:
+                seen.add(padded)
+                padded_sizes.append(padded)
 
+        # Dummy EP shape: _dummy_serial_mtp_forward uses padded_count = tp_size
+        # (with SP) or 1 (without SP).
+        dummy_padded = tp_size if sp_enabled else 1
+        if dummy_padded not in seen:
+            seen.add(dummy_padded)
+            padded_sizes.append(dummy_padded)
+
+        for padded in padded_sizes:
             hidden_dim0 = padded // tp_size if sp_enabled else padded
             dummy_hidden = torch.zeros(hidden_dim0, 1, hidden_size, device=device, dtype=dtype)
             dummy_tokens = torch.zeros(1, padded, device=device, dtype=torch.long)

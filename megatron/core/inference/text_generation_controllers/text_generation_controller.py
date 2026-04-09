@@ -165,6 +165,58 @@ class TextGenerationController:
                 * -1
             )
 
+    def warmup_mtp_cuda_graphs(self):
+        """Warm up CUDA graphs for MTP TransformerLayers.
+
+        Called from ``DynamicEngine.create_cuda_graphs`` so that each MTP
+        layer's ``cudagraph_manager`` captures a graph for every decode-only
+        batch dimension.  Only the last pipeline stage (which owns MTP) does
+        real work; other stages return immediately.
+        """
+        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        if not context.cuda_graph_batch_dimensions_list:
+            return
+
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        if not (
+            is_pipeline_last_stage(self.pp_group) and hasattr(unwrapped_model, 'mtp')
+        ):
+            return
+
+        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+        hidden_size = self.model_config.hidden_size
+        dtype = self.model_config.params_dtype
+        device = torch.cuda.current_device()
+
+        seen: set = set()
+        for dim in context.cuda_graph_batch_dimensions_list:
+            req_count = dim.decode_req_count
+            if req_count == 0:
+                continue
+            padded = req_count
+            if sp_enabled:
+                padded += (tp_size - req_count % tp_size) % tp_size
+            if padded in seen:
+                continue
+            seen.add(padded)
+
+            hidden_dim0 = padded // tp_size if sp_enabled else padded
+            dummy_hidden = torch.zeros(hidden_dim0, 1, hidden_size, device=device, dtype=dtype)
+            dummy_tokens = torch.zeros(1, padded, device=device, dtype=torch.long)
+            dummy_pos = torch.zeros(1, padded, device=device, dtype=torch.long)
+
+            with torch.inference_mode():
+                unwrapped_model.compute_mtp_single_step(
+                    hidden_states=dummy_hidden,
+                    next_token_ids=dummy_tokens,
+                    position_ids=dummy_pos,
+                    depth=0,
+                )
+
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.

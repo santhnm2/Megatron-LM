@@ -1631,6 +1631,22 @@ class CudaGraphManager(torch.nn.Module):
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+            elif (
+                not self.training
+                and torch.is_inference_mode_enabled()
+                and getattr(megatron_module, 'is_mtp_layer', False)
+            ):
+                # MTP layers during inference: immediate capture with shape-based
+                # matching, mirroring the inference_context path above.
+                runner = self.get_cudagraph_runner(
+                    megatron_module, args, kwargs, self.reuse_cudagraphs
+                )
+                if not runner.fwd_graph_recorded:
+                    runner.create_fwd_graph(args, kwargs, outputs=None, clone_inputs=True)
+                    runner.fwd_graph_recorded = True
+                    runner.cudagraph_created = True
+                    runner = runner.eval()
+                out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(
                     megatron_module, args, kwargs, self.reuse_cudagraphs

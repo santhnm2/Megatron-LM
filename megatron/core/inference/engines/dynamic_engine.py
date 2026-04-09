@@ -391,6 +391,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
             context.reset()
 
+        # Warm up MTP CUDA graphs for each decode request count.
+        controller.warmup_mtp_cuda_graphs()
+
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)

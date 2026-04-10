@@ -1134,6 +1134,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block[padding_token_slice] = 0
         self.token_to_position_in_request[padding_token_slice] = 0
 
+        # Pad request-level sampling metadata for FlashInfer.  Padded slots
+        # must contain disabled-filter sentinels so the kernel doesn't trip on
+        # stale values.  The last-token gather also reads padded slots when
+        # materialize_only_last_token_logits is False; index 0 is always
+        # in-bounds for the logits buffer.
+        if self.config.sampling_backend == 'flashinfer':
+            n = self.total_request_count - self.paused_request_count
+            padded_n = self.padded_active_request_count
+            if padded_n > n:
+                self.active_request_metadata["temperature"][n:padded_n].fill_(1.0)
+                self.active_request_metadata["top_k"][n:padded_n].fill_(0)
+                self.active_request_metadata["top_p"][n:padded_n].fill_(0.0)
+                if not self.config.materialize_only_last_token_logits:
+                    self.active_request_last_token_idxs[n:padded_n].fill_(0)
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
@@ -2234,10 +2249,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Handle request metadata.
         assert (
-            req.get_metadata_types() == self.request_metadata_types
+            req.get_metadata_types(sampling_backend=self.config.sampling_backend)
+            == self.request_metadata_types
         ), "Request added to context with invalid metadata types"
         metadata = req.tracked_metadata
-        metadata_types = req.get_metadata_types()
+        metadata_types = req.get_metadata_types(sampling_backend=self.config.sampling_backend)
         for m, m_type in zip(metadata, metadata_types):
             label, _, _ = m_type
             if not isinstance(m, torch.Tensor):

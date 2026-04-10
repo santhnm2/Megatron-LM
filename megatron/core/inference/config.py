@@ -2,10 +2,11 @@
 
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
@@ -297,6 +298,9 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
@@ -319,4 +323,17 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "sampling_backend='flashinfer' requires flashinfer to be installed."
+                )
+
+        if self.request_metadata_types is None:
+            self.request_metadata_types = DynamicInferenceRequest.get_metadata_types(
+                sampling_backend=self.sampling_backend
             )

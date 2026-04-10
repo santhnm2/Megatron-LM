@@ -472,8 +472,12 @@ class DynamicInferenceRequest(InferenceRequest):
         return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
 
     @staticmethod
-    def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
+    def get_metadata_types(sampling_backend: str = 'torch') -> List[Tuple[str, torch.dtype, bool]]:
         """Keeps track of all request metadata names, dtypes, and target device.
+
+        Args:
+            sampling_backend: Which sampling backend is in use.
+                FlashInfer needs sampling parameters directly on GPU.
 
         Returns:
             List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
@@ -481,15 +485,22 @@ class DynamicInferenceRequest(InferenceRequest):
                 dtype (torch.dtype) - The datatype of the metadata.
                 on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
         """
-        return [
-            ("temperature", torch.float32, False),  # CPU for torch sampling
-            ("top_k", torch.int32, False),  # CPU for torch sampling
-            ("top_p", torch.float32, False),  # CPU for torch sampling
+        types = [
+            ("temperature", torch.float32, False),
+            ("top_k", torch.int32, False),
+            ("top_p", torch.float32, False),
             ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("return_log_probs", torch.bool, False),
+            ("skip_prompt_log_probs", torch.bool, False),
+            ("top_n_logprobs", torch.int32, False),
         ]
+        if sampling_backend == 'flashinfer':
+            gpu_fields = {"temperature", "top_k", "top_p"}
+            types = [
+                (label, dtype, True if label in gpu_fields else on_gpu)
+                for label, dtype, on_gpu in types
+            ]
+        return types
 
     def add_event(
         self, type: DynamicInferenceEventType, payload: Optional[Any] = None

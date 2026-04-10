@@ -1,23 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import argparse
 import asyncio
 import logging
+import multiprocessing as mp
 import random
-import sys
 import time
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    start_text_gen_server,
-    stop_text_gen_server,
-)
 from megatron.core.utils import trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.training import get_args
@@ -39,20 +33,21 @@ def add_inference_benchmarking_args(parser):
         "--benchmark-profile", action="store_true", default=False, help="If set, profile"
     )
     group.add_argument(
-        "--port", type=int, default=5000, help="Port for the text generation server"
-    )
-    group.add_argument(
-        "--host", type=str, default=None,
-        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
-    )
-    group.add_argument(
         "--num-warmup-iterations", type=int, default=3, help="Number of warmup iterations"
     )
     return parser
 
 
-def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
+def get_random_prompt_tokens(vocab_size, special_token_ids, num_input_tokens) -> List[int]:
     """Generate random prompt tokens, excluding special tokens."""
+    valid_token_ids = [i for i in range(vocab_size) if i not in special_token_ids]
+    prompt_tokens = random.choices(valid_token_ids, k=num_input_tokens)
+    assert len(prompt_tokens) == num_input_tokens
+    return prompt_tokens
+
+
+def _get_special_token_ids(tokenizer) -> set:
+    """Extract special token IDs from the tokenizer."""
     special_token_ids = set()
     try:
         if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
@@ -68,28 +63,61 @@ def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
             special_token_ids.update(tokenizer.additional_special_tokens_ids)
     except NotImplementedError:
         pass
-
-    valid_token_ids = [i for i in range(tokenizer.vocab_size) if i not in special_token_ids]
-    prompt_tokens = random.choices(valid_token_ids, k=num_input_tokens)
-    assert len(prompt_tokens) == num_input_tokens
-    return prompt_tokens
+    return special_token_ids
 
 
-@trace_async_exceptions
-async def run_benchmark_client(
+# ---------------------------------------------------------------------------
+# Benchmark client — runs in a separate process
+# ---------------------------------------------------------------------------
+
+
+def _benchmark_client_worker(
     coordinator_addr: str,
-    requests: List[InferenceRequest],
+    prompt_token_lists: List[List[int]],
+    sampling_params_dict: dict,
+    warmup_sampling_params_dict: dict,
+    num_warmup_iterations: int,
+    benchmark_profile: bool,
+):
+    """Synchronous entry point for the benchmark client subprocess.
+
+    Spins up its own event loop and runs the async benchmark client.
+    This process has no GPU context — it only talks to the coordinator
+    over ZMQ, so there is zero contention with the engine process.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            _async_benchmark_client(
+                coordinator_addr=coordinator_addr,
+                prompt_token_lists=prompt_token_lists,
+                sampling_params=SamplingParams.deserialize(sampling_params_dict),
+                warmup_sampling_params=SamplingParams.deserialize(warmup_sampling_params_dict),
+                num_warmup_iterations=num_warmup_iterations,
+                benchmark_profile=benchmark_profile,
+            )
+        )
+    except KeyboardInterrupt:
+        logger.info("Benchmark client interrupted.")
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
+
+async def _async_benchmark_client(
+    coordinator_addr: str,
+    prompt_token_lists: List[List[int]],
     sampling_params: SamplingParams,
     warmup_sampling_params: SamplingParams,
     num_warmup_iterations: int,
     benchmark_profile: bool,
 ):
-    """Submit benchmark requests to the inference coordinator via ZMQ client.
-
-    Runs as an async task alongside the engine loop. The client submits
-    requests to the coordinator, which routes them to the engine running
-    in a separate async task — eliminating the single-process contention.
-    """
+    """Submit benchmark requests to the coordinator and report results."""
     client = InferenceClient(coordinator_addr, deserialize=False)
     client.start()
     logger.info("Benchmark client connected to coordinator.")
@@ -107,8 +135,8 @@ async def run_benchmark_client(
         # Submit all requests
         start_time = time.perf_counter()
         futures = []
-        for req in requests:
-            future = client.add_request(req.prompt_tokens, sampling_params)
+        for prompt_tokens in prompt_token_lists:
+            future = client.add_request(prompt_tokens, sampling_params)
             futures.append(future)
 
         results = await asyncio.gather(*futures)
@@ -118,42 +146,41 @@ async def run_benchmark_client(
         if benchmark_profile:
             torch.cuda.cudart().cudaProfilerStop()
 
-        memory_allocated = torch.cuda.max_memory_allocated()
+        for idx, result in enumerate(results):
+            print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
+            result_dict = {
+                'id': idx,
+                'num_input_tokens': len(prompt_token_lists[idx]),
+                'num_output_tokens': result.get('generated_length', 0),
+                'latency': result.get('latency', latency),
+            }
+            print(result_dict)
 
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            for idx, result in enumerate(results):
-                print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
-                num_output_tokens = result.get('generated_length', 0)
-                result_dict = {
-                    'id': idx,
-                    'num_input_tokens': len(requests[idx].prompt_tokens),
-                    'num_output_tokens': num_output_tokens,
-                    'latency': result.get('latency', latency),
-                    'memory_usage_GB': memory_allocated / (1024**3),
-                }
-                print(result_dict)
-
-            total_output_tokens = sampling_params.num_tokens_to_generate * len(requests)
-            throughput = total_output_tokens / latency
-            print(f"\nTotal latency: {latency:.3f}s")
-            print(f"Throughput: {throughput:.1f} output tokens / second")
+        total_output_tokens = sampling_params.num_tokens_to_generate * len(prompt_token_lists)
+        throughput = total_output_tokens / latency
+        print(f"\nTotal latency: {latency:.3f}s")
+        print(f"Throughput: {throughput:.1f} output tokens / second")
 
     finally:
         client.stop()
 
 
+# ---------------------------------------------------------------------------
+# Engine server — runs in the main process (needs GPU + torch.distributed)
+# ---------------------------------------------------------------------------
+
+
 @trace_async_exceptions
-async def run_benchmark(
+async def _run_engine_with_benchmark(
     engine: DynamicInferenceEngine,
-    requests: List[InferenceRequest],
+    prompt_token_lists: List[List[int]],
     sampling_params: SamplingParams,
     warmup_sampling_params: SamplingParams,
     num_warmup_iterations: int,
     benchmark_profile: bool,
-    server_port: int,
-    hostname: str | None = None,
+    hostname: Optional[str] = None,
 ):
-    """Start the coordinator and engine loop, then run the benchmark client."""
+    """Start the coordinator and engine loop, then spawn the benchmark client process."""
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -163,37 +190,40 @@ async def run_benchmark(
         hostname=hostname,
     )
 
+    client_process = None
     try:
         if rank == 0:
-            start_text_gen_server(
-                coordinator_addr=coordinator_addr,
-                tokenizer=engine.controller.tokenizer,
-                rank=rank,
-                server_port=server_port,
-                hostname=hostname,
+            client_process = mp.Process(
+                target=_benchmark_client_worker,
+                args=(
+                    coordinator_addr,
+                    prompt_token_lists,
+                    sampling_params.serialize(),
+                    warmup_sampling_params.serialize(),
+                    num_warmup_iterations,
+                    benchmark_profile,
+                ),
+                daemon=True,
             )
+            client_process.start()
+            logger.info(f"Started benchmark client process (PID: {client_process.pid})")
 
+        # Run the engine loop until the client process finishes
         if rank == 0:
-            # Run the benchmark client alongside the engine loop
-            benchmark_task = asyncio.ensure_future(
-                run_benchmark_client(
-                    coordinator_addr=coordinator_addr,
-                    requests=requests,
-                    sampling_params=sampling_params,
-                    warmup_sampling_params=warmup_sampling_params,
-                    num_warmup_iterations=num_warmup_iterations,
-                    benchmark_profile=benchmark_profile,
-                )
-            )
-            # Wait for benchmark to finish, then cancel the engine loop
-            await benchmark_task
+            while client_process.is_alive():
+                # Give the engine loop time to process requests
+                await asyncio.sleep(0.1)
         else:
-            # Non-rank-0 workers just run the engine loop until cancelled
             await engine.engine_loop_task
 
     finally:
-        if rank == 0:
-            stop_text_gen_server()
+        if client_process is not None:
+            if client_process.is_alive():
+                client_process.terminate()
+                client_process.join(timeout=5)
+                if client_process.is_alive():
+                    client_process.kill()
+                    client_process.join()
 
 
 @torch.inference_mode()
@@ -231,43 +261,31 @@ def main():
 
     warmup_sampling_params = SamplingParams(num_tokens_to_generate=10, termination_id=-1)
 
-    requests = []
+    # Build prompt token lists to pass to the client process
+    special_token_ids = _get_special_token_ids(tokenizer)
+    prompt_token_lists = []
     batch_size = args.inference_dynamic_batching_max_requests or 1
     if args.num_input_tokens is not None:
         assert args.prompts is None
-        for i in range(batch_size):
-            prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
-            requests.append(
-                InferenceRequest(
-                    request_id=str(time.monotonic()),
-                    prompt=tokenizer.detokenize(prompt_tokens),
-                    prompt_tokens=prompt_tokens,
-                    inference_parameters=sampling_params,
-                )
+        for _ in range(batch_size):
+            prompt_token_lists.append(
+                get_random_prompt_tokens(tokenizer.vocab_size, special_token_ids, args.num_input_tokens)
             )
     else:
         assert args.prompts is not None
         for prompt in args.prompts:
-            requests.append(
-                InferenceRequest(
-                    request_id=str(time.monotonic()),
-                    prompt=prompt,
-                    prompt_tokens=tokenizer.tokenize(prompt),
-                    inference_parameters=sampling_params,
-                )
-            )
+            prompt_token_lists.append(tokenizer.tokenize(prompt))
 
     try:
         asyncio.run(
-            run_benchmark(
+            _run_engine_with_benchmark(
                 engine=engine,
-                requests=requests,
+                prompt_token_lists=prompt_token_lists,
                 sampling_params=sampling_params,
                 warmup_sampling_params=warmup_sampling_params,
                 num_warmup_iterations=args.num_warmup_iterations,
                 benchmark_profile=args.benchmark_profile,
-                server_port=args.port,
-                hostname=args.host,
+                hostname=getattr(args, 'host', None),
             )
         )
     except KeyboardInterrupt:

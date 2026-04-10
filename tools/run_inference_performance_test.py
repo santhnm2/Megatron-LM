@@ -1,47 +1,29 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
-import os
+import asyncio
+import logging
 import random
 import sys
 import time
+from typing import List
 
 import torch
 
-from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
-from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequestRecord,
-    InferenceRequest,
-)
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-    GPTInferenceWrapper,
-)
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+    start_text_gen_server,
+    stop_text_gen_server,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
-from model_provider import model_provider
-
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
-)
-
-from functools import partial
-from typing import List
-
-from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
+from megatron.core.utils import trace_async_exceptions
+from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
+from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
 
-REQUEST_ID = 0
+logger = logging.getLogger(__name__)
 
 
 def add_inference_benchmarking_args(parser):
@@ -54,44 +36,23 @@ def add_inference_benchmarking_args(parser):
         "--num-input-tokens", type=int, default=128, help="Number of input tokens per request"
     )
     group.add_argument(
-        "--engine-type", choices=["static", "dynamic"], default="static", help="Engine type"
+        "--benchmark-profile", action="store_true", default=False, help="If set, profile"
     )
     group.add_argument(
-        "--benchmark-profile", action="store_true", default=False, help="If set, profile"
+        "--port", type=int, default=5000, help="Port for the text generation server"
+    )
+    group.add_argument(
+        "--host", type=str, default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
+    )
+    group.add_argument(
+        "--num-warmup-iterations", type=int, default=3, help="Number of warmup iterations"
     )
     return parser
 
 
-def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> AbstractEngine:
-    """Utility to get the relevant backend for running inference
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model .
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
-
-    if args.engine_type == "static":
-        tokenizer = get_tokenizer()
-        context = StaticInferenceContext(
-            args.inference_max_requests, args.inference_max_sequence_length
-        )
-        inference_wrapped_model = GPTInferenceWrapper(model, context)
-        inference_wrapped_model.model_is_pipeline_parallel = not (
-            mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
-        )
-        return StaticInferenceEngine(text_generation_controller=text_generation_controller)
-    elif args.engine_type == "dynamic":
-        return get_dynamic_inference_engine(model=model)
-
-
 def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
-    # Get the set of special token IDs to exclude
+    """Generate random prompt tokens, excluding special tokens."""
     special_token_ids = set()
     try:
         if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
@@ -99,58 +60,145 @@ def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
         if hasattr(tokenizer, 'eos') and tokenizer.eos is not None:
             special_token_ids.add(tokenizer.eos)
         if hasattr(tokenizer, 'eod') and tokenizer.eod is not None:
-            special_token_ids.add(tokenizer.eos)
+            special_token_ids.add(tokenizer.eod)
         if (
             hasattr(tokenizer, 'additional_special_tokens_ids')
             and tokenizer.additional_special_tokens_ids
         ):
             special_token_ids.update(tokenizer.additional_special_tokens_ids)
-    except NotImplementedError as e:
+    except NotImplementedError:
         pass
 
-    # Create a list of valid token IDs
     valid_token_ids = [i for i in range(tokenizer.vocab_size) if i not in special_token_ids]
-
-    # Randomly sample tokens from the valid tokens
     prompt_tokens = random.choices(valid_token_ids, k=num_input_tokens)
     assert len(prompt_tokens) == num_input_tokens
-
     return prompt_tokens
 
 
-def generate_dynamic(
-    args: argparse.Namespace,
-    inference_requests: List[InferenceRequest],
-    inference_engine: DynamicInferenceEngine,
+@trace_async_exceptions
+async def run_benchmark_client(
+    coordinator_addr: str,
+    requests: List[InferenceRequest],
+    sampling_params: SamplingParams,
+    warmup_sampling_params: SamplingParams,
+    num_warmup_iterations: int,
+    benchmark_profile: bool,
 ):
-    global REQUEST_ID
-    for request in inference_requests:
-        request_id = REQUEST_ID
-        REQUEST_ID += 1
-        prompt_tokens = request.prompt_tokens
-        inference_engine.add_request(request_id, prompt_tokens, request.inference_parameters)
+    """Submit benchmark requests to the inference coordinator via ZMQ client.
 
-    start_time = time.perf_counter()
-    all_finished_requests = []
-    while inference_engine.has_unfinished_requests():
-        result = inference_engine.step()
-        finished_requests = result["finished_requests"]
-        for request in finished_requests:
-            req_id = request.request_id
-            latency = time.perf_counter() - start_time
-            print(
-                f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and "
-                f"generated {request.generated_length} tokens"
+    Runs as an async task alongside the engine loop. The client submits
+    requests to the coordinator, which routes them to the engine running
+    in a separate async task — eliminating the single-process contention.
+    """
+    client = InferenceClient(coordinator_addr, deserialize=False)
+    client.start()
+    logger.info("Benchmark client connected to coordinator.")
+
+    try:
+        # Warmup
+        for i in range(num_warmup_iterations):
+            print(f"Running warmup iteration {i + 1}...")
+            warmup_future = client.add_request("warmup", warmup_sampling_params)
+            await warmup_future
+
+        if benchmark_profile:
+            torch.cuda.cudart().cudaProfilerStart()
+
+        # Submit all requests
+        start_time = time.perf_counter()
+        futures = []
+        for req in requests:
+            future = client.add_request(req.prompt_tokens, sampling_params)
+            futures.append(future)
+
+        results = await asyncio.gather(*futures)
+        end_time = time.perf_counter()
+        latency = end_time - start_time
+
+        if benchmark_profile:
+            torch.cuda.cudart().cudaProfilerStop()
+
+        memory_allocated = torch.cuda.max_memory_allocated()
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            for idx, result in enumerate(results):
+                print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
+                num_output_tokens = result.get('generated_length', 0)
+                result_dict = {
+                    'id': idx,
+                    'num_input_tokens': len(requests[idx].prompt_tokens),
+                    'num_output_tokens': num_output_tokens,
+                    'latency': result.get('latency', latency),
+                    'memory_usage_GB': memory_allocated / (1024**3),
+                }
+                print(result_dict)
+
+            total_output_tokens = sampling_params.num_tokens_to_generate * len(requests)
+            throughput = total_output_tokens / latency
+            print(f"\nTotal latency: {latency:.3f}s")
+            print(f"Throughput: {throughput:.1f} output tokens / second")
+
+    finally:
+        client.stop()
+
+
+@trace_async_exceptions
+async def run_benchmark(
+    engine: DynamicInferenceEngine,
+    requests: List[InferenceRequest],
+    sampling_params: SamplingParams,
+    warmup_sampling_params: SamplingParams,
+    num_warmup_iterations: int,
+    benchmark_profile: bool,
+    server_port: int,
+    hostname: str | None = None,
+):
+    """Start the coordinator and engine loop, then run the benchmark client."""
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
+        inference_coordinator_port=None,
+        launch_inference_coordinator=True,
+        hostname=hostname,
+    )
+
+    try:
+        if rank == 0:
+            start_text_gen_server(
+                coordinator_addr=coordinator_addr,
+                tokenizer=engine.controller.tokenizer,
+                rank=rank,
+                server_port=server_port,
+                hostname=hostname,
             )
-        all_finished_requests.extend(finished_requests)
 
-    return all_finished_requests
+        if rank == 0:
+            # Run the benchmark client alongside the engine loop
+            benchmark_task = asyncio.ensure_future(
+                run_benchmark_client(
+                    coordinator_addr=coordinator_addr,
+                    requests=requests,
+                    sampling_params=sampling_params,
+                    warmup_sampling_params=warmup_sampling_params,
+                    num_warmup_iterations=num_warmup_iterations,
+                    benchmark_profile=benchmark_profile,
+                )
+            )
+            # Wait for benchmark to finish, then cancel the engine loop
+            await benchmark_task
+        else:
+            # Non-rank-0 workers just run the engine loop until cancelled
+            await engine.engine_loop_task
+
+    finally:
+        if rank == 0:
+            stop_text_gen_server()
 
 
 @torch.inference_mode()
 def main():
     """Main program."""
-
     initialize_megatron(
         extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
@@ -163,15 +211,12 @@ def main():
 
     args = get_args()
 
-    model = get_model_for_inference()
-
-    tokenizer = build_tokenizer(args)
+    engine = get_dynamic_inference_engine()
+    tokenizer = engine.controller.tokenizer
 
     assert (args.prompts is None) ^ (
         args.num_input_tokens is None
-    ), "Exactly one of `--prompts` and `--num-prompt-tokens` must be specified"
-
-    inference_engine = get_inference_engine(args, model)
+    ), "Exactly one of `--prompts` and `--num-input-tokens` must be specified"
 
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -184,10 +229,12 @@ def main():
     )
     sampling_params.add_attributes({"no_early_termination": True})
 
+    warmup_sampling_params = SamplingParams(num_tokens_to_generate=10, termination_id=-1)
+
     requests = []
+    batch_size = args.inference_dynamic_batching_max_requests or 1
     if args.num_input_tokens is not None:
         assert args.prompts is None
-        batch_size = args.inference_max_requests
         for i in range(batch_size):
             prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
             requests.append(
@@ -210,54 +257,24 @@ def main():
                 )
             )
 
-    # TODO(ksanthanam): Use a command line argument for warmup iterations
-    for i in range(3):
-        print(f"Running warmup iteration {i+1}...")
-        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10, termination_id=-1)
-        inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
-
-    if args.benchmark_profile:
-        torch.cuda.cudart().cudaProfilerStart()
-
-    start_time = time.perf_counter()
-    if args.engine_type == "static":
-        results: List[InferenceRequest] = inference_engine.generate(
-            prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
+    try:
+        asyncio.run(
+            run_benchmark(
+                engine=engine,
+                requests=requests,
+                sampling_params=sampling_params,
+                warmup_sampling_params=warmup_sampling_params,
+                num_warmup_iterations=args.num_warmup_iterations,
+                benchmark_profile=args.benchmark_profile,
+                server_port=args.port,
+                hostname=args.host,
+            )
         )
-    else:
-        prompts = [request.prompt_tokens for request in requests]
-        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
-            prompts=prompts, sampling_params=sampling_params
-        )
-        results: List[InferenceRequest] = [record.merge() for record in records]
-
-    end_time = time.perf_counter()
-    latency = end_time - start_time
-
-    memory_allocated = torch.cuda.max_memory_allocated()
-
-    if args.benchmark_profile:
-        torch.cuda.cudart().cudaProfilerStop()
-
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        for idx, result in enumerate(results):
-            print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
-            generated_log_probs = result.generated_log_probs
-            result_dict = {
-                'id': result.request_id,
-                'num_input_tokens': len(result.prompt_tokens),
-                'num_output_tokens': len(result.generated_tokens),
-                'tpot': result.tpot,
-                'latency': latency,
-                'memory_usage_GB': memory_allocated / (1024**3),
-            }
-            if args.prompts is not None:
-                result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
-            print(result_dict)
-
-    total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests
-    throughput = total_output_tokens / latency
-    print(f"Throughput: {throughput} output tokens / second")
+    except KeyboardInterrupt:
+        print("Benchmark interrupted by user.")
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

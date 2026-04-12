@@ -64,6 +64,7 @@ class TestTextGenerationController:
         sequence_parallel: bool = False,
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
+        cuda_graph_impl: str = 'none',
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -98,6 +99,7 @@ class TestTextGenerationController:
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
             add_bias_linear=num_moe_experts is None,
+            cuda_graph_impl=cuda_graph_impl,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True

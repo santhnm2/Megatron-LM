@@ -14,7 +14,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
@@ -34,6 +34,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
@@ -64,6 +66,7 @@ class TestTextGenerationController:
         sequence_parallel: bool = False,
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
+        hybrid_layer_pattern: str = None,
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -98,31 +101,51 @@ class TestTextGenerationController:
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
             add_bias_linear=num_moe_experts is None,
+            **(
+                dict(is_hybrid_model=True, mamba_num_heads=2, mamba_head_dim=16, mamba_num_groups=2)
+                if hybrid_layer_pattern
+                else {}
+            ),
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
 
-        layer_spec = get_gpt_layer_local_spec()
+        mamba_inference_state_config = None
+        if hybrid_layer_pattern:
+            model = MambaModel(
+                config=transformer_config,
+                mamba_stack_spec=mamba_stack_spec,
+                vocab_size=self.vocab_size,
+                max_sequence_length=self.sequence_length,
+                parallel_output=True,
+                hybrid_layer_pattern=hybrid_layer_pattern,
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
+            ).cuda()
+            mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+        else:
+            layer_spec = get_gpt_layer_local_spec()
 
-        mtp_block_spec = None
-        if mtp_num_layers > 0:
-            mtp_block_spec = get_gpt_mtp_block_spec(
-                config=transformer_config, spec=layer_spec, use_transformer_engine=False
-            )
+            mtp_block_spec = None
+            if mtp_num_layers > 0:
+                mtp_block_spec = get_gpt_mtp_block_spec(
+                    config=transformer_config, spec=layer_spec, use_transformer_engine=False
+                )
 
-        gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=self.vocab_size,
-            max_sequence_length=self.sequence_length,
-            parallel_output=True,
-            pre_process=parallel_state.is_pipeline_first_stage(),
-            post_process=parallel_state.is_pipeline_last_stage(),
-            mtp_block_spec=mtp_block_spec,
-        ).cuda()
-        gpt_model.eval()
+            model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=layer_spec,
+                vocab_size=self.vocab_size,
+                max_sequence_length=self.sequence_length,
+                parallel_output=True,
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
+                mtp_block_spec=mtp_block_spec,
+            ).cuda()
+
+        model.eval()
         if dtype == torch.bfloat16:
-            gpt_model = Float16Module(gpt_model.config, gpt_model)
+            model = Float16Module(model.config, model)
 
         if static:
             inference_context = StaticInferenceContext(
@@ -142,10 +165,11 @@ class TestTextGenerationController:
                     block_size_tokens=block_size_tokens,
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
+                    mamba_inference_state_config=mamba_inference_state_config,
                 ),
             )
 
-        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_context)
+        inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
 
         inference_wrapped_model.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
@@ -1124,6 +1148,9 @@ class TestTextGenerationController:
 
         # Override sampling to return our predictable mock outputs
         self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+            torch.tensor([0, 1], device='cuda', dtype=torch.long)
+        ]
         self.text_generation_controller._torch_sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
@@ -1156,6 +1183,7 @@ class TestTextGenerationController:
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
+            hybrid_layer_pattern="***M" if is_hybrid_model else None,
         )
         self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1177,13 +1205,13 @@ class TestTextGenerationController:
         )
 
         if is_hybrid_model:
-            ctx.is_hybrid_model = True
-            ctx.mamba_metadata = mock.MagicMock()
-            ctx.mamba_metadata.request_to_mamba_state_idx = torch.tensor([0, 1], device='cuda')
-            ctx.mamba_ssm_states = torch.zeros((1, 2, 16), device='cuda')
-            ctx.mamba_intermediate_ssm_states = torch.ones((1, 2, 4, 16), device='cuda') * 99
-            ctx.mamba_conv_states = torch.zeros((1, 2, 8), device='cuda')
-            ctx.mamba_intermediate_conv_states = torch.ones((1, 2, 4, 8), device='cuda') * 77
+            ctx.mamba_metadata.request_to_mamba_state_idx[:2] = torch.tensor(
+                [0, 1], dtype=torch.int32, device='cuda'
+            )
+            ctx.mamba_ssm_states.zero_()
+            ctx.mamba_intermediate_ssm_states.fill_(99)
+            ctx.mamba_conv_states.zero_()
+            ctx.mamba_intermediate_conv_states.fill_(77)
 
         # Mock accepted token counts: Req 0 accepts 1 (rejects 2), Req 1 accepts 0 (rejects 3)
         self.text_generation_controller._init_mtp_sampling_tensor()
@@ -1191,7 +1219,8 @@ class TestTextGenerationController:
             [1, 0], device='cuda'
         )
 
-        self.text_generation_controller._rewind_kv_cache()
+        blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
+        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
 
         # Assert offsets updated
         assert torch.equal(
@@ -1251,6 +1280,9 @@ class TestTextGenerationController:
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
         # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
         self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
+        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+            torch.tensor([0, 1], device='cuda', dtype=torch.long)
+        ]
 
         # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
         # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
@@ -1315,7 +1347,8 @@ class TestTextGenerationController:
             [1, 0], device='cuda'
         )
 
-        self.text_generation_controller._rewind_kv_cache()
+        blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
+        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
 
         # Req 1 should have released block 20 (ref count decremented).
         assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
@@ -1355,7 +1388,8 @@ class TestTextGenerationController:
             [0], device='cuda'
         )
 
-        self.text_generation_controller._rewind_kv_cache()
+        blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
+        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
 
         # Only block 40 should be released, not blocks 10, 20, or 30.
         assert ctx.request_kv_block_counts[0].item() == 3
@@ -1488,6 +1522,9 @@ class TestTextGenerationController:
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
         ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._torch_sampling_bucket_index_tensors = [
+            torch.arange(active_request_count, device='cuda', dtype=torch.long)
+        ]
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()

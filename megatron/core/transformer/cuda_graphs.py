@@ -241,8 +241,8 @@ def _check_supported_type(meta):
         DynamicInferenceContext,
         ArgMetadata,
     }
-    assert meta.type in _SUPPORTED_TYPES or is_dataclass(
-        meta.value
+    assert (
+        meta.type in _SUPPORTED_TYPES or is_dataclass(meta.value) or callable(meta.value)
     ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 
@@ -256,6 +256,10 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
     if not hasattr(base_module, "layer_number"):
+        return True, True
+
+    # MTP layers are self-contained; don't chain them with decoder layers.
+    if getattr(base_module, 'is_mtp_layer', False):
         return True, True
 
     # find all first/last layers of this PP stage
@@ -1418,8 +1422,12 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
         """
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
+        # MTP is only cuda-graphed for inference (forward_single_position).
+        self.is_mtp = isinstance(base_module, MultiTokenPredictionLayer)
 
         if function_name is not None:
             func = getattr(base_module, function_name)
@@ -1494,6 +1502,7 @@ class CudaGraphManager(torch.nn.Module):
         over different microbatches by tracking their respective fwd and bwd passes.'''
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            is_mtp_inference = self.is_mtp
             if is_inference_mode:
                 is_static_batching = kwargs['inference_context'].is_static_batching()
                 if is_static_batching:
@@ -1503,6 +1512,10 @@ class CudaGraphManager(torch.nn.Module):
                 else:
                     padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
                     runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+            elif is_mtp_inference:
+                # MTP layers have no inference_context; key by hidden_states shape.
+                mtp_key = ('mtp', kwargs['hidden_states'].shape)
+                runner = self.inference_cudagraphs_lookup_table.get(mtp_key)
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created
@@ -1545,6 +1558,8 @@ class CudaGraphManager(torch.nn.Module):
                             )
                         else:
                             self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
+                    elif is_mtp_inference:
+                        self.inference_cudagraphs_lookup_table[mtp_key] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1574,7 +1589,9 @@ class CudaGraphManager(torch.nn.Module):
 
             kwargs (dict):  The keyword args to be passed to the module.
         """
-        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        is_inference_mode = (
+            'inference_context' in kwargs.keys() and kwargs['inference_context']
+        ) or self.is_mtp
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
@@ -1590,8 +1607,21 @@ class CudaGraphManager(torch.nn.Module):
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
+                # MTP must match the main model's eager/graph mode so all EP
+                # ranks take the same code path. Skip during graph capture.
+                if (
+                    self.is_mtp
+                    and not getattr(megatron_module, 'use_mtp_cuda_graphs', False)
+                    and not is_graph_capturing()
+                ):
+                    return self.func(*args, **kwargs)
+
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
+
+                if not runner.fwd_graph_recorded and self.is_mtp and not is_graph_capturing():
+                    # No pre-warmed graph for this batch size — run eagerly.
+                    return self.func(*args, **kwargs)
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference

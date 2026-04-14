@@ -843,6 +843,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         mamba_submodules: Optional[MambaStackSubmodules] = None,
     ):
         super().__init__(config=config)
+        self.is_mtp_layer = True
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
@@ -948,6 +949,19 @@ class MultiTokenPredictionLayer(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         self.offload_context = nullcontext()
+
+        # Create cuda graph manager for forward_single_position so that
+        # the full MTP forward (embedding, projection, transformer, layernorm)
+        # is captured in a single graph.
+        if config.cuda_graph_impl == "local" and not config.cuda_graph_scope:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.cudagraph_manager = CudaGraphManager(
+                config,
+                base_module=self,
+                function_name="forward_single_position",
+                need_backward=False,
+            )
 
     def _get_embeddings(
         self,
@@ -1110,6 +1124,14 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         return hidden_states
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """MTP cuda-graphs forward_single_position, not forward.
+
+        Disable the MegatronModule.__call__ interceptor so the training forward
+        path is not routed through the cuda graph manager.
+        """
+        return False
+
     def forward_single_position(
         self,
         hidden_states: Tensor,
@@ -1120,7 +1142,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
-        inference_params=None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
     ) -> Tensor:
@@ -1151,7 +1172,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
-            inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )

@@ -925,6 +925,10 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
+    if getattr(args, 'fp8_param', False) and not args.fp8_param_gather:
+        assert not torch.is_grad_enabled(), \
+            '--fp8-param (without --fp8-param-gather) is only supported in inference mode'
+
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
@@ -1665,7 +1669,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
-    kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp8_param'] = getattr(args, 'fp8_param', False) or args.fp8_param_gather
+
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1735,6 +1740,11 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+
+    group.add_argument('--fp8-param', action='store_true',
+                       help='Initialize model parameters in fp8 format. '
+                            'Use for inference with --fp8-recipe=mxfp8. '
+                            'For training, use --fp8-param-gather instead.')
 
     # FP4 related arguments
     group.add_argument('--te-precision-config-file', default=None,

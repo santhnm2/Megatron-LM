@@ -39,6 +39,8 @@ from megatron.core.utils import (
     get_asyncio_loop,
     get_model_config,
     get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
     unwrap_model,
 )
 
@@ -814,6 +816,7 @@ class TextGenerationController:
         (scattered along the first dimension) between MTP depths to avoid a
         redundant gather + scatter round-trip per depth.
         """
+        nvtx_range_push("sampling/mtp")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
@@ -922,9 +925,11 @@ class TextGenerationController:
         # Clean up cached hidden states.
         if has_mtp:
             del unwrapped_model._decoder_hidden_states_cache
+        nvtx_range_pop("sampling/mtp")
 
     def _dynamic_step_sample_logits_and_verify_tokens(self, input_ids: Tensor):
         """Sample and verify speculative tokens."""
+        nvtx_range_push("sampling/verify")
         context = self.inference_wrapped_model.inference_context
         self._sampling.sample_and_verify(
             self._all_logits_cuda,
@@ -937,9 +942,11 @@ class TextGenerationController:
             accepted_counts=self._accepted_token_counts_per_request,
             use_graph=context.using_cuda_graph_this_step(),
         )
+        nvtx_range_pop("sampling/verify")
 
     def _dynamic_step_sample_logits(self):
         """Sample tokens from logits for dynamic batching."""
+        nvtx_range_push("sampling")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         gather_indices = (
@@ -955,6 +962,7 @@ class TextGenerationController:
             gather_indices=gather_indices,
             use_graph=context.using_cuda_graph_this_step(),
         )
+        nvtx_range_pop("sampling")
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -1032,6 +1040,7 @@ class TextGenerationController:
 
     def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
         """Calculate log probs from logits."""
+        nvtx_range_push("logprobs")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         logits_seq_len = (
@@ -1040,11 +1049,13 @@ class TextGenerationController:
             else context.padded_active_token_count
         )
 
-        return context.calculate_log_probs(
+        result = context.calculate_log_probs(
             self._all_logits_cuda[:, :logits_seq_len, :],
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
+        nvtx_range_pop("logprobs")
+        return result
 
     def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs from logits for speculative decoding.
@@ -1063,6 +1074,7 @@ class TextGenerationController:
                     log probs for the tokens emitted in this step.
                 log_probs_tensor: Full log_softmax tensor for top-n computation.
         """
+        nvtx_range_push("logprobs/speculative")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -1152,6 +1164,7 @@ class TextGenerationController:
 
         log_probs_list = log_probs_list_decode + log_probs_list_prefill
 
+        nvtx_range_pop("logprobs/speculative")
         return log_probs_list, log_probs_tensor
 
     def _dynamic_step_calculate_top_n_logprobs_speculative(
@@ -1171,6 +1184,7 @@ class TextGenerationController:
             A dictionary mapping request_idx to list of (top_n_values, top_n_indices)
             tuples, one per emitted token position.
         """
+        nvtx_range_push("top_n_logprobs/speculative")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -1272,6 +1286,7 @@ class TextGenerationController:
                                     for t in range(request_lp.size(0))
                                 ]
 
+        nvtx_range_pop("top_n_logprobs/speculative")
         return top_n_results if top_n_results else None
 
     def _dynamic_step_calculate_top_n_logprobs(
@@ -1288,6 +1303,7 @@ class TextGenerationController:
             A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
             Each tuple in the list represents one token position.
         """
+        nvtx_range_push("top_n_logprobs")
         assert log_probs_tensor is not None, (
             "log_probs_tensor must be provided. This should be guaranteed by the calling code "
             "computing log_probs when return_top_n_logprobs is True."
@@ -1352,6 +1368,7 @@ class TextGenerationController:
                         )
                     top_n_results[req_idx] = top_n_per_token
 
+        nvtx_range_pop("top_n_logprobs")
         return top_n_results if top_n_results else None
 
     def dummy_forward(self):

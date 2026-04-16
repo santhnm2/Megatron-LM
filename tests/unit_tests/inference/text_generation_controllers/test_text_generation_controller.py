@@ -1520,19 +1520,27 @@ class TestTextGenerationController:
 
         ctrl = self.text_generation_controller
         ctx = ctrl.inference_wrapped_model.inference_context
-        ctx.total_request_count = active_request_count
-        ctx.paused_request_count = 0
-
-        ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
-            active_request_count, dtype=torch.int32, device='cuda'
-        )
-        ctx.request_query_lengths[:active_request_count] = torch.ones(
-            active_request_count, dtype=torch.int32, device='cuda'
-        )
 
         ctrl._init_mtp_sampling_tensor()
+
+        # Add decode requests with greedy sampling (top_k=1) via the public API.
+        device = torch.cuda.current_device()
+        decode_tokens = torch.zeros(1, dtype=torch.long, device=device)
+        sp = SamplingParams(top_k=1, num_tokens_to_generate=1, termination_id=-1)
+        requests = [
+            DynamicInferenceRequest(request_id=i, prompt_tokens=decode_tokens, sampling_params=sp)
+            for i in range(active_request_count)
+        ]
+        ctx.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        # Override KV offsets to staggered values for a realistic decode scenario.
+        ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
+            active_request_count, dtype=torch.int32, device=device
+        )
+        ctx.build_active_slices(active_request_count)
+        ctrl._sampling.pre_forward_bookkeeping(ctx)
+
         ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
-            torch.arange(active_request_count, device='cuda'), self.vocab_size
+            torch.arange(active_request_count, device=device), self.vocab_size
         )
 
         # Build decoder hidden states cache in proper SP format.
@@ -1543,7 +1551,7 @@ class TestTextGenerationController:
         s_total = active_request_count + pad
 
         torch.manual_seed(42)
-        full_hidden = torch.randn(s_total, 1, self.hidden_size, device='cuda', dtype=torch.float32)
+        full_hidden = torch.randn(s_total, 1, self.hidden_size, device=device, dtype=torch.float32)
         # Broadcast so every rank starts from the same full tensor.
         torch.distributed.broadcast(full_hidden, src=0)
 
@@ -1551,10 +1559,7 @@ class TestTextGenerationController:
         local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
         unwrapped_model._decoder_hidden_states_cache = local_hidden
 
-        ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
-
-        # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device=device)
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()

@@ -1133,6 +1133,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_request_metadata["top_p"][n:padded_n].fill_(0.0)
             if not self.config.materialize_only_last_token_logits:
                 self.active_request_last_token_idxs[n:padded_n].fill_(0)
+            self.active_request_query_lengths[n:padded_n].fill_(
+                self.num_speculative_tokens + 1
+            )
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.

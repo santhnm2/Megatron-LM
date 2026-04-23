@@ -349,6 +349,14 @@ class _CudagraphGlobalRecord:
     tensor_reuse_pool = TensorReusePool()
 
     @classmethod
+    def reset(cls):
+        """Reset all global tracking state. Only necessary for testing."""
+        cls.cudagraph_created = False
+        cls.cudagraph_record = []
+        cls.cudagraph_inference_record = []
+        cls.mtp_cudagraph_managers.clear()
+
+    @classmethod
     def record_fwd_graph(cls, runner, args, kwargs, out):
         """Record a fwd graph to 'cudagraph_record"""
         cls.cudagraph_record.append((runner, "fwd", args, kwargs, out))
@@ -533,9 +541,7 @@ def delete_cuda_graphs():
         mgr.inference_cudagraphs_lookup_table.clear()
 
     # Reset global tracking state
-    _CudagraphGlobalRecord.cudagraph_created = False
-    _CudagraphGlobalRecord.cudagraph_record = []
-    _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.reset()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()

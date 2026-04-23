@@ -140,9 +140,7 @@ class TestPrefixCachingCudaGraphs:
 
     def _reset_cuda_graph_state(self, model):
         """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        _CudagraphGlobalRecord.reset()
         CudaGraphManager.global_mempool = None
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
@@ -360,9 +358,7 @@ class TestHybridChunkedPrefillIntermediateState:
 
     def _reset_cuda_graph_state(self, model):
         """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        _CudagraphGlobalRecord.reset()
         CudaGraphManager.global_mempool = None
         for module in model.modules():
             if isinstance(module, CudaGraphManager):

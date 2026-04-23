@@ -78,8 +78,7 @@ class TestParallelTransformerBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.reset()
         CudaGraphManager.global_mempool = None
 
     @pytest.mark.skipif(
@@ -270,8 +269,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
 
     # Teardown
     Utils.destroy_model_parallel()
-    _CudagraphGlobalRecord.cudagraph_created = False
-    _CudagraphGlobalRecord.cudagraph_record = []
+    _CudagraphGlobalRecord.reset()
     CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
     CudaGraphManager.bwd_mempools = None
@@ -358,8 +356,7 @@ class TestLLaVACudaGraph:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.reset()
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -500,8 +497,7 @@ class TestParallelHybridBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.reset()
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),

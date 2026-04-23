@@ -219,9 +219,7 @@ class TestMambaPrefixCachingE2E:
                 vocab_size=VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        _CudagraphGlobalRecord.reset()
         CudaGraphManager.global_mempool = None
         for module in model.modules():
             if isinstance(module, CudaGraphManager):

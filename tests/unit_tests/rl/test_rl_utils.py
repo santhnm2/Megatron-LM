@@ -883,8 +883,7 @@ class TestRLUtils:
         # Ensure all pending work is complete and graph destruction runs now
         torch.cuda.synchronize()
 
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.reset()
         CudaGraphManager.global_mempool = None
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None

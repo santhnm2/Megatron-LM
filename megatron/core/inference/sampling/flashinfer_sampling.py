@@ -77,6 +77,10 @@ class FlashInferSampling(Sampling):
             top_k = md["top_k"][token_to_request_index]
             top_p = md["top_p"][token_to_request_index]
 
+        # Clamp to avoid division-by-zero when temperature=0 (greedy).
+        # top_k=1 in FlashInfer still selects the argmax after scaling.
+        temperature = temperature.clamp(min=1e-6)
+
         if gather_indices is None:
             scaled = logits[:n] / temperature.unsqueeze(1)
         else:

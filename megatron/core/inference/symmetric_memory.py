@@ -73,7 +73,9 @@ class SymmetricMemoryBuffer:
             self.symm_buffer = None
             self.symm_mem_hdl = None
         else:
-            numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+            world_size = process_group.size()
+            pad_bytes = _SIGNAL_PAD_MAX_BLOCKS * world_size * 4
+            numel = int(size_in_mb * 1024 * 1024) + pad_bytes
             try:
                 symm_mem.enable_symm_mem_for_group(process_group.group_name)
                 self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')

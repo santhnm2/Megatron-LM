@@ -666,6 +666,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
+        _dbg_rank = torch.distributed.get_rank()
+        _dbg_id = id(self) % 10000
+        print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} before dispatch A2A, input_splits={self.input_splits}, output_splits={self.output_splits}, stream={torch.cuda.current_stream()}", flush=True)
         # Make sure the shared experts fc1 is overlapped with dispatch A2A
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
@@ -681,6 +684,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             use_nccl_stream=self.use_nccl_stream,
         )
+        print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} after dispatch tokens A2A", flush=True)
         # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
         # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
         # Forward launch order: tokens A2A -> shared experts fc1 -> probs A2A
@@ -694,6 +698,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             use_nccl_stream=self.use_nccl_stream,
         )
+        print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} after dispatch probs A2A", flush=True)
 
         return global_input_tokens, global_probs
 
@@ -710,7 +715,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of processed tokens, token counts per expert, and processed probabilities.
         """
+        _dbg_rank = torch.distributed.get_rank()
+        _dbg_id = id(self) % 10000
         if self.tp_size > 1:
+            print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} before TP allgather in dispatch_postprocess", flush=True)
             if self.output_splits_tp is None:
                 output_split_sizes = None
             else:
@@ -721,6 +729,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             global_probs = gather_from_sequence_parallel_region(
                 global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
             )
+            print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} after TP allgather in dispatch_postprocess", flush=True)
 
         # Permutation 2: Sort tokens by local expert.
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -793,7 +802,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     fused=self.config.moe_permute_fusion,
                 )
 
+        _dbg_rank = torch.distributed.get_rank()
+        _dbg_id = id(self) % 10000
         if self.tp_size > 1:
+            print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} before TP reduce_scatter in combine_preprocess", flush=True)
             if self.output_splits_tp is None:
                 input_split_sizes = None
             else:
@@ -803,6 +815,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
             ).to(hidden_states.dtype)
+            print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} after TP reduce_scatter in combine_preprocess", flush=True)
 
         return hidden_states
 
@@ -827,12 +840,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             Tokens after the All-to-All communication for combining.
         """
+        _dbg_rank = torch.distributed.get_rank()
+        _dbg_id = id(self) % 10000
         # Make sure the shared experts fc2 is not overlapped with routed experts fc1
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
+        print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} before combine A2A, input_splits={self.input_splits}, output_splits={self.output_splits}", flush=True)
         permutated_local_input_tokens = all_to_all(
             self.ep_group,
             hidden_states,
@@ -840,6 +856,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             use_nccl_stream=self.use_nccl_stream,
         )
+        print(f"[RANK {_dbg_rank}] dispatcher={_dbg_id} after combine A2A", flush=True)
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
             self.shared_experts.post_forward_comm()

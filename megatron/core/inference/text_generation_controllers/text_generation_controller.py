@@ -1716,6 +1716,11 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        if not hasattr(self, '_dbg_step'):
+            self._dbg_step = 0
+        self._dbg_step += 1
+        _dbg_rank = torch.distributed.get_rank()
+
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
 
@@ -1733,7 +1738,9 @@ class TextGenerationController:
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             range_push("forward_pass")
+            print(f"[RANK {_dbg_rank}] step={self._dbg_step} before forward, stream={torch.cuda.current_stream()}", flush=True)
             self._dynamic_step_forward_logits(input_ids, position_ids)
+            print(f"[RANK {_dbg_rank}] step={self._dbg_step} after forward", flush=True)
 
             # Commit Mamba intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
@@ -1786,7 +1793,9 @@ class TextGenerationController:
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
+                print(f"[RANK {_dbg_rank}] step={self._dbg_step} before sampling", flush=True)
                 self._dynamic_step_sample_logits()
+                print(f"[RANK {_dbg_rank}] step={self._dbg_step} after sampling", flush=True)
 
             log_probs = None
             top_n_logprobs = None

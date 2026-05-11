@@ -180,6 +180,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             return hidden_states, probs
 
+        _dbg_rank = dist.get_rank()
+        _dbg_id = id(self) % 10000
+        _dbg_agv = self.__class__._use_allgather_v
+        print(f"[RANK {_dbg_rank}] infer_dispatcher={_dbg_id} token_dispatch: use_allgather_v={_dbg_agv}, local_tokens={hidden_states.shape[0]}", flush=True)
+
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
 
@@ -253,6 +258,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
+
+        _dbg_rank = dist.get_rank()
+        _dbg_id = id(self) % 10000
+        _dbg_agv = self.__class__._use_allgather_v
+        print(f"[RANK {_dbg_rank}] infer_dispatcher={_dbg_id} token_combine: use_allgather_v={_dbg_agv}, tokens={hidden_states.shape[0]}", flush=True)
 
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard reduce-scatter.

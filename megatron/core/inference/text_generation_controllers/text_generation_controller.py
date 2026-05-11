@@ -1738,7 +1738,9 @@ class TextGenerationController:
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             range_push("forward_pass")
-            print(f"[RANK {_dbg_rank}] step={self._dbg_step} before forward, stream={torch.cuda.current_stream()}", flush=True)
+            _dbg_cg = context.using_cuda_graph_this_step()
+            _dbg_arc2 = context.total_request_count - context.paused_request_count
+            print(f"[RANK {_dbg_rank}] step={self._dbg_step} before forward, active_reqs={_dbg_arc2}, cuda_graph={_dbg_cg}, padded={context.padded_active_request_count}, stream={torch.cuda.current_stream()}", flush=True)
             self._dynamic_step_forward_logits(input_ids, position_ids)
             print(f"[RANK {_dbg_rank}] step={self._dbg_step} after forward", flush=True)
 
@@ -1795,7 +1797,8 @@ class TextGenerationController:
             else:
                 print(f"[RANK {_dbg_rank}] step={self._dbg_step} before sampling", flush=True)
                 self._dynamic_step_sample_logits()
-                print(f"[RANK {_dbg_rank}] step={self._dbg_step} after sampling", flush=True)
+                _dbg_arc = context.total_request_count - context.paused_request_count
+                print(f"[RANK {_dbg_rank}] step={self._dbg_step} after sampling, tokens={self._sampled_tokens_cuda[:_dbg_arc].tolist()}, active_reqs={_dbg_arc}", flush=True)
 
             log_probs = None
             top_n_logprobs = None

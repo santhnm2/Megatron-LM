@@ -441,6 +441,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         valid_tokens are ignored by the GEMM; the AGV below overwrites
         [0, valid_tokens) in-place.
         """
+        _dbg_rank = dist.get_rank()
+        print(f"[RANK {_dbg_rank}] NVLS update_metadata: before fused_metadata_update, local_tokens={local_tokens}", flush=True)
         cls = NVLSAllGatherVDispatcher
         fused_metadata_update(
             local_tokens=local_tokens,
@@ -448,6 +450,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
+        print(f"[RANK {_dbg_rank}] NVLS update_metadata: after fused_metadata_update, step_metadata={cls._step_metadata.tolist()}", flush=True)
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
@@ -521,8 +524,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             return hidden_states, probs
 
+        _dbg_rank = dist.get_rank()
+        _dbg_id = id(self) % 10000
+        print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} before update_metadata, local_tokens={hidden_states.shape[0]}", flush=True)
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
+        print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} after update_metadata, step_metadata={self.__class__._step_metadata.tolist()}", flush=True)
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing
@@ -536,6 +543,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Cap AGV CTAs when overlapping the shared expert so the AGV does not
         # starve the shared-expert GEMMs running on the side stream.
         agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
+        print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} before multimem_all_gatherv_3tensor, per_rank_max={per_rank_max}, global_max={global_max}, stream={torch.cuda.current_stream()}", flush=True)
         multimem_all_gatherv_3tensor(
             agv_h["tensor"],
             agv_r["tensor"],
@@ -551,6 +559,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             per_rank_max_tokens=per_rank_max,
             **agv_kwargs,
         )
+        print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} after multimem_all_gatherv_3tensor", flush=True)
 
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
@@ -582,9 +591,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
+        _dbg_rank = dist.get_rank()
+        _dbg_id = id(self) % 10000
         rsv = self.__class__._symm_rsv
 
-        if hidden_states is not rsv["tensor"]:
+        is_rsv_direct = hidden_states is rsv["tensor"]
+        print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} before RSV, local_tokens={self._local_tokens}, is_rsv_direct={is_rsv_direct}, stream={torch.cuda.current_stream()}", flush=True)
+        if not is_rsv_direct:
             rsv["tensor"].copy_(hidden_states)
         output = torch.empty(
             self._local_tokens,
@@ -592,6 +605,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
+        print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} before multimem_reduce_scatter_v", flush=True)
         multimem_reduce_scatter_v(
             output,
             rsv["tensor"],
@@ -600,6 +614,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
         )
+        print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} after multimem_reduce_scatter_v", flush=True)
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):

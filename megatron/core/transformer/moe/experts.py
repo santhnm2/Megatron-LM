@@ -650,11 +650,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         import torch.distributed as _dist
+        _capturing = torch.cuda.is_current_stream_capturing()
         _dbg_rank = _dist.get_rank() if _dist.is_initialized() else -1
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         _vt = InferenceAllGatherDispatcherBase._valid_tokens()
         _vt_hint = InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate()
-        print(f"[RANK {_dbg_rank}] experts._vllm_forward: hs={hidden_states.shape}, probs={probs.shape}, valid_tokens_hint={_vt_hint}, local_expert_start={local_expert_start}, stream={torch.cuda.current_stream()}", flush=True)
+        if not _capturing:
+            print(f"[RANK {_dbg_rank}] experts._vllm_forward: hs={hidden_states.shape}, probs={probs.shape}, valid_tokens_hint={_vt_hint}, local_expert_start={local_expert_start}, stream={torch.cuda.current_stream()}", flush=True)
         output = vllm_fused_moe(
             hidden_states,
             probs,
@@ -668,7 +670,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=_vt_hint,
         )
-        print(f"[RANK {_dbg_rank}] experts._vllm_forward: done, out={output.shape}", flush=True)
+        if not _capturing:
+            print(f"[RANK {_dbg_rank}] experts._vllm_forward: done, out={output.shape}", flush=True)
         return output, None
 
     def forward(

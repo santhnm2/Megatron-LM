@@ -532,31 +532,35 @@ class MoELayer(BaseMoELayer):
         import torch.distributed as _dist
         _moe_rank = _dist.get_rank() if _dist.is_initialized() else -1
         _moe_layer_id = id(self) % 10000
+        _capturing = torch.cuda.is_current_stream_capturing()
+        def _dbg(msg):
+            if not _capturing:
+                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} {msg}", flush=True)
 
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
-        print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before dispatch_postprocess", flush=True)
+        _dbg("before dispatch_postprocess")
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after dispatch_postprocess, dispatched={dispatched_input.shape}", flush=True)
+        _dbg(f"after dispatch_postprocess, dispatched={dispatched_input.shape}")
         if hasattr(self, "_inference_token_dispatcher") and not self.training:
             routing_map = self.token_dispatcher.routing_map
-            print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before experts.forward (inference), routing_map={routing_map.shape}", flush=True)
+            _dbg(f"before experts.forward (inference), routing_map={routing_map.shape}")
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
-            print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after experts.forward (inference)", flush=True)
+            _dbg("after experts.forward (inference)")
         else:
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before combine_preprocess", flush=True)
+        _dbg("before combine_preprocess")
         output = self.token_dispatcher.combine_preprocess(expert_output)
-        print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after combine_preprocess", flush=True)
+        _dbg("after combine_preprocess")
 
         return output, mlp_bias
 
@@ -637,17 +641,21 @@ class MoELayer(BaseMoELayer):
             import torch.distributed as _dist
             _moe_rank = _dist.get_rank() if _dist.is_initialized() else -1
             _moe_layer_id = id(self) % 10000
+            _capturing = torch.cuda.is_current_stream_capturing()
+            def _dbg(msg):
+                if not _capturing:
+                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} {msg}", flush=True)
             try:
                 if "route" in self.fwd_execution_map:
-                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before shared_experts_compute, hs={hidden_states.shape}", flush=True)
+                    _dbg(f"before shared_experts_compute, hs={hidden_states.shape}")
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after shared_experts_compute", flush=True)
-                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before route", flush=True)
+                    _dbg("after shared_experts_compute")
+                    _dbg("before route")
                     probs, routing_map = self.route(hidden_states, padding_mask)
-                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after route, probs={probs.shape}, routing_map={routing_map.shape}", flush=True)
-                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before preprocess", flush=True)
+                    _dbg(f"after route, probs={probs.shape}, routing_map={routing_map.shape}")
+                    _dbg("before preprocess")
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
-                    print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after preprocess, hs={hidden_states.shape}", flush=True)
+                    _dbg(f"after preprocess, hs={hidden_states.shape}")
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -664,18 +672,18 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before dispatch, hs={hidden_states.shape}", flush=True)
+                _dbg(f"before dispatch, hs={hidden_states.shape}")
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after dispatch, dispatched={dispatched_input.shape}", flush=True)
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before routed_experts_compute", flush=True)
+                _dbg(f"after dispatch, dispatched={dispatched_input.shape}")
+                _dbg("before routed_experts_compute")
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after routed_experts_compute, out={output.shape}", flush=True)
+                _dbg(f"after routed_experts_compute, out={output.shape}")
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before combine", flush=True)
+                _dbg("before combine")
                 output = self.combine(output)
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after combine, out={output.shape}", flush=True)
+                _dbg(f"after combine, out={output.shape}")
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -684,9 +692,9 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} before postprocess", flush=True)
+                _dbg("before postprocess")
                 output = self.postprocess(output, shared_expert_output)
-                print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} after postprocess", flush=True)
+                _dbg("after postprocess")
 
                 if intermediate_tensors is not None:
                     return output

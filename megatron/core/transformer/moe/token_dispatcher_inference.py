@@ -444,6 +444,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         _capturing = torch.cuda.is_current_stream_capturing()
         _dbg_rank = dist.get_rank()
         if not _capturing:
+            torch.cuda.synchronize()
             print(f"[RANK {_dbg_rank}] NVLS update_metadata: before fused_metadata_update, local_tokens={local_tokens}", flush=True)
         cls = NVLSAllGatherVDispatcher
         fused_metadata_update(
@@ -453,6 +454,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             step_metadata=cls._step_metadata,
         )
         if not _capturing:
+            torch.cuda.synchronize()
             print(f"[RANK {_dbg_rank}] NVLS update_metadata: after fused_metadata_update, step_metadata={cls._step_metadata.tolist()}", flush=True)
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -531,11 +533,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         _dbg_rank = dist.get_rank()
         _dbg_id = id(self) % 10000
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} before update_metadata, local_tokens={hidden_states.shape[0]}", flush=True)
+            torch.cuda.synchronize()
+            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} token_dispatch entry, local_tokens={hidden_states.shape[0]}, runs_metadata_sync={self._runs_metadata_sync}", flush=True)
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} after update_metadata, step_metadata={self.__class__._step_metadata.tolist()}", flush=True)
+            torch.cuda.synchronize()
+            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} after update_metadata", flush=True)
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing
@@ -550,7 +554,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # starve the shared-expert GEMMs running on the side stream.
         agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} before multimem_all_gatherv_3tensor, per_rank_max={per_rank_max}, global_max={global_max}, stream={torch.cuda.current_stream()}", flush=True)
+            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} before AGV, per_rank_max={per_rank_max}, global_max={global_max}", flush=True)
         multimem_all_gatherv_3tensor(
             agv_h["tensor"],
             agv_r["tensor"],
@@ -567,7 +571,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             **agv_kwargs,
         )
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} after multimem_all_gatherv_3tensor", flush=True)
+            torch.cuda.synchronize()
+            print(f"[RANK {_dbg_rank}] NVLS_dispatch={_dbg_id} after AGV", flush=True)
 
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
@@ -606,7 +611,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         is_rsv_direct = hidden_states is rsv["tensor"]
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} before RSV, local_tokens={self._local_tokens}, is_rsv_direct={is_rsv_direct}, stream={torch.cuda.current_stream()}", flush=True)
+            torch.cuda.synchronize()
+            print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} before RSV, local_tokens={self._local_tokens}, is_rsv_direct={is_rsv_direct}", flush=True)
         if not is_rsv_direct:
             rsv["tensor"].copy_(hidden_states)
         output = torch.empty(
@@ -615,8 +621,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} before multimem_reduce_scatter_v", flush=True)
         multimem_reduce_scatter_v(
             output,
             rsv["tensor"],
@@ -626,7 +630,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
         )
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} after multimem_reduce_scatter_v", flush=True)
+            torch.cuda.synchronize()
+            print(f"[RANK {_dbg_rank}] NVLS_combine={_dbg_id} after RSV", flush=True)
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):

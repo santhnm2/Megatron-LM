@@ -535,20 +535,19 @@ class MoELayer(BaseMoELayer):
         _capturing = torch.cuda.is_current_stream_capturing()
         def _dbg(msg):
             if not _capturing:
+                torch.cuda.synchronize()
                 print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} {msg}", flush=True)
 
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
-        _dbg("before dispatch_postprocess")
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         _dbg(f"after dispatch_postprocess, dispatched={dispatched_input.shape}")
         if hasattr(self, "_inference_token_dispatcher") and not self.training:
             routing_map = self.token_dispatcher.routing_map
-            _dbg(f"before experts.forward (inference), routing_map={routing_map.shape}")
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
@@ -558,7 +557,6 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        _dbg("before combine_preprocess")
         output = self.token_dispatcher.combine_preprocess(expert_output)
         _dbg("after combine_preprocess")
 
@@ -644,16 +642,15 @@ class MoELayer(BaseMoELayer):
             _capturing = torch.cuda.is_current_stream_capturing()
             def _dbg(msg):
                 if not _capturing:
+                    torch.cuda.synchronize()
                     print(f"[RANK {_moe_rank}] MoE={_moe_layer_id} {msg}", flush=True)
             try:
                 if "route" in self.fwd_execution_map:
                     _dbg(f"before shared_experts_compute, hs={hidden_states.shape}")
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     _dbg("after shared_experts_compute")
-                    _dbg("before route")
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     _dbg(f"after route, probs={probs.shape}, routing_map={routing_map.shape}")
-                    _dbg("before preprocess")
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
                     _dbg(f"after preprocess, hs={hidden_states.shape}")
 
@@ -661,11 +658,6 @@ class MoELayer(BaseMoELayer):
                         return hidden_states, probs, shared_expert_output
 
             except MoECudaGraphPartialCaptureSignal as e:
-                # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
-                # It means we should early-return from the MoE layer forward pass.
-                # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
-                # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:
@@ -675,13 +667,11 @@ class MoELayer(BaseMoELayer):
                 _dbg(f"before dispatch, hs={hidden_states.shape}")
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
                 _dbg(f"after dispatch, dispatched={dispatched_input.shape}")
-                _dbg("before routed_experts_compute")
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 _dbg(f"after routed_experts_compute, out={output.shape}")
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                _dbg("before combine")
                 output = self.combine(output)
                 _dbg(f"after combine, out={output.shape}")
 
@@ -692,7 +682,6 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                _dbg("before postprocess")
                 output = self.postprocess(output, shared_expert_output)
                 _dbg("after postprocess")
 

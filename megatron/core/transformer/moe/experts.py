@@ -656,7 +656,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         _vt = InferenceAllGatherDispatcherBase._valid_tokens()
         _vt_hint = InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate()
         if not _capturing:
-            print(f"[RANK {_dbg_rank}] experts._vllm_forward: hs={hidden_states.shape}, probs={probs.shape}, valid_tokens_hint={_vt_hint}, local_expert_start={local_expert_start}, stream={torch.cuda.current_stream()}", flush=True)
+            print(f"[RANK {_dbg_rank}] experts._vllm_forward: hs={hidden_states.shape}, valid_tokens_hint={_vt_hint}, local_expert_start={local_expert_start}", flush=True)
         output = vllm_fused_moe(
             hidden_states,
             probs,
@@ -671,6 +671,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             num_tokens_hint=_vt_hint,
         )
         if not _capturing:
+            torch.cuda.synchronize()
             print(f"[RANK {_dbg_rank}] experts._vllm_forward: done, out={output.shape}", flush=True)
         return output, None
 

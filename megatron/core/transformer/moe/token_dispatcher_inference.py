@@ -150,15 +150,19 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         ep_size = self.ep_size
         device = torch.cuda.current_device()
 
+        _dbg_rank = dist.get_rank()
         if cls._use_allgather_v:
+            print(f"[RANK {_dbg_rank}] update_metadata: BEFORE all_gather_into_tensor on ep_group (use_allgather_v=True, local_tokens={local_tokens})", flush=True)
             local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
+            print(f"[RANK {_dbg_rank}] update_metadata: AFTER all_gather_into_tensor on ep_group", flush=True)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
             total = local_tokens_per_rank.sum()
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(total)
             InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = int(total.item())
         else:
+            print(f"[RANK {_dbg_rank}] update_metadata: fill_ path, no collective (use_allgather_v=False, local_tokens={local_tokens})", flush=True)
             total = ep_size * local_tokens
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total)
             InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = total

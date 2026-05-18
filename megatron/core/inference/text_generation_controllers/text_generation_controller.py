@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel, toggle_cuda_graphs
@@ -1913,7 +1914,7 @@ class TextGenerationController:
             not self._async_scheduling_enabled
             or not context.config.enable_async_decode_graphs
             or not self._enable_cuda_graph
-            or CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope
+            or self.model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
         ):
             return
 
@@ -2196,7 +2197,7 @@ class TextGenerationController:
             return self._async_step_barrier_reason
         if not self._enable_cuda_graph:
             return "requires local cuda graphs"
-        if CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope:
+        if self.model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
             return "requires full-iteration inference cuda graphs"
         if self.model_is_pipeline_parallel:
             return "pipeline parallel is unsupported"

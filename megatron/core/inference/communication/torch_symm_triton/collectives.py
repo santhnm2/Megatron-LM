@@ -53,11 +53,11 @@ def _ag_phase(
         # RANK * numel_per_rank -> start of our rank's segment
         # * 2 -> each 128-bit pack is 2 uint64s
         multicast_ptrs = (
-            multicast_ptr.to(tl.pointer_type(tl.uint64))
+            tl.cast(multicast_ptr, tl.int64).to(tl.pointer_type(tl.uint64))
             + byte_offset // 8
             + (RANK * numel_per_rank + offsets) * 2
         )
-        local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
+        local_ptrs = tl.cast(local_ptr, tl.int64).to(tl.pointer_type(tl.uint64)) + offsets * 2
         (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
         st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
 
@@ -195,9 +195,10 @@ def _multimem_reduce_scatter_kernel(
 
         # Each pointer points to a 128-bit bit pack
         multicast_ptrs = (
-            multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
+            tl.cast(multicast_ptr, tl.int64).to(tl.pointer_type(tl.uint64))
+            + (RANK * numel_per_rank + offsets) * 2
         )
-        local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
+        local_ptrs = tl.cast(local_ptr, tl.int64).to(tl.pointer_type(tl.uint64)) + offsets * 2
         (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
         st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 

@@ -2009,11 +2009,17 @@ class TextGenerationController:
         self._wait_for_dummy_context_h2d()
         context.reset()
         range_push("ep_dummy_async_handoff")
+        # Notify the context that this init belongs to an EP async handoff so the
+        # NVLS eager-consensus all-reduce is skipped (the real rank does not call
+        # initialize_attention_state during its handoff; an extra collective here
+        # would desync the EP async protocol).
+        context.ep_async_handoff_this_step = True
         try:
             input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
             self._dynamic_step_forward_logits(input_ids, position_ids)
             self._async_forward_launch_count += 1
         finally:
+            context.ep_async_handoff_this_step = False
             range_pop()
         return True
 
@@ -3226,29 +3232,40 @@ class TextGenerationController:
                     async_sample_ready_event,
                 ) = self._async_transfer_samples_to_cpu(active_request_count)
                 if self._confirm_prepared_ep_async_handoff():
-                    context.publish_async_prepared_decode_plan()
-                    range_push("async_transfer_bookkeeping_to_gpu")
-                    async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
-                        include_token_to_input_ids=False,
-                        refresh_request_staging=False,
-                        record_done_event=True,
-                    )
-                    range_pop()
-                    range_push("async_forward_launch")
-                    next_input_ids, next_position_ids = context.current_input_and_position_ids()
-                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
-                    self._async_forward_launch_count += 1
-                    self._async_pending_forward = True
-                    self._async_pending_cuda_graph_request_count = (
-                        context.padded_active_request_count
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    )
-                    self._record_async_pending_forward_requests(
-                        self._async_pending_cuda_graph_request_count
-                    )
-                    context.mark_async_forward_in_flight()
-                    range_pop()
+                    # Mark this step as an EP async handoff, mirroring the dummy
+                    # rank. The real handoff launches the forward from prepared
+                    # metadata without calling initialize_attention_state, so this
+                    # is a no-op for the NVLS eager-consensus, but keeps the context
+                    # state symmetric across real and dummy ranks.
+                    context.ep_async_handoff_this_step = True
+                    try:
+                        context.publish_async_prepared_decode_plan()
+                        range_push("async_transfer_bookkeeping_to_gpu")
+                        async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
+                            include_token_to_input_ids=False,
+                            refresh_request_staging=False,
+                            record_done_event=True,
+                        )
+                        range_pop()
+                        range_push("async_forward_launch")
+                        next_input_ids, next_position_ids = (
+                            context.current_input_and_position_ids()
+                        )
+                        self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                        self._async_forward_launch_count += 1
+                        self._async_pending_forward = True
+                        self._async_pending_cuda_graph_request_count = (
+                            context.padded_active_request_count
+                            if context.using_cuda_graph_this_step()
+                            else None
+                        )
+                        self._record_async_pending_forward_requests(
+                            self._async_pending_cuda_graph_request_count
+                        )
+                        context.mark_async_forward_in_flight()
+                        range_pop()
+                    finally:
+                        context.ep_async_handoff_this_step = False
 
             if deferred_mtp_blocks_to_release is not None:
                 range_push("mtp_deferred_release_memory_blocks")

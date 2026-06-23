@@ -362,6 +362,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # rest of the EP async step phases.
         self._ep_async_protocol = None
 
+        # True while initialize_attention_state runs for an EP async handoff (the
+        # controller sets it around the dummy async-handoff forward). On that path
+        # the NVLS eager-consensus all-reduce must be skipped: the real rank does
+        # not call initialize_attention_state during its async handoff, so issuing
+        # the collective here would desync the EP async protocol.
+        self.ep_async_handoff_this_step = False
+
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -2567,11 +2574,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         # is only correct when EP ranks are balanced. If any rank is eager (e.g. a
         # prefill rank while peers decode), force ALL ranks eager so the dispatcher
         # host-syncs the real cross-rank token count (see NVLS update_metadata).
-        # Single-int EP all-reduce-max of the local eager decision. This is the
-        # main-path match only; the EP async handoff guarantees all ranks run this
-        # in lockstep (the async-prepare match never coincides with a prefill peer).
+        # Single-int EP all-reduce-max of the local eager decision.
+        #
+        # Skip it when async scheduling has taken over this step
+        # (self.ep_async_handoff_this_step). On the dummy async-handoff path the
+        # real rank prepares its next step WITHOUT calling initialize_attention_state,
+        # so a consensus here would be an unmatched collective and desync the EP
+        # async protocol (expected ep_graph_shape, got ep_step_begin). Async
+        # scheduling only engages for balanced all-decode steps, where the estimate
+        # is already correct, so skipping the consensus there is semantically safe.
         if (
-            self._nvls_dispatcher
+            not self.ep_async_handoff_this_step
+            and self._nvls_dispatcher
             and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
             and self._ep_consensus_any_rank_eager(best_graph is None)
         ):

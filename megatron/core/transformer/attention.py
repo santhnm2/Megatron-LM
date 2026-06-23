@@ -88,8 +88,6 @@ try:
 except ImportError:
     HAVE_FA4 = False
 
-HAVE_FA4=False
-
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
@@ -958,47 +956,24 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                 )
             else:
-                if HAVE_FA4:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
-                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
-                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
-                    output_total, _ = flash_attn4_varlen_func(
-                        q_varlen,
-                        k,
-                        v,
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=tokens_per_request,
-                        max_seqlen_k=max_seqlen_k,
-                        seqused_k=seqlens_k,
-                        page_table=block_table,
-                        softmax_scale=softmax_scale,
-                        causal=True,
-                        num_splits=1,
-                    )
-                    # Reshape back to (B, S, H, D)
-                    output_total = output_total.reshape(
-                        num_requests, tokens_per_request, *output_total.shape[1:]
-                    )
+                # FA4 is intentionally not used for decode (regresses long decodes);
+                # prefill still uses FA4 above. Decode falls through to FA3/FA2 kvcache.
+                flash_attn_args = {
+                    "q": q,
+                    "k_cache": k,
+                    "v_cache": v,
+                    "cache_seqlens": seqlens_k,
+                    "causal": True,
+                    "page_table" if HAVE_FA3 else "block_table": block_table,
+                    "num_splits": 0 if not self.batch_invariant_mode else 1,
+                }
+                if HAVE_FA3:
+                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
-                    flash_attn_args = {
-                        "q": q,
-                        "k_cache": k,
-                        "v_cache": v,
-                        "cache_seqlens": seqlens_k,
-                        "causal": True,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
-                        "num_splits": 0 if not self.batch_invariant_mode else 1,
-                    }
-                    if HAVE_FA3:
-                        output_total = flash_attn3_with_kvcache(**flash_attn_args)
-                    else:
-                        assert (
-                            not self.batch_invariant_mode
-                        ), "Batch invariant mode is not supported for flash attention 2"
-                        output_total = flash_attn_with_kvcache(**flash_attn_args)
+                    assert (
+                        not self.batch_invariant_mode
+                    ), "Batch invariant mode is not supported for flash attention 2"
+                    output_total = flash_attn_with_kvcache(**flash_attn_args)
 
             # Reshape back to (B*S, 1, H, D) for consistent output shape.
             output_total = output_total.reshape(

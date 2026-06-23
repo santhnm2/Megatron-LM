@@ -24,7 +24,9 @@ from megatron.core.inference.config import (
     KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
 )
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -2275,6 +2277,30 @@ class DynamicInferenceContext(BaseInferenceContext):
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
         )
 
+    def _ep_consensus_any_rank_eager(self, local_is_eager: bool) -> bool:
+        """All-reduce-MAX the local eager decision across the EP group (single int).
+
+        Returns True if ANY EP rank chose eager (no matching CUDA graph). Used by the
+        NVLS path so a prefill rank forces all decode peers eager too. Reuses the EP
+        async protocol's GRAPH_SHAPE phase (unused on the NVLS path otherwise); falls
+        back to a NCCL all-reduce when the protocol is unavailable.
+        """
+        if get_pg_size(self.expert_model_parallel_group) <= 1:
+            return local_is_eager
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return bool(
+                self._ep_async_protocol.sync_all_reduce_max(
+                    EPAsyncPhase.GRAPH_SHAPE, int(local_is_eager)
+                )
+            )
+        sync = torch.tensor(
+            [int(local_is_eager)], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(
+            sync, op=torch.distributed.ReduceOp.MAX, group=self.expert_model_parallel_group
+        )
+        return bool(sync.item())
+
     def _fallback_padded_batch_dimensions(
         self, batch_dimensions: InferenceBatchDimensions
     ) -> InferenceBatchDimensions:
@@ -2481,6 +2507,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher._use_allgather_v = not self.using_cuda_graph_this_step()
 
+        if self._nvls_dispatcher:
+            # Eager steps may host-sync the real cross-rank token total for the
+            # grouped-GEMM estimate; CUDA-graph steps use the capture-safe heuristic.
+            # Change 1 (EP eager consensus) guarantees this is consistent across ranks.
+            NVLSAllGatherVDispatcher._use_real_token_count = not self.using_cuda_graph_this_step()
+
     def initialize_attention_state(
         self,
         *,
@@ -2531,6 +2563,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = self._match_cuda_graph_batch_dimensions(
             batch_dimensions, strict=self.is_hybrid_model
         )
+        # NVLS + vLLM grouped-GEMM: the valid-token estimate (local_tokens*ep_size)
+        # is only correct when EP ranks are balanced. If any rank is eager (e.g. a
+        # prefill rank while peers decode), force ALL ranks eager so the dispatcher
+        # host-syncs the real cross-rank token count (see NVLS update_metadata).
+        # Single-int EP all-reduce-max of the local eager decision. This is the
+        # main-path match only; the EP async handoff guarantees all ranks run this
+        # in lockstep (the async-prepare match never coincides with a prefill peer).
+        if (
+            self._nvls_dispatcher
+            and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+            and self._ep_consensus_any_rank_eager(best_graph is None)
+        ):
+            best_graph = None
         self._configure_step_batch_dimensions(
             batch_dimensions, best_graph, allow_eager_fallback=True
         )

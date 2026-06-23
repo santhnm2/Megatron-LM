@@ -302,6 +302,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _step_metadata: Optional[torch.Tensor] = None  # [3] int32
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
+    # Per-step flag set by the context. True on eager (non-CUDA-graph) steps, where
+    # update_metadata may host-sync the REAL cross-rank valid-token total for the
+    # grouped-GEMM estimate. False on CUDA-graph steps, where we must use the
+    # capture-safe local_tokens*ep_size heuristic (no device->host sync allowed).
+    _use_real_token_count: bool = False
+
     # [1] int32 view onto context.gpu_view.real_token_count. Fixed GPU address;
     # written each step by the context's transfer_bookkeeping_to_gpu(). Holds the
     # real (unpadded) local token count so the dispatcher can mask routing for
@@ -452,7 +458,20 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+        if cls._use_real_token_count:
+            # Eager step: use the real cross-rank total (step_metadata[0] holds
+            # valid_tokens). Host sync is safe — eager steps are not captured. This
+            # fixes the lopsided EP case (e.g. one prefill rank + decode peers) where
+            # local_tokens*ep_size badly under-estimates the gathered token count.
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = int(
+                cls._step_metadata[0:1].item()
+            )
+        else:
+            # CUDA-graph step: ranks are balanced by construction; use the
+            # capture-safe heuristic (no device->host sync inside a graph).
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = (
+                local_tokens * self.ep_size
+            )
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
 

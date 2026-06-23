@@ -5,6 +5,7 @@ import concurrent.futures
 import logging
 import math
 import multiprocessing
+import os
 import socket
 import time
 import warnings
@@ -64,6 +65,8 @@ from megatron.core.utils import (
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
+
+_TIMING = os.environ.get("MCORE_INFERENCE_TIMING", "0") == "1"
 
 try:
     from tqdm import tqdm
@@ -1097,6 +1100,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        _t_tok = time.time()
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -1121,8 +1125,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
+        if _TIMING:
+            print(
+                f"[TIMING ENGINE] tokenize {(time.time()-_t_tok)*1e3:.2f}ms "
+                f"n_prompt={len(tokens)}",
+                flush=True,
+            )
 
         # Initialize request.
+        _t0 = time.time()
         request = DynamicInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
@@ -1131,9 +1142,18 @@ class DynamicInferenceEngine(AbstractEngine):
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
         )
+        if _TIMING:
+            print(f"[TIMING ENGINE] build_request {(time.time()-_t0)*1e3:.2f}ms", flush=True)
 
         # Add request.
-        return self._add_request(request)
+        _t0 = time.time()
+        future = self._add_request(request)
+        if _TIMING:
+            print(
+                f"[TIMING ENGINE] submit {(time.time()-_t0)*1e3:.2f}ms req_id={request_id}",
+                flush=True,
+            )
+        return future
 
     def post_process_requests(
         self,

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -13,6 +14,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
+
+_TIMING = os.environ.get("MCORE_INFERENCE_TIMING", "0") == "1"
 
 # pylint: disable=line-too-long
 
@@ -421,7 +424,10 @@ try:
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
 
+        _t0 = time.time()
         req = await request.get_json()
+        if _TIMING:
+            print(f"[TIMING FE] json_parse {(time.time()-_t0)*1e3:.2f}ms", flush=True)
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
@@ -438,14 +444,18 @@ try:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
+        _t0 = time.time()
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
+        if _TIMING:
+            print(f"[TIMING FE] sanitize {(time.time()-_t0)*1e3:.2f}ms", flush=True)
 
         try:
             if (
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
+                _t0 = time.time()
                 prompt_tokens = _coerce_to_token_id_list(
                     tokenizer.apply_chat_template(
                         template_messages,
@@ -455,6 +465,11 @@ try:
                         **chat_template_kwargs,
                     )
                 )
+                if _TIMING:
+                    print(
+                        f"[TIMING FE] apply_chat_template {(time.time()-_t0)*1e3:.2f}ms",
+                        flush=True,
+                    )
 
                 if req.get("prevent_retokenization", True):
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
@@ -494,6 +509,7 @@ try:
                         ]
 
                         # Get the templated tokenization of just the previous generation
+                        _t0 = time.time()
                         retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
                             tokenizer.apply_chat_template(
                                 messages_to_last_assistant_message,
@@ -503,6 +519,11 @@ try:
                                 **chat_template_kwargs,
                             )
                         )
+                        if _TIMING:
+                            print(
+                                f"[TIMING FE] retok_template {(time.time()-_t0)*1e3:.2f}ms",
+                                flush=True,
+                            )
 
                         # Replace the prefix tokens with the tokens from the previous generation.
                         # If prior token IDs are unavailable, fall back to normal retokenized prompt
@@ -591,7 +612,10 @@ try:
             start_time = time.perf_counter()
 
         try:
+            _t0 = time.time()
             batch_results = await asyncio.gather(*tasks)
+            if _TIMING:
+                print(f"[TIMING FE] engine {(time.time()-_t0)*1e3:.2f}ms", flush=True)
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
@@ -637,6 +661,7 @@ try:
             return Response(f"Inference request(s) failed: {error_detail}", status=status)
 
         # --- 5. Format OpenAI Response ---
+        _t_format = time.time()
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
@@ -782,11 +807,30 @@ try:
             },
         }
 
+        if _TIMING:
+            print(f"[TIMING FE] format {(time.time()-_t_format)*1e3:.2f}ms", flush=True)
+
         if HAVE_ORJSON:
             # Use orjson for faster serialization
-            return Response(orjson.dumps(response), mimetype="application/json")
+            _t0 = time.time()
+            body = orjson.dumps(response)
+            if _TIMING:
+                print(
+                    f"[TIMING FE] serialize {(time.time()-_t0)*1e3:.2f}ms "
+                    f"prompt_tokens={prompt_token_count} resp_kb={len(body)/1024:.1f}",
+                    flush=True,
+                )
+            return Response(body, mimetype="application/json")
         else:
-            return jsonify(response)
+            _t0 = time.time()
+            resp = jsonify(response)
+            if _TIMING:
+                print(
+                    f"[TIMING FE] serialize {(time.time()-_t0)*1e3:.2f}ms "
+                    f"prompt_tokens={prompt_token_count}",
+                    flush=True,
+                )
+            return resp
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")

@@ -3,6 +3,8 @@
 import logging
 import math
 import operator
+import os
+import time
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -51,6 +53,8 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+
+_TIMING = os.environ.get("MCORE_INFERENCE_TIMING", "0") == "1"
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -3742,6 +3746,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.is_tensor_state_allocated:
             raise TensorStateDeallocatedError(req.request_id)
 
+        _t_ctx = time.time()
+
         # Prefill chunk length.
         if prefill_chunk_length is None:
             prefill_chunk_length = req.remaining_prompt_length
@@ -3933,6 +3939,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
         self.total_request_count += 1
         self.num_prefill_requests += 1
+
+        if _TIMING:
+            print(
+                f"[TIMING CTX] add_request {(time.time()-_t_ctx)*1e3:.2f}ms "
+                f"req_id={req.request_id} chunk_tokens={effective_prefill_chunk_length}",
+                flush=True,
+            )
 
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None

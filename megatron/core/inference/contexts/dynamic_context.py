@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.prefix_cache_debug import PREFIX_CACHE_DEBUG, pclog
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -1335,6 +1336,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
         self.is_tensor_state_allocated = True
 
+        if PREFIX_CACHE_DEBUG:
+            pclog(
+                "reinitialize_inference_state_buffers (resume) kv_cache_mode=%s um_level=%s",
+                self.kv_cache_management_mode,
+                self.unified_memory_level,
+            )
+
         if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
@@ -1371,6 +1379,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = False
+
+        if PREFIX_CACHE_DEBUG:
+            pclog(
+                "deallocate_inference_state_buffers (suspend) kv_cache_mode=%s um_level=%s "
+                "kv_cache_index=%d",
+                self.kv_cache_management_mode,
+                self.unified_memory_level,
+                len(self.kv_block_allocator.kv_hash_to_block_id),
+            )
 
         if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
@@ -2491,11 +2508,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-    def reset_metadata(self) -> None:
+    def reset_metadata(self, preserve_prefix_cache: bool = False) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV block allocator's prefix-cache
+                state (hash index, ref counts, cached blocks) intact. Used by the idle
+                ``dummy_forward`` path, which only needs to clear the transient one-token
+                step state — wiping the allocator there would destroy cross-request prefix
+                reuse for any subsequent request (the engine idles between requests at low
+                concurrency, especially with EP > 1).
         """
 
         # Reset request/token counts.
@@ -2517,7 +2542,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
-        self.kv_block_allocator.reset()
+        if not preserve_prefix_cache:
+            self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset chunked prefill state
@@ -2529,7 +2555,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def reset(self) -> None:
+    def reset(self, preserve_prefix_cache: bool = False) -> None:
         """Reset entire context.
 
         This method does:
@@ -2540,18 +2566,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
+                state (hash indices, cached blocks/slots, LRU clock) intact. Used by
+                the idle ``dummy_forward`` path so an idle step between requests does
+                not destroy cross-request prefix reuse.
         """
         self.reset_tensors()
-        self.reset_metadata()
+        self.reset_metadata(preserve_prefix_cache=preserve_prefix_cache)
 
         # Reset lifetime counters (not reset in reset_metadata, which is also
         # called during suspend/resume where these must persist).
         self.step_count = 0
-        self.prefix_cache_lru_clock = 0
+        if not preserve_prefix_cache:
+            self.prefix_cache_lru_clock = 0
 
-        # Reset Mamba cache state
-        if self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.reset()
+            # Reset Mamba cache state
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.reset()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -2707,6 +2740,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             req, already_allocated_blocks, overall_required_blocks
         )
         num_matched = len(matched_block_ids)
+        num_mamba_matched = 0  # set below for hybrid models; reported in debug log
 
         block_aligned = finished % self.block_size_tokens == 0
         if num_matched > 0 and block_aligned:
@@ -2758,6 +2792,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_blocks_from_pool = max(
             0, overall_required_blocks - already_allocated_blocks - num_matched
         )
+
+        # record_mamba_match is True only on the real add_request() path, so this
+        # logs once per scheduled chunk (not for every check_availability probe).
+        if record_mamba_match and PREFIX_CACHE_DEBUG:
+            if not self.is_hybrid_model:
+                mode = "kv-only"
+            elif self.mamba_slot_allocator is not None:
+                mode = "full"
+            else:
+                mode = "memory-only(no-mamba-budget,skip=0)"
+            pclog(
+                "match req=%s finished=%d chunk_len=%d kv_matched=%d/%d mamba_matched=%d "
+                "block_aligned=%s prefix_skip_tokens=%d effective_chunk=%d new_blocks=%d "
+                "mode=%s kv_cache_index=%d",
+                req.request_id,
+                finished,
+                prefill_chunk_length,
+                num_matched,
+                overall_required_blocks,
+                num_mamba_matched,
+                block_aligned,
+                prefix_skip_tokens,
+                effective_prefill_chunk_length,
+                num_blocks_from_pool,
+                mode,
+                len(self.kv_block_allocator.kv_hash_to_block_id),
+            )
 
         return (
             matched_block_ids,
@@ -2991,6 +3052,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
+            num_registered = [0]
+
             def _register_range(start: int, end: int):
                 if start >= end:
                     return
@@ -2999,11 +3062,23 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice
                 )
+                num_registered[0] += len(block_ids_to_hash)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
             # Range 2: newly allocated (non-matched) blocks that are now complete
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
+
+            if PREFIX_CACHE_DEBUG and num_registered[0]:
+                pclog(
+                    "register req=%s new_blocks=%d complete_blocks=%d matched_blocks=%d "
+                    "kv_cache_index=%d",
+                    req.request_id,
+                    num_registered[0],
+                    num_complete_blocks,
+                    num_matched_blocks,
+                    len(self.kv_block_allocator.kv_hash_to_block_id),
+                )
 
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
             # Allocate a slot for Mamba states

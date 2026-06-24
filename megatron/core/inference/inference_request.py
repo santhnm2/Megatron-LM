@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from megatron.core.inference.prefix_cache_debug import PREFIX_CACHE_DEBUG, pclog
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
@@ -408,6 +409,20 @@ class DynamicInferenceRequest(InferenceRequest):
         self.precomputed_block_hashes = compute_block_hashes_batched(
             self.prompt_tokens, self.block_size_tokens
         )
+        if PREFIX_CACHE_DEBUG:
+            n = len(self.precomputed_block_hashes)
+            plen = len(self.prompt_tokens)
+            pclog(
+                "hash-compute req=%s prompt_tokens=%d block_size=%d complete_blocks=%d "
+                "remainder_tokens=%d first_hash=%s last_hash=%s",
+                self.request_id,
+                plen,
+                self.block_size_tokens,
+                n,
+                plen - n * self.block_size_tokens,
+                self.precomputed_block_hashes[0] if n else None,
+                self.precomputed_block_hashes[-1] if n else None,
+            )
 
     @property
     def remaining_prompt_length(self):

@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.prefix_cache_debug import PREFIX_CACHE_DEBUG, pclog
 
 
 class KVBlockAllocator:
@@ -163,6 +164,16 @@ class KVBlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
+            if PREFIX_CACHE_DEBUG:
+                pclog(
+                    "alloc-pressure need=%d free_pool=%d evictable_cached=%s policy=%s",
+                    num_blocks,
+                    self.total_avail,
+                    int(self.get_evictable_block_count()) if self.enable_prefix_caching else 0,
+                    self.prefix_caching_eviction_policy.value
+                    if self.enable_prefix_caching
+                    else "disabled",
+                )
             if (
                 not self.enable_prefix_caching
                 or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
@@ -208,6 +219,13 @@ class KVBlockAllocator:
             self.block_ref_counts[blocks] -= 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
                 zero_mask = self.block_ref_counts[blocks] == 0
+                if PREFIX_CACHE_DEBUG:
+                    pclog(
+                        "release(ref_zero) blocks=%d -> deregistering ref0=%d "
+                        "(these will NOT survive for cross-request reuse)",
+                        blocks.numel(),
+                        int(zero_mask.sum()),
+                    )
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
             elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -218,6 +236,21 @@ class KVBlockAllocator:
                 unreg_mask = (self.block_ref_counts[blocks] == 0) & (
                     self.block_hashes[blocks] == -1
                 )
+                if PREFIX_CACHE_DEBUG:
+                    ref0_registered = int(
+                        (
+                            (self.block_ref_counts[blocks] == 0)
+                            & (self.block_hashes[blocks] != -1)
+                        ).sum()
+                    )
+                    pclog(
+                        "release(lru) blocks=%d -> now_cached(ref0,registered)=%d "
+                        "returned_to_pool(unreg)=%d evictable_total=%d",
+                        blocks.numel(),
+                        ref0_registered,
+                        int(unreg_mask.sum()),
+                        int(self.get_evictable_block_count()),
+                    )
                 if unreg_mask.any():
                     unreg_blocks = blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()
@@ -235,6 +268,23 @@ class KVBlockAllocator:
         (except for the dummy block).
         """
 
+        if PREFIX_CACHE_DEBUG:
+            import traceback
+
+            cached = (
+                len(self.kv_hash_to_block_id)
+                if self.enable_prefix_caching
+                else 0
+            )
+            pclog(
+                "ALLOCATOR.reset() clearing kv_cache_index=%d -- this wipes all "
+                "cross-request prefix reuse. caller: %s",
+                cached,
+                " <- ".join(
+                    line.strip().split("\n")[0]
+                    for line in traceback.format_stack(limit=4)[:-1]
+                ),
+            )
         # Reset block bag to so we start consuming from the beginning of the pool
         # for UVM performance.
         # *Note*: Resetting the block bag is essential because if engine has been
@@ -315,6 +365,15 @@ class KVBlockAllocator:
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
         self.total_avail += num_blocks
 
+        if PREFIX_CACHE_DEBUG:
+            pclog(
+                "deregister blocks=%d hashes_removed=%d free_pool_after=%d kv_cache_index_after=%d",
+                num_blocks,
+                len(keys_to_delete),
+                self.total_avail,
+                len(self.kv_hash_to_block_id),
+            )
+
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
 
@@ -359,6 +418,14 @@ class KVBlockAllocator:
         cached_timestamps = self.block_timestamps[cached_block_ids]
         sorted_indices = torch.argsort(cached_timestamps)
         blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
+
+        if PREFIX_CACHE_DEBUG:
+            pclog(
+                "evict-lru needed=%d cached_available=%d evicting_oldest=%d",
+                num_blocks_needed,
+                cached_block_ids.numel(),
+                blocks_to_evict.numel(),
+            )
 
         self._deregister_blocks(blocks_to_evict)
 

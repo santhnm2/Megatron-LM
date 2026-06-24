@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.prefix_cache_debug import PREFIX_CACHE_DEBUG, pclog
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -206,6 +207,14 @@ class MambaSlotAllocator:
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
+        if PREFIX_CACHE_DEBUG:
+            pclog(
+                "mamba-evict needed=%d evictable_slots=%d free_durable_slots=%d",
+                num_needed,
+                candidate_ids.numel(),
+                int(self.free_count),
+            )
+
         if candidate_ids.numel() < num_needed:
             raise RuntimeError("No evictable Mamba cache slots available")
 
@@ -383,6 +392,13 @@ class MambaSlotAllocator:
         updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
         if updates:
             self.hash_to_block_id.update(updates)
+        if PREFIX_CACHE_DEBUG and updates:
+            pclog(
+                "mamba-register slots=%d free_durable_slots=%d mamba_index=%d",
+                len(updates),
+                int(self.free_count),
+                len(self.hash_to_block_id),
+            )
 
     # =========================================================================
     # Intermediate state tracking

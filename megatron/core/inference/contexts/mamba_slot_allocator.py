@@ -58,7 +58,10 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors (GPU - accessed by Mamba CUDA kernels).
+        # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
+        # one slot per cached block boundary, reused across requests. Sized to
+        # `max_slots`; the budget accounting in DynamicInferenceContext refers to
+        # these as the "durable" buffers.
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
@@ -100,7 +103,12 @@ class MambaSlotAllocator:
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
+        # Pre-allocated "scratch" output buffers for CUDA graph compatible
+        # extraction (GPU): per-step staging that the kernel writes intermediate
+        # states into before commit copies them to the durable cache above. Sized
+        # to the per-step worst case (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
+        # max_requests); the budget accounting in DynamicInferenceContext refers to
+        # these as the "scratch" buffers.
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
@@ -123,11 +131,19 @@ class MambaSlotAllocator:
         Handles deduplication: if the same block_id appears multiple times,
         only one slot is allocated and all occurrences get the same slot.
 
+        Prefix caching is best-effort: when the durable slot pool is exhausted
+        (free pool empty and no evictable blocks -- every slotted block is still
+        referenced), blocks that cannot obtain a slot are returned as -1 rather
+        than raising. This happens under high async-scheduling concurrency, where
+        many cached block boundaries stay referenced simultaneously. Callers must
+        skip -1 slots.
+
         Args:
             block_ids: List of KV block IDs to associate with slots.
 
         Returns:
-            List of allocated slot indices (same length as block_ids).
+            List of slot indices (same length as block_ids). Entries are -1 for
+            blocks that could not be assigned a slot.
         """
         if not block_ids:
             return []
@@ -163,14 +179,23 @@ class MambaSlotAllocator:
         if need_evict > 0:
             new_slots.extend(self._evict_lru_slots_batch(need_evict))
 
-        # Phase 4: Batch GPU writes for new mappings
-        new_bid_tensor = torch.tensor(new_bids, dtype=torch.int64, device=device)
-        new_slot_tensor = torch.tensor(new_slots, dtype=torch.int64, device=device)
-        self.block_to_slot[new_bid_tensor] = new_slot_tensor.to(torch.int32)
-        self.slot_to_block[new_slot_tensor] = new_bid_tensor.to(torch.int32)
+        # Best-effort: pad with -1 for any new blocks we could not allocate a slot
+        # for (free pool empty and nothing evictable). These boundaries simply go
+        # uncached this step; the caller skips them.
+        if len(new_slots) < num_new:
+            new_slots = new_slots + [-1] * (num_new - len(new_slots))
+
+        # Phase 4: Batch GPU writes for new mappings (only successfully allocated)
+        alloc_bids = [bid for bid, slot in zip(new_bids, new_slots) if slot >= 0]
+        alloc_slots = [slot for slot in new_slots if slot >= 0]
+        if alloc_bids:
+            new_bid_tensor = torch.tensor(alloc_bids, dtype=torch.int64, device=device)
+            new_slot_tensor = torch.tensor(alloc_slots, dtype=torch.int64, device=device)
+            self.block_to_slot[new_bid_tensor] = new_slot_tensor.to(torch.int32)
+            self.slot_to_block[new_slot_tensor] = new_bid_tensor.to(torch.int32)
 
         # Phase 5: Build result mapping
-        # Map new block_ids to their allocated slots
+        # Map new block_ids to their allocated slots (-1 if unallocated)
         alloc_bid_to_slot = {bid: slot for bid, slot in zip(new_bids, new_slots)}
         result = []
         for bid, existing in zip(block_ids, existing_slots):
@@ -185,11 +210,17 @@ class MambaSlotAllocator:
 
         Does NOT return slots to the free pool — caller takes ownership.
 
+        Best-effort: evicts up to `num_needed` slots, but returns fewer (possibly
+        zero) when not enough blocks are evictable. Every slotted block may still
+        be referenced (ref_count > 0) under high async-scheduling concurrency;
+        prefix caching is an optimization, so the caller skips boundaries that
+        cannot be cached rather than failing the step.
+
         Args:
             num_needed: Number of slots to evict.
 
         Returns:
-            List of freed slot indices.
+            List of freed slot indices (length <= num_needed).
         """
         kv_alloc = self.context.kv_block_allocator
         # Find blocks that have mamba slots and ref_count == 0
@@ -198,16 +229,18 @@ class MambaSlotAllocator:
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
-        if candidate_ids.numel() < num_needed:
-            raise RuntimeError("No evictable Mamba cache slots available")
+        # Evict only what is actually evictable (best-effort prefix caching).
+        n_evict = min(num_needed, candidate_ids.numel())
+        if n_evict == 0:
+            return []
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             timestamps = kv_alloc.block_timestamps[candidate_ids]
-            sorted_indices = torch.argsort(timestamps)[:num_needed]
+            sorted_indices = torch.argsort(timestamps)[:n_evict]
             evict_ids = candidate_ids[sorted_indices]
         else:
-            evict_ids = candidate_ids[:num_needed]
+            evict_ids = candidate_ids[:n_evict]
 
         # Batch gather slots + hashes (2 GPU syncs)
         slots = self.block_to_slot[evict_ids].tolist()
@@ -407,24 +440,36 @@ class MambaSlotAllocator:
             overall_required_blocks: Total blocks needed for this request.
         """
         ctx = self.context
+        bs = ctx.block_size_tokens
         prompt_len = len(req.prompt_tokens)
-        num_kv_matched = num_matched_blocks
-        kv_div_abs = num_kv_matched * ctx.block_size_tokens
-        last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
-        seq_len = prefill_chunk_length - skip_tokens  # effective prefill length
 
-        # Compute relative offsets (relative to prefill start after skip)
-        kv_div_rel = kv_div_abs - skip_tokens
-        last_aligned_rel = last_aligned_abs - skip_tokens
-        penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
-        penultimate_rel = penultimate_abs - skip_tokens
+        # Absolute token position (from the prompt start) where THIS chunk's
+        # computed tokens begin. The first chunk computes from `skip_tokens` (the
+        # prefix that was skipped); continuation chunks compute from
+        # `finished_chunk_token_count` (with skip_tokens == 0). Framing the
+        # boundary offsets against this chunk start -- rather than assuming the
+        # first chunk -- lets us extract Mamba state at block boundaries that fall
+        # in ANY chunk. In particular the last complete block of a multi-chunk
+        # prompt lives in a continuation chunk; it was previously unreachable, so
+        # non-block-aligned prompts never cached a usable resume boundary and
+        # later turns could not skip prefill.
+        chunk_start = req.finished_chunk_token_count + skip_tokens
+        seq_len = prefill_chunk_length - skip_tokens  # tokens computed this chunk
+        is_last_chunk = req.finished_chunk_token_count + prefill_chunk_length >= prompt_len
+
+        # Candidate absolute block boundaries at which to cache Mamba state.
+        kv_div_abs = num_matched_blocks * bs
+        last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
+        penultimate_abs = (overall_required_blocks - 1) * bs
 
         # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
         mamba_chunk_size = 128
 
-        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
+        # Keep only boundaries that land inside this chunk's computed tokens and on
+        # a mamba-chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
-        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
+        for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
+            offset = abs_pos - chunk_start
             if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
                 offsets_set.add(offset)
 
@@ -433,8 +478,8 @@ class MambaSlotAllocator:
 
         # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
-            abs_tokens_cpu = torch.tensor([skip_tokens + o for o in offsets], dtype=torch.int64)
-            block_indices_cpu = abs_tokens_cpu // ctx.block_size_tokens - 1
+            abs_tokens_cpu = torch.tensor([chunk_start + o for o in offsets], dtype=torch.int64)
+            block_indices_cpu = abs_tokens_cpu // bs - 1
             bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
 
             self._intermediate_offsets_cpu[current_id, :count] = torch.tensor(
@@ -444,9 +489,13 @@ class MambaSlotAllocator:
             self._has_intermediates = True
         self._intermediate_counts_cpu[current_id] = count
 
-        # Block-aligned EOS: prompt_len is exactly block-aligned
-        if last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // ctx.block_size_tokens - 1
+        # Block-aligned EOS: when the prompt length is exactly block-aligned, the
+        # request's live final state IS the last block boundary's state and can be
+        # cached directly. Only valid on the final chunk (otherwise the live state
+        # is mid-prompt). Non-block-aligned prompts cache their last complete block
+        # via the intermediate-extraction path above instead.
+        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
+            last_block_idx = prompt_len // bs - 1
             if last_block_idx >= 0:
                 self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx
@@ -512,19 +561,31 @@ class MambaSlotAllocator:
             return
         intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
 
-        # Allocate all slots in one batch (intermediates + EOS)
+        # Allocate all slots in one batch (intermediates + EOS). Allocation is
+        # best-effort: slots may come back as -1 when the durable pool is
+        # exhausted (common under high async-scheduling concurrency). Those
+        # boundaries are skipped below -- they simply go uncached this step.
         all_bids = intermediate_bids + eos_bids
         all_slots = self.allocate_slots_batch(all_bids)
 
-        # Copy intermediate states from output buffers to cache
+        # Copy intermediate states from output buffers to cache (skip uncached)
         n_intermediate = len(intermediate_bids)
-        self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
+        inter_slots = all_slots[:n_intermediate]
+        kept_src_offsets = [o for o, s in zip(src_offsets, inter_slots) if s >= 0]
+        kept_inter_slots = [s for s in inter_slots if s >= 0]
+        self._copy_intermediate_to_cache(kept_src_offsets, kept_inter_slots)
 
-        # Copy EOS states from live buffers to cache
-        self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
+        # Copy EOS states from live buffers to cache (skip uncached)
+        eos_slots = all_slots[n_intermediate:]
+        kept_eos_ctx = [c for c, s in zip(eos_ctx_indices, eos_slots) if s >= 0]
+        kept_eos_slots = [s for s in eos_slots if s >= 0]
+        self.store_from_live_batch(kept_eos_slots, kept_eos_ctx)
 
-        # Register hashes for all committed blocks
-        self.register_block_hashes_batch(all_bids, all_hashes)
+        # Register hashes only for blocks that actually obtained a cache slot;
+        # a hash entry implies cached Mamba state exists for that block.
+        kept_bids = [b for b, s in zip(all_bids, all_slots) if s >= 0]
+        kept_hashes = [h for h, s in zip(all_hashes, all_slots) if s >= 0]
+        self.register_block_hashes_batch(kept_bids, kept_hashes)
 
         self._clear_intermediate_state()
 

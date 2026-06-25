@@ -397,17 +397,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
-            output = super().__call__(*args, **kwargs)
-            if (
-                isinstance(output, tuple)
-                and len(output) == 2
-                and self.config.mtp_num_layers is not None
-                and self.mtp_process
-            ):
-                logits, decoder_hidden_states = output
-                self._decoder_hidden_states_cache = decoder_hidden_states
-                return logits
-            return output[0]
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):
@@ -553,9 +543,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+            if is_spec_decode:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    # Block-scope CUDA graph mode: copy_() into the
+                    # pre-allocated buffer so every graph replay writes to
+                    # the same fixed GPU address regardless of batch size.
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    # Non-block scope: direct assignment; the controller will set
+                    # this back to None after reading to allow GC.
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
@@ -614,16 +616,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            logits = logits.transpose(0, 1).contiguous()
-            if (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-                and self.mtp_process
-                and inference_context.using_cuda_graph_this_step()
-            ):
-                return logits, self._decoder_hidden_states_cache
-            return logits
+            return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
 

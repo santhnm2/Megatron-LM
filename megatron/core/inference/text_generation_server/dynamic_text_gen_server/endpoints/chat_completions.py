@@ -685,7 +685,7 @@ try:
         # (default True). Gate them on that flag so a request that opts out gets a
         # lean, vLLM-shaped response. The choice-level copies are dropped entirely
         # (only the message level is ever read back).
-        prevent_retokenization = req.get("prevent_retokenization", True)
+        prevent_retokenization = req.get("prevent_retokenization", False)
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)

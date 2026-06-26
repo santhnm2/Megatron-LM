@@ -28,6 +28,64 @@ SPECIAL_TOKEN_TEMPLATE = "<SPECIAL_{id}>"
 __all__ = ["TikTokenTokenizer", "reload_mergeable_ranks"]
 
 
+def _load_tokenizer_json(path: str):
+    with open(path, "r") as f:
+        tokenizer_json = json.load(f)
+
+    if isinstance(tokenizer_json, dict):
+        vocab = tokenizer_json.get("vocab")
+        config = tokenizer_json.get("config") or {}
+        special_tokens = tokenizer_json.get("special_tokens")
+    else:
+        vocab = tokenizer_json
+        config = {}
+        special_tokens = None
+
+    if not isinstance(vocab, list):
+        raise ValueError("TikTokenizer JSON must be a list or contain a list-valued 'vocab'")
+    if not isinstance(config, dict):
+        raise ValueError("TikTokenizer config must be an object when present")
+    return vocab, config, special_tokens
+
+
+def _pattern_from_name(pattern: Optional[str]) -> str:
+    if pattern in (None, "v2"):
+        return _PATTERN_TIKTOKEN_V2
+    if pattern == "v1":
+        return _PATTERN_TIKTOKEN_V1
+    return pattern
+
+
+def _special_tokens_from_tekken(wrapper_special_tokens, num_special_tokens: int):
+    if not isinstance(wrapper_special_tokens, list):
+        return None, []
+
+    special_tokens = [None] * num_special_tokens
+    special_filler = []
+    for item in wrapper_special_tokens:
+        if not isinstance(item, dict):
+            raise ValueError("Tekken special_tokens entries must be objects")
+        rank = item.get("rank")
+        token = item.get("token_str")
+        if not isinstance(rank, int) or not isinstance(token, str):
+            raise ValueError("Tekken special_tokens entries require integer rank and string token_str")
+        if 0 <= rank < num_special_tokens:
+            special_tokens[rank] = token
+
+    for rank, token in enumerate(special_tokens):
+        if token is None:
+            token = SPECIAL_TOKEN_TEMPLATE.format(id=rank)
+            special_tokens[rank] = token
+        if token == SPECIAL_TOKEN_TEMPLATE.format(id=rank):
+            special_filler.append(token)
+
+    return special_tokens, special_filler
+
+
+def _special_token_id(special_tokens: List[str], token: str) -> int:
+    return special_tokens.index(token) if token in special_tokens else -1
+
+
 def reload_mergeable_ranks(
     path: str, max_vocab: Optional[int] = None, num_special_tokens: Optional[int] = None
 ) -> Dict[bytes, int]:
@@ -46,10 +104,7 @@ def reload_mergeable_ranks(
     assert path.endswith(".json")
     from megatron.core.utils import log_single_rank
 
-    # reload vocab
-    with open(path, "r") as f:
-        vocab = json.load(f)
-    assert isinstance(vocab, list)
+    vocab, _, _ = _load_tokenizer_json(path)
     log_single_rank(logger, logging.INFO, f"Vocab size: {len(vocab)}")
     if max_vocab is not None:
         vocab = vocab[:max_vocab]
@@ -98,50 +153,78 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         if not tokenizer_path or not os.path.exists(tokenizer_path):
             raise ValueError(f"tokenizer_path: {tokenizer_path} is invalid")
 
+        vocab, tokenizer_config, wrapper_special_tokens = _load_tokenizer_json(tokenizer_path)
+        if num_special_tokens is None:
+            num_special_tokens = int(tokenizer_config.get("default_num_special_tokens", 1000))
+        wrapper_default_vocab_size = tokenizer_config.get("default_vocab_size")
+        if (
+            wrapper_default_vocab_size is not None
+            and vocab_size in (None, DEFAULT_TIKTOKEN_MAX_VOCAB)
+        ):
+            vocab_size = int(wrapper_default_vocab_size)
+        elif vocab_size is None:
+            vocab_size = len(vocab) + num_special_tokens
+
+        wrapper_special_filler = None
+        if special_tokens is None:
+            special_tokens, wrapper_special_filler = _special_tokens_from_tekken(
+                wrapper_special_tokens, num_special_tokens
+            )
         if special_tokens is None:
             special_tokens = SPECIAL_TOKENS.copy()
 
-        if pattern == "v1":
-            pattern = _PATTERN_TIKTOKEN_V1
-        elif pattern == "v2":
-            pattern = _PATTERN_TIKTOKEN_V2
+        wrapper_pattern = tokenizer_config.get("pattern")
+        if isinstance(wrapper_pattern, str) and pattern in (None, "v1", "v2"):
+            pattern = wrapper_pattern
         else:
-            raise ValueError(f"Expected tiktoken pattern to be `v1` or `v2`, but got {pattern}.")
+            pattern = _pattern_from_name(pattern)
 
         assert len(special_tokens) == len(
             set(special_tokens)
         ), f"Special tokens should be unique: {special_tokens}"
         assert len(special_tokens) <= num_special_tokens < vocab_size
-        assert set(SPECIAL_TOKENS) <= set(
-            special_tokens
-        ), f"Custom special tokens should include {SPECIAL_TOKENS}"
+        if wrapper_special_filler is None:
+            assert set(SPECIAL_TOKENS) <= set(
+                special_tokens
+            ), f"Custom special tokens should include {SPECIAL_TOKENS}"
 
-        self._unk_id = special_tokens.index("<unk>")
-        self._bos_id = special_tokens.index("<s>")
-        self._eos_id = special_tokens.index("</s>")
-        self._mask_id = special_tokens.index("<mask>")
-        self._pad_id = special_tokens.index("<pad>")
-        self._cls_id = special_tokens.index("<cls>")
-        self._sep_id = special_tokens.index("<sep>")
+        self._unk_id = _special_token_id(special_tokens, "<unk>")
+        self._bos_id = _special_token_id(special_tokens, "<s>")
+        self._eos_id = _special_token_id(special_tokens, "</s>")
+        self._mask_id = _special_token_id(special_tokens, "<mask>")
+        self._pad_id = _special_token_id(special_tokens, "<pad>")
+        self._cls_id = _special_token_id(special_tokens, "<cls>")
+        self._sep_id = _special_token_id(special_tokens, "<sep>")
 
         self._vocab_size = vocab_size
         self.chat_template = chat_template
         self.num_special_tokens = num_special_tokens
-        special_filler = [
-            SPECIAL_TOKEN_TEMPLATE.format(id=i)
-            for i in range(len(special_tokens), num_special_tokens)
-        ]
+        if wrapper_special_filler is None:
+            special_filler = [
+                SPECIAL_TOKEN_TEMPLATE.format(id=i)
+                for i in range(len(special_tokens), num_special_tokens)
+            ]
+        else:
+            special_filler = wrapper_special_filler
         self.special_filler = special_filler
         from megatron.core.utils import log_single_rank
 
         if special_filler:
+            filler_set = set(special_filler)
+            displayed_special_tokens = [t for t in special_tokens if t not in filler_set]
+            if not displayed_special_tokens:
+                displayed_special_tokens = special_tokens[: min(len(special_tokens), 8)]
             log_single_rank(
                 logger,
                 logging.INFO,
                 "Adding special tokens: "
-                f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}",
+                f"{', '.join(displayed_special_tokens)}, "
+                f"{special_filler[0]}, ..., {special_filler[-1]}",
             )
-        self.special_tokens = special_tokens + special_filler
+        if wrapper_special_filler is None:
+            self.special_tokens = special_tokens + special_filler
+        else:
+            self.special_tokens = special_tokens
         assert (
             len(set(self.special_tokens)) == len(self.special_tokens) == num_special_tokens
         ), self.special_tokens

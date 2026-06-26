@@ -1514,7 +1514,7 @@ def load_args_from_checkpoint(
     _set_arg('hidden_dropout', force=True)
 
     # Legacy MTP pattern for old checkpoints
-    _set_arg('mtp_hybrid_override_pattern', force=True)
+    _set_arg('mtp_hybrid_override_pattern', force=False)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
 
@@ -1542,7 +1542,7 @@ def load_args_from_checkpoint(
     _set_arg('mamba_num_heads', force=True)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
-    _set_arg('hybrid_layer_pattern')
+    _set_arg('hybrid_layer_pattern', force=False)
 
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)

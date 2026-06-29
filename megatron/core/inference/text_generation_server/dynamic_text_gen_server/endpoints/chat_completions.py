@@ -680,6 +680,7 @@ try:
         total_completion_tokens = 0
         prompt_tokens_counts = []
         cached_tokens_counts = []
+        ttft_seconds_list = []
 
         # The big response fields (prompt/generation token ids) are only useful to
         # a client that echoes them back next turn for prevent_retokenization
@@ -696,6 +697,9 @@ try:
             prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
             cached_tokens_counts.append(result.get("num_cached_tokens", 0))
+            ttft_seconds = result.get("ttft")
+            if ttft_seconds is not None:
+                ttft_seconds_list.append(float(ttft_seconds))
 
             logprobs_content = None
             if sampling_params.return_log_probs:
@@ -798,6 +802,12 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
+            if ttft_seconds is not None:
+                # Time to first token (admission -> first generated token), in
+                # milliseconds. Useful for sanity-checking that prefill compute
+                # actually drives TTFT (compare to the per-step prefill time in
+                # the engine log).
+                choice_data["ttft_ms"] = ttft_seconds * 1000.0
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 
@@ -814,20 +824,26 @@ try:
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
+        usage = {
+            "prompt_tokens": prompt_token_count,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": prompt_token_count + total_completion_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cached_token_count,
+            },
+        }
+        if ttft_seconds_list:
+            # Max across choices (n>1) so a single client request reports the
+            # worst-case TTFT it observed; per-choice values are also available
+            # on choices[i].ttft_ms.
+            usage["ttft_ms"] = max(ttft_seconds_list) * 1000.0
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",
             "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_token_count,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": prompt_token_count + total_completion_tokens,
-                "prompt_tokens_details": {
-                    "cached_tokens": cached_token_count,
-                },
-            },
+            "usage": usage,
         }
 
         if _TIMING:

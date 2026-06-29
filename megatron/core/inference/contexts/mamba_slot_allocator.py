@@ -16,6 +16,26 @@ if TYPE_CHECKING:
 MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
 
 
+def compute_max_intermediate_count(max_tokens: int, block_size_tokens: int) -> int:
+    """Per-step upper bound on Mamba intermediate state extractions.
+
+    A step can produce at most one Mamba block boundary per ``block_size_tokens``
+    of its token budget, so:
+
+        max_intermediate_count = ceil(max_tokens / block_size_tokens)
+
+    independently of ``max_requests``. The ``MAX_INTERMEDIATE_OFFSETS_PER_REQUEST``
+    floor handles tiny ``max_tokens`` deployments; the ``+ 1`` is a small safety
+    margin.
+    """
+    import math
+
+    return max(
+        MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+        math.ceil(max_tokens / block_size_tokens) + 1,
+    )
+
+
 class MambaSlotAllocator:
     """Manages Mamba state caching for prefix caching in hybrid models.
 
@@ -106,10 +126,12 @@ class MambaSlotAllocator:
         # Pre-allocated "scratch" output buffers for CUDA graph compatible
         # extraction (GPU): per-step staging that the kernel writes intermediate
         # states into before commit copies them to the durable cache above. Sized
-        # to the per-step worst case (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
-        # max_requests); the budget accounting in DynamicInferenceContext refers to
-        # these as the "scratch" buffers.
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        # by the per-step token budget (see compute_max_intermediate_count); the
+        # budget accounting in DynamicInferenceContext refers to these as the
+        # "scratch" buffers.
+        self.max_intermediate_count = compute_max_intermediate_count(
+            context.max_tokens, context.block_size_tokens
+        )
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,

@@ -413,6 +413,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
 
+        if getattr(model_config, "sequence_parallel", False):
+            from megatron.core.parallel_state import get_global_memory_buffer
+
+            max_ag_numel = self.context.max_tokens * model_config.hidden_size
+            get_global_memory_buffer().get_tensor((max_ag_numel,), model_config.params_dtype, "mpu")
+
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)

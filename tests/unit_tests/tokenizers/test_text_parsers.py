@@ -32,6 +32,9 @@ from megatron.core.tokenizers.text.parsers.nemotron_v3_reasoning_parser import (
 )
 
 # (text, kwargs, expected_content, expected_info)
+# `kwargs` is expanded into `parse(text, **kwargs)`; the override flags reach the
+# parser inside `chat_template_kwargs`, exactly as the chat-completions endpoint
+# forwards them from the request.
 NEMOTRON_V3_CASES = [
     # No chat_template_kwargs override: behaves exactly like DeepSeekR1ReasoningParser.
     ("<think>hello", {}, "", {"reasoning": "hello"}),
@@ -43,22 +46,22 @@ NEMOTRON_V3_CASES = [
     ("just an answer", {}, "", {"reasoning": "just an answer"}),
     # enable_thinking=False surfaces would-be-empty content as the reasoning text,
     # for both the "unterminated" and "closes with nothing following" cases.
-    ("<think>hello", {"enable_thinking": False}, "hello", {}),
-    ("<think>hello</think>", {"enable_thinking": False}, "hello", {}),
+    ("<think>hello", {"chat_template_kwargs": {"enable_thinking": False}}, "hello", {}),
+    ("<think>hello</think>", {"chat_template_kwargs": {"enable_thinking": False}}, "hello", {}),
     # force_nonempty_content=True has the same effect as enable_thinking=False.
-    ("<think>hello</think>", {"force_nonempty_content": True}, "hello", {}),
-    ("<think>hello", {"force_nonempty_content": True}, "hello", {}),
+    ("<think>hello</think>", {"chat_template_kwargs": {"force_nonempty_content": True}}, "hello", {}),
+    ("<think>hello", {"chat_template_kwargs": {"force_nonempty_content": True}}, "hello", {}),
     # The override only fires when there would otherwise be no content.
     (
         "<think>hello</think>world",
-        {"enable_thinking": False},
+        {"chat_template_kwargs": {"enable_thinking": False}},
         "world",
         {"reasoning": "hello"},
     ),
     # Text preceding `<think>` is discarded, override still applies past it.
-    ("prefix<think>hello</think>", {"enable_thinking": False}, "hello", {}),
+    ("prefix<think>hello</think>", {"chat_template_kwargs": {"enable_thinking": False}}, "hello", {}),
     # enable_thinking=True (or omitted) must not trigger the override.
-    ("<think>hello</think>", {"enable_thinking": True}, "", {"reasoning": "hello"}),
+    ("<think>hello</think>", {"chat_template_kwargs": {"enable_thinking": True}}, "", {"reasoning": "hello"}),
 ]
 
 

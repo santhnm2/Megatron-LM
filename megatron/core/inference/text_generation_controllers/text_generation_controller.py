@@ -1514,7 +1514,11 @@ class TextGenerationController:
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            # `gather_indices` presence selects distinct kernel code paths (row-gather
+            # vs contiguous), so it must be part of the CUDA-graph cache key; otherwise
+            # a graph captured for one path is replayed for the other and the arg-type
+            # check fails (NoneType vs Tensor).
+            cache_key=("sample", n, gather_indices is not None) if use_graph else None,
         )
         self._sampled_tokens_cuda[:active_request_count].copy_(
             sampled_tokens[:active_request_count]

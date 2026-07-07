@@ -1508,6 +1508,15 @@ class TextGenerationController:
             gather_indices = context.gpu_view.active_request_last_token_idxs
             if row_indices is not None:
                 gather_indices = gather_indices.index_select(0, row_indices)
+        # Under graph capture the kernel samples a static `n` (padded) rows, so
+        # `gather_indices` must supply `n` rows to match the padded `temperature`/
+        # `top_k`/`top_p` slices. Row-mapped async reuse passes only the active rows,
+        # so pad the trailing slots to row 0; those samples are discarded by the
+        # `[:active_request_count]` copy-back below.
+        if use_graph and gather_indices is not None and gather_indices.shape[0] < n:
+            padded_gather_indices = gather_indices.new_zeros(n)
+            padded_gather_indices[: gather_indices.shape[0]] = gather_indices
+            gather_indices = padded_gather_indices
         sampled_tokens = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,

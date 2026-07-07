@@ -362,6 +362,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         ),
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         cuda_graph_all_prefills=args.inference_cuda_graph_all_prefills,
+        cuda_graph_max_tokens=args.inference_cuda_graph_max_tokens,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,

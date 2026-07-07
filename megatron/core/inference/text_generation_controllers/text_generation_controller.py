@@ -2239,8 +2239,9 @@ class TextGenerationController:
             return "mtp pre-sampling graph is unsupported"
         if self.num_speculative_tokens != 0 and self.num_mtp_depths != self.num_speculative_tokens:
             return "not enough mtp heads"
-        if self._sampling_backend != "torch":
-            return "sampling backend is unsupported"
+        # The flashinfer backend samples inside a captured CUDA graph using a private
+        # generator that is registered graph-safe (see FlashInferSampling), so its RNG
+        # advances correctly across the chained async replays. Both backends are eligible.
         return None
 
     def _dummy_async_handoff_disabled_reason(self) -> Optional[str]:

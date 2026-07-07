@@ -936,7 +936,9 @@ def _make_async_gate_controller(active_request_count=2):
         ("pipeline_parallel", "pipeline parallel is unsupported"),
         ("mtp_presampling", "mtp pre-sampling graph is unsupported"),
         ("mtp_depth_mismatch", "not enough mtp heads"),
-        ("flashinfer", "sampling backend is unsupported"),
+        # flashinfer samples inside the captured graph with a graph-safe RNG, so it is
+        # eligible for async scheduling alongside the torch backend.
+        ("flashinfer", None),
         ("prefill", "not decode-only"),
         ("eager_step", "not using cuda graph"),
         ("empty", "no active requests"),

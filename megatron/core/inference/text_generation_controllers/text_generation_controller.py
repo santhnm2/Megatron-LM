@@ -2009,7 +2009,12 @@ class TextGenerationController:
             return False
 
         self._wait_for_dummy_context_h2d()
-        context.reset()
+        # Preserve prefix-cache state: this dummy async handoff runs when the rank
+        # is idle (mirroring a real rank's async forward for EP collectives), so it
+        # must not wipe cached KV/Mamba prefixes -- otherwise cross-request prefix
+        # reuse is destroyed every time the engine drains to idle. Mirrors the
+        # preserve_prefix_cache=True reset on the synchronous dummy_forward path.
+        context.reset(preserve_prefix_cache=True)
         range_push("ep_dummy_async_handoff")
         # Notify the context that this init belongs to an EP async handoff so the
         # NVLS eager-consensus all-reduce is skipped (the real rank does not call

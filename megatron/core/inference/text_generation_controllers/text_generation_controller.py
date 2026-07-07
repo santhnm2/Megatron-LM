@@ -1508,6 +1508,13 @@ class TextGenerationController:
             gather_indices = context.gpu_view.active_request_last_token_idxs
             if row_indices is not None:
                 gather_indices = gather_indices.index_select(0, row_indices)
+        # `gather_indices` feeds advanced indexing and is a CUDA-graph input, so it must
+        # carry one dtype across every path. `row_indices` is int64 (it is also an
+        # `index_select` argument elsewhere, which requires int64) while the gpu_view
+        # last-token index buffer is int32; standardize on int64, the index-safe dtype.
+        # Only the prefill path is widened here; the decode row-mapped path is already int64.
+        if gather_indices is not None and gather_indices.dtype != torch.int64:
+            gather_indices = gather_indices.to(torch.int64)
         # Under graph capture the kernel samples a static `n` (padded) rows, so
         # `gather_indices` must supply `n` rows to match the padded `temperature`/
         # `top_k`/`top_p` slices. Row-mapped async reuse passes only the active rows,
@@ -1523,11 +1530,18 @@ class TextGenerationController:
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
-            # `gather_indices` presence selects distinct kernel code paths (row-gather
-            # vs contiguous), so it must be part of the CUDA-graph cache key; otherwise
-            # a graph captured for one path is replayed for the other and the arg-type
-            # check fails (NoneType vs Tensor).
-            cache_key=("sample", n, gather_indices is not None) if use_graph else None,
+            # `gather_indices` is a graph input with a now-uniform dtype, so its length is
+            # the only remaining discriminator: the decode row-mapped path passes `n`
+            # per-request indices while the prefill path passes a differently sized
+            # per-token index array. Keying on shape (and None vs Tensor) keeps their
+            # graphs distinct so the replay validator never sees a mismatched capture.
+            cache_key=(
+                ("sample", n, gather_indices.shape[0])
+                if gather_indices is not None
+                else ("sample", n, None)
+            )
+            if use_graph
+            else None,
         )
         self._sampled_tokens_cuda[:active_request_count].copy_(
             sampled_tokens[:active_request_count]

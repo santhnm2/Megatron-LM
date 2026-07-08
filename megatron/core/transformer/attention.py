@@ -884,7 +884,7 @@ class Attention(MegatronModule, ABC):
                     page_table=block_table,
                     softmax_scale=softmax_scale,
                     causal=True,
-                    num_splits=1,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                 )
             elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -955,9 +955,29 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                 )
+            elif HAVE_FA4:
+                # Use the FA4 varlen kernel for decode with num_splits=0.
+                softmax_scale = getattr(self, "softmax_scale", None)
+                if softmax_scale is None:
+                    softmax_scale = q.shape[-1] ** -0.5
+                q_flat = q.reshape(-1, q.shape[-2], q.shape[-1])  # (B, S, H, D) -> (B*S, H, D)
+                output_total, _ = flash_attn4_varlen_func(
+                    q_flat,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    seqused_k=seqlens_k,
+                    page_table=block_table,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
+                )
+                output_total = output_total.reshape(
+                    num_requests, tokens_per_request, *output_total.shape[1:]
+                )
             else:
-                # FA4 is intentionally not used for decode (regresses long decodes);
-                # prefill still uses FA4 above. Decode falls through to FA3/FA2 kvcache.
                 flash_attn_args = {
                     "q": q,
                     "k_cache": k,

@@ -76,7 +76,6 @@ class TorchSampling(Sampling):
         top_k: int,
         top_p: float,
         *,
-        generator: torch.Generator,
         vocab_size: Optional[int] = None,
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
@@ -88,7 +87,6 @@ class TorchSampling(Sampling):
             temperature: Temperature scaling factor.
             top_k: Top-k filtering value (0 = disabled).
             top_p: Top-p (nucleus) filtering value (0.0 = disabled).
-            generator: RNG used by `torch.multinomial`.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
 
@@ -106,7 +104,7 @@ class TorchSampling(Sampling):
             last_token_logits, temperature, top_k, top_p, vocab_size=vocab_size
         )
         probabilities = filtered.softmax(dim=-1)
-        sampled = torch.multinomial(probabilities, num_samples=1, generator=generator).view(-1)
+        sampled = torch.multinomial(probabilities, num_samples=1, generator=self._rng).view(-1)
 
         if vocab_size:
             sampled = torch.clamp(sampled, min=0, max=(vocab_size - 1))
@@ -201,7 +199,6 @@ class TorchSampling(Sampling):
                     temp,
                     top_k,
                     top_p,
-                    generator=self._rng,
                     vocab_size=self._vocab_size,
                 )
             )

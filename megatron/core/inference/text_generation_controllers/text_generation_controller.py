@@ -521,7 +521,6 @@ class TextGenerationController:
             temperature,
             top_k,
             top_p,
-            generator=self.sampling_rng,
             vocab_size=vocab_size,
         )
 

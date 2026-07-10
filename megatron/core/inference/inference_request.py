@@ -420,6 +420,13 @@ class DynamicInferenceRequest(InferenceRequest):
     events: List[DynamicInferenceEvent] = field(default_factory=list)
     event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
     generated_tokens: List[int] = field(default_factory=list)
+    # For speculative decoding (e.g. MTP): the number of tokens emitted for this
+    # request on each active engine step. For a decode step this equals the
+    # number of accepted draft tokens + 1 (the always-accepted base token); the
+    # prefill/first step is 1. This list always sums to ``generated_length`` and
+    # lets a client reconstruct per-step acceptance lengths. Empty when
+    # speculative decoding is disabled.
+    acceptance_step_lengths: List[int] = field(default_factory=list)
 
     def __str__(self):
         return ", ".join(
@@ -726,6 +733,7 @@ class DynamicInferenceRequestRecord:
             generated_text=generated_text,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
+            acceptance_step_lengths=merge_lists("acceptance_step_lengths"),
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,

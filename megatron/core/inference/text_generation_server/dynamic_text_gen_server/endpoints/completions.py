@@ -259,6 +259,17 @@ try:
             }
             choice_data["policy_epoch"] = result["policy_epoch"]
             choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
+            # Per-step token counts for speculative decoding (e.g. MTP). Each
+            # entry is the number of tokens emitted on one engine step
+            # (accepted draft tokens + 1 for decode steps); the list sums to the
+            # number of generated tokens. Empty/None when spec decoding is off.
+            choice_data["acceptance_step_lengths"] = result.get("acceptance_step_lengths")
+            # Per-request timing measured by the engine. ttft is the real
+            # time-to-first-token (seconds). tpot is a sparse per-token step-time
+            # sample (only populated on logging steps), so clients that need a
+            # dense TPOT should derive it from ttft + total latency instead.
+            choice_data["ttft"] = result.get("ttft")
+            choice_data["tpot"] = result.get("tpot")
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )

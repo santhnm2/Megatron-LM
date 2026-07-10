@@ -19,6 +19,10 @@ from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
+from megatron.core.transformer.moe.inference_routing_mask_kernel import (
+    HAVE_TRITON,
+    mask_routing_padding,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -31,6 +35,10 @@ requires_te = pytest.mark.skipif(
 requires_torch_grouped_mm = pytest.mark.skipif(
     not is_torch_min_version("2.10") or not hasattr(torch, '_grouped_mm'),
     reason="Requires PyTorch >= 2.10 with torch._grouped_mm",
+)
+requires_triton_cuda = pytest.mark.skipif(
+    not HAVE_TRITON or not torch.cuda.is_available(),
+    reason="Routing padding mask requires Triton and CUDA",
 )
 
 # ──────────────────────────────────────────────────────────────────────
@@ -439,3 +447,93 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    def test_dispatch_masks_semantic_padding_before_all_gather(self):
+        """NVLS must propagate -1, not expert IDs, for transport-only rows."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        local_tokens = 8
+        real_tokens = 5
+        hidden = torch.randn(
+            local_tokens, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+        probs = torch.randn(
+            local_tokens, NANOV3_BASE["moe_router_topk"], device="cuda", dtype=torch.float32
+        )
+        dispatcher.routing_map = torch.full(
+            (local_tokens, NANOV3_BASE["moe_router_topk"]), 3, device="cuda", dtype=torch.int64
+        )
+        NVLSAllGatherVDispatcher.set_real_token_count_tensor(
+            torch.tensor([real_tokens], device="cuda", dtype=torch.int32)
+        )
+
+        try:
+            dispatcher.token_dispatch(hidden, probs)
+            gathered_routing = dispatcher.routing_map[: local_tokens * ep_size]
+            for ep_rank in range(ep_size):
+                rank_routing = gathered_routing[
+                    ep_rank * local_tokens : (ep_rank + 1) * local_tokens
+                ]
+                assert torch.all(rank_routing[:real_tokens] == 3)
+                assert torch.all(rank_routing[real_tokens:] == -1)
+        finally:
+            NVLSAllGatherVDispatcher._real_token_count_tensor = None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sequence-parallel routing padding mask
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.internal
+@requires_triton_cuda
+class TestMaskRoutingPadding:
+    """Tests the semantic-token boundary used by TP+SP+EP MTP routing."""
+
+    TOPK = 6
+
+    @staticmethod
+    def _real_token_count(count):
+        return torch.tensor([count], dtype=torch.int32, device="cuda")
+
+    def _routing_map(self, rows):
+        return torch.full((rows, self.TOPK), 3, dtype=torch.int64, device="cuda")
+
+    @pytest.mark.parametrize(
+        "local_rows, real_count, sp_rank, expected_real_rows",
+        [(8, 5, 0, 5), (8, 11, 1, 3), (8, 8, 1, 0), (8, 16, 1, 8), (7, 0, 0, 0)],
+    )
+    def test_masks_in_global_pre_sp_index_space(
+        self, local_rows, real_count, sp_rank, expected_real_rows
+    ):
+        routing_map = self._routing_map(local_rows)
+        original = routing_map.clone()
+
+        mask_routing_padding(
+            routing_map, self._real_token_count(real_count), sequence_parallel_rank=sp_rank
+        )
+
+        torch.testing.assert_close(
+            routing_map[:expected_real_rows], original[:expected_real_rows], atol=0, rtol=0
+        )
+        assert torch.all(routing_map[expected_real_rows:] == -1)
+
+    def test_cuda_graph_replay_reads_updated_boundary(self):
+        """A captured mask reads the scalar value, rather than capturing its value."""
+        routing_map = self._routing_map(8)
+        real_count = self._real_token_count(8)
+        graph = torch.cuda.CUDAGraph()
+
+        with torch.cuda.graph(graph):
+            mask_routing_padding(routing_map, real_count)
+
+        routing_map.fill_(3)
+        real_count.fill_(3)
+        graph.replay()
+
+        assert torch.all(routing_map[:3] == 3)
+        assert torch.all(routing_map[3:] == -1)

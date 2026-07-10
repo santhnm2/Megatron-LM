@@ -1,9 +1,11 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest import mock
+
 import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -211,6 +213,27 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
+
+    def test_moe_layer_keeps_mtp_identity(self):
+        """Hybrid E layers must pass the MTP identity through to TransformerLayer."""
+        config = TransformerConfig(
+            hidden_size=32, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+        )
+
+        with mock.patch(
+            "megatron.core.models.hybrid.hybrid_block.build_module",
+            return_value=torch.nn.Identity(),
+        ) as build_module:
+            HybridStack(
+                config=config,
+                submodules=HybridStackSubmodules(),
+                layer_type_list=[Symbols.MOE],
+                post_layer_norm=False,
+                pg_collection=self.get_pg_collection(),
+                is_mtp_layer=True,
+            )
+
+        assert build_module.call_args.kwargs["is_mtp_layer"] is True
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'

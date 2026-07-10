@@ -43,6 +43,8 @@ class ContextGPUView:
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
         req_4byte_bytes = max_requests * 4
+        # Fixed-address scalar consumed by the inference MoE routing mask.
+        real_token_count_bytes = 4
 
         # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
         # (only one is active per step, so sharing storage is fine).
@@ -74,6 +76,7 @@ class ContextGPUView:
             3 * tok_int64_bytes
             + 3 * tok_int32_bytes
             + 7 * req_4byte_bytes
+            + real_token_count_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
             + mha_kv_seq_lengths_bytes
@@ -162,6 +165,11 @@ class ContextGPUView:
             torch.int32
         )
         off += req_4byte_bytes
+
+        # Number of semantic (unpadded) tokens before sequence-parallel sharding.
+        # The value changes each step, while this view's address remains graph-safe.
+        self.real_token_count = self._buf[off : off + real_token_count_bytes].view(torch.int32)
+        off += real_token_count_bytes
 
         # MHA flash-attention metadata (shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata — only one is active per step).

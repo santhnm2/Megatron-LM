@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -33,13 +34,15 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.utils import InferenceMode, set_moe_metadata_sync
 from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
@@ -47,6 +50,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionBlockSubmodules,
@@ -1107,6 +1112,171 @@ class TestMTPCudaGraphExpertParallel:
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)
         assert logits.shape == (tp_size, 1, self.VOCAB_SIZE)
+
+
+# --------------------------------------------------------------------------- #
+#  TestMTPEagerTensorSequenceExpertParallel (TP = 2, SP, EP = 4)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.internal
+class TestMTPEagerTensorSequenceExpertParallel:
+    """Regression test for decoder-to-MTP metadata transitions with TP+SP+EP."""
+
+    TP_SIZE = 2
+    EP_SIZE = 4
+    HIDDEN_SIZE = 32
+    VOCAB_SIZE = 128
+    MAX_SEQ_LEN = 64
+    NUM_EXPERTS = 8
+
+    @classmethod
+    def setup_class(cls):
+        if Utils.world_size < cls.EP_SIZE:
+            pytest.skip(f"Test requires {cls.EP_SIZE} GPUs")
+        if Utils.world_size % cls.EP_SIZE != 0:
+            pytest.skip(f"world_size={Utils.world_size} must be divisible by EP={cls.EP_SIZE}")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=cls.TP_SIZE,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=cls.EP_SIZE,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+    @torch.inference_mode()
+    def test_eager_mtp_refreshes_decoder_metadata_and_masks_sp_padding(self):
+        """The MTP MoE epoch must replace decoder metadata before routing."""
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=self.HIDDEN_SIZE,
+            ffn_hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=self.TP_SIZE,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=self.EP_SIZE,
+            expert_tensor_parallel_size=1,
+            num_moe_experts=self.NUM_EXPERTS,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            activation_func=squared_relu,
+            add_bias_linear=False,
+            normalization="RMSNorm",
+            sequence_parallel=True,
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=True,
+            transformer_impl="inference_optimized",
+            inference_moe_token_dispatcher_type="nvls",
+            inference_grouped_gemm_backend="torch",
+            cuda_graph_impl="local",
+        )
+        # Populated by training args in production; the base config used by
+        # this focused unit test does not declare the compatibility switch.
+        config.moe_use_legacy_grouped_gemm = False
+        block_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=False)
+        for layer_spec in block_spec.layer_specs:
+            layer_spec.submodules.mlp = get_inference_optimized_moe_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=block_spec, use_transformer_engine=True
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=block_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            mtp_block_spec=mtp_block_spec,
+        ).cuda()
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        model.eval()
+
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.MAX_SEQ_LEN,
+                max_requests=8,
+                max_tokens=64,
+                buffer_size_gb=0.25,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+                num_speculative_tokens=2,
+                num_cuda_graphs=0,
+                sampling_backend="torch",
+            ),
+        )
+        set_moe_metadata_sync(model)
+
+        moe_layers = [module for module in model.modules() if isinstance(module, MoELayer)]
+        decoder_leader = next(
+            layer
+            for layer in moe_layers
+            if not layer.is_mtp_layer and layer._inference_token_dispatcher._runs_metadata_sync
+        )
+        mtp_leader = next(
+            layer
+            for layer in moe_layers
+            if layer.is_mtp_layer and layer._inference_token_dispatcher._runs_metadata_sync
+        )
+
+        # Seed the shared buffers with a decoder-shaped epoch that is larger
+        # than the request-shaped MTP epoch below.
+        decoder_local_tokens = 8
+        context.gpu_view.real_token_count.fill_(decoder_local_tokens * self.TP_SIZE)
+        decoder_hidden = torch.randn(
+            decoder_local_tokens, 1, self.HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+        )
+        assert isinstance(decoder_leader.router, InferenceTopKRouter)
+        with InferenceMode.active():
+            decoder_probs, decoder_routing = decoder_leader.route(decoder_hidden)
+            assert decoder_probs.shape[1] == config.moe_router_topk
+            assert decoder_routing.shape[1] == config.moe_router_topk
+            decoder_leader(decoder_hidden)
+
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        decoder_valid_tokens = (
+            decoder_local_tokens * decoder_leader._inference_token_dispatcher.ep_size
+        )
+        assert NVLSAllGatherVDispatcher._step_metadata[0].item() == decoder_valid_tokens
+
+        # Five requests require one SP alignment row: global 5 -> padded 6 ->
+        # three local transport rows. The controller changes the semantic bound
+        # to 5 before this forward; the MTP leader changes transport metadata to
+        # 3/rank. Calling the MTP MoE directly keeps the test focused on the
+        # decoder-to-MTP dispatcher boundary and avoids unrelated attention.
+        active_request_count = 5
+        padded_count = 6
+        NVLSAllGatherVDispatcher.set_mtp_real_token_count(active_request_count)
+        mtp_hidden = torch.randn(
+            padded_count // self.TP_SIZE, 1, self.HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+        )
+        with InferenceMode.active():
+            mtp_output, _ = mtp_leader(mtp_hidden)
+
+        mtp_local_tokens = padded_count // self.TP_SIZE
+        mtp_valid_tokens = mtp_local_tokens * mtp_leader._inference_token_dispatcher.ep_size
+        assert NVLSAllGatherVDispatcher._step_metadata[0].item() == mtp_valid_tokens
+        assert NVLSAllGatherVDispatcher._real_token_count_tensor.item() == active_request_count
+        assert torch.all(torch.isfinite(mtp_output))
 
 
 # --------------------------------------------------------------------------- #

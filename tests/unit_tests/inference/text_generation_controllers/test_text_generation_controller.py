@@ -1772,7 +1772,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             return_value=torch.tensor([101, 201], device='cuda')
         )
 
-        self.text_generation_controller._compute_serial_mtp_and_sample()
+        # Exercise the NVLS boundary: main decoder metadata is token-shaped,
+        # while serial MTP routing is request-shaped.
+        ctx._nvls_dispatcher = True
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers."
+            "text_generation_controller.NVLSAllGatherVDispatcher.set_mtp_real_token_count"
+        ) as set_mtp_real_token_count:
+            self.text_generation_controller._compute_serial_mtp_and_sample()
+
+        set_mtp_real_token_count.assert_called_once_with(2)
 
         # The base_position for Req 0 should be 10 + 3 = 13
         # The base_position for Req 1 should be 0 + 15 = 15

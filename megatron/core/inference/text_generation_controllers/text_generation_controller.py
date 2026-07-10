@@ -42,6 +42,7 @@ from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
     accepts_parameter,
@@ -962,6 +963,14 @@ class TextGenerationController:
         position_ids_buf[0, active_request_count:] = 0
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
+
+        # The decoder publishes a token-shaped semantic bound. Serial MTP is
+        # request-shaped, so move the bound before the MTP router runs. The
+        # padded transport extent remains padded_count and is synchronized by
+        # the first MTP MoE dispatcher.
+        if context._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_mtp_real_token_count(active_request_count)
+
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 

@@ -259,8 +259,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             "Only pass `model_config` and `inference_config`"
         ),
     )
-    def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
+    def __init__(
+        self,
+        model_config: TransformerConfig,
+        inference_config: InferenceConfig,
+        layer_map: Optional[Dict[int, int]] = None,
+    ):
         super().__init__(inference_config=inference_config)
+
+        # When `layer_map` is provided, this is the nested MTP KV cache context (a
+        # pared-down, pure-attention `DynamicInferenceContext` spanning only the MTP
+        # attention layer(s)). It must not recursively build its own MTP child.
+        self.is_mtp_child = layer_map is not None
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -349,7 +359,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
-        if self.is_hybrid_model:
+        if layer_map is not None:
+            # Explicit layer_map override (nested MTP KV cache context). Bypass the
+            # hybrid/identity derivation and treat this as a pure-attention context
+            # spanning exactly the layers named in `layer_map`. Keys are global
+            # `layer_number - 1` values; values are indices into `memory_buffer`.
+            assert not self.is_hybrid_model, (
+                "Explicit layer_map is only supported for pure-attention contexts "
+                "(e.g. the MTP KV cache); hybrid models derive their own layer_map."
+            )
+            self.layer_map = layer_map
+            self.num_attention_layers = len(set(layer_map.values()))
+            self.num_mamba_layers = 0
+            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+        elif self.is_hybrid_model:
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
@@ -726,6 +749,79 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
+
+        # Nested MTP KV cache context. Built only for the top-level context when
+        # enabled; the child sets `layer_map` and therefore never recurses.
+        self.mtp_inference_context: Optional["DynamicInferenceContext"] = None
+        if not self.is_mtp_child and getattr(inference_config, "enable_mtp_kv_cache", False):
+            self.mtp_inference_context = self._build_mtp_inference_context(
+                model_config, inference_config
+            )
+
+    def _build_mtp_inference_context(
+        self, model_config: TransformerConfig, inference_config: InferenceConfig
+    ) -> "DynamicInferenceContext":
+        """Construct the nested, pared-down MTP KV cache context.
+
+        Reuses `DynamicInferenceContext` configured for the single repeated MTP
+        attention layer: geometry is shared with the main model, while Mamba, MoE,
+        and prefix caching are stripped and it owns an independent (small) KV pool.
+        Only the repeated-layer, attention-based MTP configuration is supported in v1.
+
+        Args:
+            model_config (TransformerConfig): The main model's config.
+            inference_config (InferenceConfig): The main inference config.
+
+        Returns:
+            DynamicInferenceContext: The nested MTP KV cache context.
+        """
+        import copy
+
+        from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
+
+        # v1 scope guards.
+        assert self.num_speculative_tokens > 0, (
+            "enable_mtp_kv_cache requires num_speculative_tokens > 0."
+        )
+        assert getattr(model_config, "mtp_num_layers", None), (
+            "enable_mtp_kv_cache requires an MTP model (mtp_num_layers set)."
+        )
+        assert getattr(model_config, "mtp_use_repeated_layer", False) or (
+            model_config.mtp_num_layers == 1
+        ), (
+            "enable_mtp_kv_cache (v1) supports only the repeated-layer MTP configuration "
+            "(mtp_use_repeated_layer=True, or a single MTP layer). Independent multi-layer "
+            "MTP is not yet supported."
+        )
+
+        # Reduced model config: a single pure-attention layer. Shallow-copy and
+        # override fields directly to avoid re-running the heavy
+        # TransformerConfig.__post_init__ validation on hybrid/MoE base configs.
+        reduced_model_config = copy.copy(model_config)
+        reduced_model_config.num_layers = 1
+        reduced_model_config.num_moe_experts = None
+        reduced_model_config.moe_enable_routing_replay = False
+        reduced_model_config.mtp_num_layers = None
+
+        # Reduced inference config: own small buffer, no Mamba / prefix caching, and
+        # no recursive MTP child. Match the parent's resolved request capacity so
+        # per-request row indices stay aligned under lifecycle forwarding.
+        reduced_inference_config = copy.copy(inference_config)
+        reduced_inference_config.buffer_size_gb = inference_config.mtp_kv_cache_buffer_size_gb
+        reduced_inference_config.paused_buffer_size_gb = None
+        reduced_inference_config.mamba_inference_state_config = None
+        reduced_inference_config.mamba_memory_ratio = None
+        reduced_inference_config.enable_prefix_caching = False
+        reduced_inference_config.enable_mtp_kv_cache = False
+        reduced_inference_config.max_requests = self.max_requests
+
+        # Map the MTP layer's global layer_number -> cache index 0.
+        mtp_layer_number = 1 + get_mtp_layer_offset(model_config, vp_stage=None)
+        layer_map = {mtp_layer_number - 1: 0}
+
+        return DynamicInferenceContext(
+            reduced_model_config, reduced_inference_config, layer_map=layer_map
+        )
 
         # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
         # so it can mask out CUDA-graph padding tokens during routing. The

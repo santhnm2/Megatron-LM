@@ -288,6 +288,25 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
+    enable_mtp_kv_cache: bool = False
+    """Whether to give the MTP (multi-token prediction) draft layer its own independent
+    paged KV cache, so its self-attention can attend to the request's full history
+    (prompt + generated) instead of only the current token. This is a draft
+    acceptance-rate optimization; generated output is unchanged because drafts are
+    always verified.
+
+    v1 supports only the repeated-layer MTP configuration (`mtp_use_repeated_layer=True`,
+    i.e. a single physical MTP attention layer) with attention-based (non-Mamba) MTP
+    layers. Requires `num_speculative_tokens > 0`.
+    """
+
+    mtp_kv_cache_buffer_size_gb: float = 2
+    """GPU memory (in GB) reserved for the MTP KV cache when `enable_mtp_kv_cache` is
+    True. This is an independent buffer from the main model's `buffer_size_gb`; the MTP
+    cache holds a single attention layer, so it is typically much smaller than the main
+    KV cache.
+    """
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 

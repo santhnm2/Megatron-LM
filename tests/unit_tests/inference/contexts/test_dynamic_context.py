@@ -163,6 +163,77 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_ids == -1)
 
     @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_child_context(self):
+        """The nested MTP KV cache context is built for repeated-layer MTP and is an
+        independent, single-attention-layer DynamicInferenceContext."""
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_speculative_tokens=2,
+            enable_mtp_kv_cache=True,
+            mtp_kv_cache_buffer_size_gb=0.02,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(
+            model_config=model_config, inference_config=inference_config
+        )
+
+        child = ctx.mtp_inference_context
+        assert child is not None
+        assert child.is_mtp_child
+        assert child.mtp_inference_context is None, "child must not recurse"
+        assert child.num_attention_layers == 1
+        assert child.num_mamba_layers == 0
+        # MTP layer global layer_number is 1 for PP=1, so layer_map is {0: 0}.
+        assert child.layer_map == {0: 0}
+        # Independent pool: distinct allocator, single-layer memory buffer.
+        assert child.kv_block_allocator is not ctx.kv_block_allocator
+        assert child.memory_buffer.shape[1] == 1
+        # Matches parent request capacity so per-request row indices stay aligned.
+        assert child.max_requests == ctx.max_requests
+        # Parent itself is not a child.
+        assert not ctx.is_mtp_child
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_rejects_independent_layers(self):
+        """v1 supports only repeated-layer MTP; independent multi-layer must raise."""
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=False,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            num_speculative_tokens=2,
+            enable_mtp_kv_cache=True,
+            mtp_kv_cache_buffer_size_gb=0.02,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+        )
+        with pytest.raises(AssertionError, match="repeated-layer"):
+            DynamicInferenceContext(
+                model_config=model_config, inference_config=inference_config
+            )
+
+    @pytest.mark.internal
     def test_is_static_batching(self):
 
         dynamic_context = self._get_dynamic_context(

@@ -164,6 +164,14 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
+    enable_mtp_kv_cache: bool = False
+    """Give the MTP draft module its own paged KV cache so it attends over each request's full
+    history (repeated-layer, attention-based MTP only). Purely an acceptance-rate optimization;
+    generated tokens are unchanged."""
+
+    mtp_kv_cache_buffer_size_gb: float = 2
+    """GPU memory (GB) reserved for the MTP KV cache when `enable_mtp_kv_cache` is set."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -365,6 +373,8 @@ class InferenceSetupConfig:
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
+            enable_mtp_kv_cache=self.enable_mtp_kv_cache,
+            mtp_kv_cache_buffer_size_gb=self.mtp_kv_cache_buffer_size_gb,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,

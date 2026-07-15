@@ -861,6 +861,48 @@ class TextGenerationController:
 
         return blocks_to_release, remove_mask
 
+    def _rewind_mtp_kv_cache(self) -> None:
+        """Rewind the MTP KV cache child in lockstep with the main rewind.
+
+        The child appended ``D + 1`` draft tokens (base + all D speculative tokens)
+        in the previous step's MTP loop; this step's verification accepted ``a`` of
+        them. Trim the ``D - a`` rejected tokens with the same rewind kernel,
+        accepted counts, and ``num_speculative_tokens`` as the main context so the
+        child stays at ``mtp_len == main_len - 1``. A request being prefilled this
+        step has child ``prefill_status == 1`` (no prior draft), so it is skipped.
+
+        Driven only on the eager path in v1 (mirrors the append guard).
+        """
+        context = self.inference_wrapped_model.inference_context
+        child = context.mtp_inference_context
+        if child is None or context.using_cuda_graph_this_step():
+            return
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count == 0:
+            return
+
+        active_slice = slice(child.paused_request_count, child.total_request_count)
+        accepted_counts_cpu = self._accepted_token_counts_per_request[:active_request_count].cpu()
+
+        blocks_to_release, remove_mask = rewind_kv_cache(
+            accepted_counts=accepted_counts_cpu,
+            prefill_status=child.request_in_prefill_status_tensor[active_slice],
+            last_kv_block_offset=child.request_last_kv_block_offset[active_slice],
+            kv_length_offsets=child.request_kv_length_offsets[active_slice],
+            kv_block_counts=child.request_kv_block_counts[active_slice],
+            last_kv_block_id=child.request_last_kv_block_id[active_slice],
+            kv_block_ids=child.request_to_kv_block_ids[active_slice],
+            num_speculative_tokens=self.num_speculative_tokens,
+            block_size_tokens=child.block_size_tokens,
+            num_active_requests=active_request_count,
+        )
+
+        # Release the child's rejected blocks back to its own pool.
+        to_release = blocks_to_release[remove_mask]
+        if to_release.numel() > 0:
+            child.kv_block_allocator.release_memory_blocks(to_release)
+
     def _sample_from_logits_2d(self, logits_2d: Tensor) -> Tensor:
         """Sample tokens from 2D logits using existing sampling parameters.
 
@@ -876,6 +918,106 @@ class TextGenerationController:
             self.inference_wrapped_model.inference_context,
             eager=True,
         )
+
+    def _mtp_prefill_prompt(self, context, child, unwrapped_model):
+        """Seed the MTP KV cache with prefill requests' prompts (roll-by-one).
+
+        Runs the repeated MTP layer over each prefill request's prompt positions
+        ``0..L-2``: position ``i`` consumes the main decoder hidden ``h_i`` (from
+        ``context.mtp_decoder_hidden_states``) and embeds prompt token ``i+1``,
+        appending one K/V per position to the child cache. This leaves each
+        request's child KV length at ``L-1`` (== main_len - 1); the decode draft
+        loop then appends position ``L-1`` at depth 0.
+
+        v1 handles single-chunk prompts (the whole prompt processed in one step).
+        Chunked prefill needs a cross-step boundary-hidden carryover (the last
+        position of a chunk embeds the first token of the next chunk, whose main
+        decoder hidden is overwritten each step); until that is implemented, fail
+        loudly rather than seed a KV cache that is missing chunk-boundary tokens.
+        """
+        if context.chunked_prefill_request_id != -1:
+            raise NotImplementedError(
+                "enable_mtp_kv_cache does not yet support chunked prefill "
+                "(prompts split across steps). Increase the token budget so prompts "
+                "prefill in a single step, or disable the MTP KV cache."
+            )
+
+        hidden = context.mtp_decoder_hidden_states  # [active_token_count, 1, H], packed
+        # Under sequence parallelism the decoder output is scattered [S/TP, 1, H];
+        # gather it so per-request prompt positions index into the full sequence.
+        # (block-scope CUDA graphs are not driven with the MTP cache in v1.)
+        if self._sp_enabled:
+            hidden = gather_from_sequence_parallel_region(
+                hidden, group=self.inference_wrapped_model.tp_group
+            )
+        active_token_count = context.active_token_count
+        token_request_idx = context.token_to_request_idx[:active_token_count]
+        input_ids = context.token_to_input_ids[:active_token_count]
+
+        row_start = context.paused_request_count + context.num_decode_requests
+        n_prefill = context.num_prefill_requests
+
+        # The final chunk of a multi-chunk prompt (and prefix-cache skips) present a
+        # nonzero main KV offset; the single-chunk child prefill would misplace the
+        # prompt. Fail loudly until the carryover path exists.
+        main_kv_offsets = context.request_kv_length_offsets
+        if int(main_kv_offsets[row_start : row_start + n_prefill].max().item()) > 0:
+            raise NotImplementedError(
+                "enable_mtp_kv_cache does not yet support chunked prefill or prefix "
+                "reuse (prefill requests with a nonzero KV offset). Prefill prompts in "
+                "a single step without prefix caching, or disable the MTP KV cache."
+            )
+
+        hid_chunks, tok_chunks, append_counts = [], [], []
+        for j in range(n_prefill):
+            row = row_start + j
+            idxs = (token_request_idx == row).nonzero(as_tuple=True)[0]
+            length = idxs.numel()
+            # Roll-by-one drops the last prompt position (handled by decode depth 0);
+            # a 1-token prompt contributes nothing to the prompt prefill.
+            count = max(int(length) - 1, 0)
+            append_counts.append(count)
+            if count == 0:
+                continue
+            keep = idxs[:count]  # positions 0..L-2
+            hid_chunks.append(hidden[keep])  # h_0..h_{L-2}
+            tok_chunks.append(input_ids[idxs[1:length]])  # tokens 1..L-1
+
+        append_counts = torch.tensor(append_counts, dtype=torch.int64, device='cpu')
+        if int(append_counts.sum().item()) == 0:
+            return
+
+        total = child._mtp_prefill_step(row_start, append_counts)
+        child.transfer_bookkeeping_to_gpu()
+
+        cuda = torch.cuda.current_device()
+        packed_hidden = torch.cat(hid_chunks, dim=0)  # [total, 1, H]
+        packed_tokens = torch.cat(tok_chunks).to(cuda)  # [total]
+        packed_positions = child.token_to_pos_ids[:total].to(cuda, torch.int64)  # [total]
+
+        # Pad to the child's tp-aligned token count so the MTP forward matches the
+        # child's attention metadata (and the SP scatter has a divisible length).
+        padded = child.padded_active_token_count
+        pad = padded - total
+        if pad > 0:
+            packed_hidden = F.pad(packed_hidden, (0, 0, 0, 0, 0, pad))
+            packed_tokens = F.pad(packed_tokens, (0, pad))
+            packed_positions = F.pad(packed_positions, (0, pad))
+        # The embedding scatters decoder_input under SP, so the hidden it is
+        # concatenated with must be scattered to match (mirrors the decode loop).
+        if self._sp_enabled:
+            packed_hidden = scatter_to_sequence_parallel_region(
+                packed_hidden, group=self.inference_wrapped_model.tp_group
+            )
+
+        unwrapped_model.mtp.layers[0].forward_single_position(
+            hidden_states=packed_hidden,
+            next_token_ids=packed_tokens.unsqueeze(0),
+            position_ids=packed_positions.unsqueeze(0),
+            embedding=unwrapped_model.embedding,
+            inference_context=child,
+        )
+        child._mtp_finalize_prefill_step(row_start, append_counts)
 
     def _compute_serial_mtp_and_sample(self):
         """Compute MTP logits serially after verification and sample speculative tokens.
@@ -982,6 +1124,22 @@ class TextGenerationController:
         if context._nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
 
+        # Dedicated MTP KV cache: when enabled, the MTP self-attention reads and
+        # appends to its own paged cache so the draft attends over each request's
+        # full history. Driven only on the eager path in v1; CUDA-graph capture of
+        # the MTP KV cache append is handled in a later phase.
+        mtp_kv_context = None
+        if (
+            has_mtp
+            and context.mtp_inference_context is not None
+            and not context.using_cuda_graph_this_step()
+        ):
+            mtp_kv_context = context.mtp_inference_context
+            # Seed the child KV cache with each prefill request's prompt (roll-by-one)
+            # before the decode draft loop, so the draft attends over full history.
+            if context.num_prefill_requests > 0:
+                self._mtp_prefill_prompt(context, mtp_kv_context, unwrapped_model)
+
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
@@ -992,11 +1150,22 @@ class TextGenerationController:
             if has_mtp:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                # Prepare the child's single-token decode append for this depth.
+                # Only pass the child on the eager cache path; passing it (even as
+                # None) on the CUDA-graph path would add a kwarg the captured graph
+                # never saw and fail the replay argument check.
+                if mtp_kv_context is not None:
+                    mtp_kv_context._mtp_decode_step(advance_previous=depth > 0)
+                    mtp_kv_context.transfer_bookkeeping_to_gpu()
+                    mtp_ctx_kwargs = {"mtp_inference_context": mtp_kv_context}
+                else:
+                    mtp_ctx_kwargs = {}
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
                     position_ids=position_ids_buf,
                     depth=mtp_depth,
+                    **mtp_ctx_kwargs,
                     eager=not context.using_cuda_graph_this_step(),
                     cache_key=(
                         ("mtp", padded_count, mtp_depth)
@@ -1033,6 +1202,26 @@ class TextGenerationController:
             # Use sampled token as input for the next depth.
             next_token_ids = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
+
+        # Append the final speculative token (spec[D-1]) to the child so it holds
+        # all D+1 tokens the main model forwards next step (base + spec[0..D-1]),
+        # matching the main KV growth. Without this the child is one token short at
+        # full acceptance, breaking the mtp_len == main_len - 1 invariant. This
+        # forward only appends K/V; its logits feed no further depth.
+        if mtp_kv_context is not None:
+            mtp_kv_context._mtp_decode_step(advance_previous=True)
+            mtp_kv_context.transfer_bookkeeping_to_gpu()
+            token_ids_buf[0, :active_request_count] = next_token_ids
+            position_ids_buf[0, :active_request_count] = base_position + self.num_mtp_depths
+            unwrapped_model.compute_mtp_single_step(
+                hidden_states=current_hidden,
+                next_token_ids=token_ids_buf,
+                position_ids=position_ids_buf,
+                depth=None if unwrapped_model.mtp.mtp_use_repeated_layer else self.num_mtp_depths - 1,
+                mtp_inference_context=mtp_kv_context,
+                eager=True,
+            )
+            mtp_kv_context._mtp_finalize_decode_step()
 
         # In eager mode forward() assigns the hidden states tensor directly to
         # the context attribute; release it so the tensor can be garbage
@@ -1704,11 +1893,23 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
-        for depth in range(self.num_mtp_depths):
+        # When the MTP KV cache is active (eager only), real ranks run one extra
+        # MTP forward after the depth loop to append the final speculative token
+        # (spec[D-1]); the dummy rank must issue a matching forward so the MoE
+        # all-to-all count stays balanced across EP ranks.
+        extra_mtp_forwards = (
+            1
+            if context.mtp_inference_context is not None
+            and not context.using_cuda_graph_this_step()
+            else 0
+        )
+
+        for depth in range(self.num_mtp_depths + extra_mtp_forwards):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
-                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                real_depth = min(depth, self.num_mtp_depths - 1)
+                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else real_depth
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
@@ -1934,6 +2135,9 @@ class TextGenerationController:
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
+                # Rewind the MTP KV cache child in lockstep (trims the rejected
+                # draft tokens it appended last step).
+                self._rewind_mtp_kv_cache()
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs

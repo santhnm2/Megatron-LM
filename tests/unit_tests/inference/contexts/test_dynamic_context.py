@@ -233,6 +233,322 @@ class TestDynamicContext:
                 model_config=model_config, inference_config=inference_config
             )
 
+    def _get_mtp_dynamic_context(
+        self,
+        *,
+        num_speculative_tokens=2,
+        block_size_tokens=128,
+        buffer_size_gb=0.03,
+        mtp_kv_cache_buffer_size_gb=0.02,
+        max_sequence_length=512,
+        max_tokens=None,
+        enable_chunked_prefill=False,
+        max_requests=None,
+    ):
+        """Build a repeated-layer MTP context with the nested KV cache enabled."""
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
+            block_size_tokens=block_size_tokens,
+            max_tokens=max_tokens,
+            num_speculative_tokens=num_speculative_tokens,
+            enable_mtp_kv_cache=True,
+            mtp_kv_cache_buffer_size_gb=mtp_kv_cache_buffer_size_gb,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_requests=max_requests,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+        )
+        return DynamicInferenceContext(
+            model_config=model_config, inference_config=inference_config
+        )
+
+    def _add_prompt_request(self, ctx, request_id, prompt_length, prefill_chunk_length=None):
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, prompt_length, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=8),
+            ),
+            prefill_chunk_length=prefill_chunk_length,
+        )
+
+    def _assert_mtp_child_aligned(self, ctx):
+        """The child mirrors the parent's row layout and request/pause counts."""
+        child = ctx.mtp_inference_context
+        assert child.total_request_count == ctx.total_request_count
+        assert child.paused_request_count == ctx.paused_request_count
+        high = ctx.total_request_count
+        assert (
+            child.request_ids[:high].tolist() == ctx.request_ids[:high].tolist()
+        ), "MTP child request rows diverged from parent"
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_add_request_mirrors_child(self):
+        """add_request establishes a matching child row (lazy KV blocks) while
+        keeping per-request row indices aligned with the parent."""
+        ctx = self._get_mtp_dynamic_context()
+        child = ctx.mtp_inference_context
+
+        # Rows are established without allocating KV blocks (allocated lazily on
+        # the first MTP append), so the child's independent pool is untouched here.
+        child_blocks_before = child.kv_block_allocator.total_avail
+        for i, rid in enumerate([10, 11, 12, 13]):
+            self._add_prompt_request(ctx, rid, prompt_length=5 + i)
+            assert ctx.total_request_count == i + 1
+            self._assert_mtp_child_aligned(ctx)
+            # The child row records the request and starts with zero KV length.
+            assert child.request_ids[i] == rid
+            assert child.request_kv_length_offsets[i] == 0
+            assert child.request_kv_block_counts[i] == 0
+
+        assert child.kv_block_allocator.total_avail == child_blocks_before
+        assert child.kv_block_allocator is not ctx.kv_block_allocator
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_update_requests_realigns_child(self):
+        """After update_requests finishes/compacts requests, the child realigns to
+        the parent's surviving-request order and releases dropped rows' blocks."""
+        ctx = self._get_mtp_dynamic_context()
+        child = ctx.mtp_inference_context
+
+        for rid in [10, 11, 12, 13]:
+            self._add_prompt_request(ctx, rid, prompt_length=6)
+        # Give the child real KV blocks (one decode append) so that dropping a
+        # request must release blocks.
+        child._mtp_decode_step(advance_previous=False)
+        child._mtp_finalize_decode_step()
+        self._assert_mtp_child_aligned(ctx)
+        child_avail_before = child.kv_block_allocator.total_avail
+        assert child.request_kv_block_counts[:4].tolist() == [1, 1, 1, 1]
+
+        # Finish requests 11 and 13 (rows 1 and 3); keep 10 and 12.
+        active_requests_mask = torch.tensor([1, 0, 1, 0], device='cpu').int()
+        new_tokens = torch.tensor([100, 101, 102, 103], device='cpu').int()
+        new_speculative_tokens = torch.zeros(
+            (ctx.num_speculative_tokens, 4), dtype=torch.int32, device='cpu'
+        )
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        assert ctx.total_request_count == 2
+        # Survivors 10 and 12 compacted to rows [0, 1] in both contexts.
+        assert ctx.request_ids[:2].tolist() == [10, 12]
+        self._assert_mtp_child_aligned(ctx)
+        # The child released the two finished requests' KV blocks.
+        assert child.kv_block_allocator.total_avail > child_avail_before
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_reset_forwards_to_child(self):
+        """reset() releases and zeroes the child in lockstep with the parent."""
+        ctx = self._get_mtp_dynamic_context()
+        child = ctx.mtp_inference_context
+
+        child_avail_initial = child.kv_block_allocator.total_avail
+        for rid in [10, 11, 12]:
+            self._add_prompt_request(ctx, rid, prompt_length=5)
+        # One decode append allocates real child KV blocks.
+        child._mtp_decode_step(advance_previous=False)
+        child._mtp_finalize_decode_step()
+        assert child.total_request_count == 3
+        assert child.kv_block_allocator.total_avail < child_avail_initial
+
+        ctx.reset()
+
+        assert ctx.total_request_count == 0
+        assert child.total_request_count == 0
+        assert child.paused_request_count == 0
+        assert torch.all(child.request_ids == -1)
+        # All child blocks returned to the pool.
+        assert child.kv_block_allocator.total_avail == child_avail_initial
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_decode_step_grows_cache(self):
+        """_mtp_decode_step (stripped update_requests) appends one token per active
+        request per depth: KV length grows, blocks allocate lazily, rows stay put."""
+        ctx = self._get_mtp_dynamic_context(num_speculative_tokens=3, block_size_tokens=16)
+        child = ctx.mtp_inference_context
+
+        for rid in [10, 11]:
+            self._add_prompt_request(ctx, rid, prompt_length=4)
+        assert child.request_kv_length_offsets[:2].tolist() == [0, 0]
+        assert child.request_kv_block_counts[:2].tolist() == [0, 0]
+
+        num_depths = ctx.num_speculative_tokens
+        for depth in range(num_depths):
+            active = child._mtp_decode_step(advance_previous=depth > 0)
+            assert active == 2
+            # Append slot for this depth == prior appends (== depth).
+            assert child.request_kv_length_offsets[:2].tolist() == [depth, depth]
+            # One query token per active request.
+            assert child.request_query_lengths[:2].tolist() == [1, 1]
+            assert child.num_decode_requests == 2
+            assert child.active_token_count == 2
+            # Blocks allocated lazily on first append only (fits one 16-token block).
+            assert child.request_kv_block_counts[:2].tolist() == [1, 1]
+        child._mtp_finalize_decode_step()
+
+        # After D depths each request has appended D tokens.
+        assert child.request_kv_length_offsets[:2].tolist() == [num_depths, num_depths]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_prompt_prefill_bookkeeping(self):
+        """_mtp_prefill_step appends prompt_len-1 roll-by-one positions per prefill
+        request, establishing mtp_len == main_len - 1, and decode continues from it."""
+        ctx = self._get_mtp_dynamic_context(num_speculative_tokens=2, block_size_tokens=16)
+        child = ctx.mtp_inference_context
+
+        prompt_lengths = [8, 5]
+        for rid, L in zip([10, 11], prompt_lengths):
+            self._add_prompt_request(ctx, rid, prompt_length=L)
+
+        # Roll-by-one: each request prefills L-1 positions.
+        append_counts = torch.tensor([L - 1 for L in prompt_lengths], dtype=torch.int64)
+        total = child._mtp_prefill_step(row_start=0, append_counts=append_counts)
+        assert total == sum(L - 1 for L in prompt_lengths)
+        assert child.num_prefill_requests == 2
+        assert child.request_query_lengths[:2].tolist() == [7, 4]
+        # Packed token bookkeeping: request 0 (7 tokens) then request 1 (4 tokens).
+        assert child.token_to_request_idx[:7].tolist() == [0] * 7
+        assert child.token_to_request_idx[7:11].tolist() == [1] * 4
+        # Each request's prefill positions are 0..L-2.
+        assert child.token_to_pos_ids[:7].tolist() == list(range(7))
+        assert child.token_to_pos_ids[7:11].tolist() == list(range(4))
+        # Blocks allocated to cover the prefill (16-token blocks).
+        assert child.request_kv_block_counts[:2].tolist() == [1, 1]
+
+        child._mtp_finalize_prefill_step(row_start=0, append_counts=append_counts)
+        # Invariant established: child KV length == prompt_len - 1.
+        assert child.request_kv_length_offsets[:2].tolist() == [7, 4]
+
+        # Decode depth 0 continues from L-1 (no advance on first depth).
+        child._mtp_decode_step(advance_previous=False)
+        assert child.request_kv_length_offsets[:2].tolist() == [7, 4]
+        assert child.token_to_pos_ids[:2].tolist() == [7, 4]
+        child._mtp_finalize_decode_step()
+        assert child.request_kv_length_offsets[:2].tolist() == [8, 5]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("accepted", [0, 1, 2])
+    def test_mtp_kv_cache_rewind_cycle(self, accepted):
+        """One draft step appends D+1 child tokens (base + all D spec); rewinding
+        D-accepted leaves the committed length at start + accepted + 1, matching the
+        main context's accepted growth. Full acceptance (accepted==D) rewinds none."""
+        from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
+            rewind_kv_cache,
+        )
+
+        D = 2
+        ctx = self._get_mtp_dynamic_context(num_speculative_tokens=D, block_size_tokens=4)
+        child = ctx.mtp_inference_context
+
+        # Prefill a prompt of length 6 -> child at L-1 = 5.
+        self._add_prompt_request(ctx, 10, prompt_length=6)
+        child._mtp_prefill_step(0, torch.tensor([5], dtype=torch.int64))
+        child._mtp_finalize_prefill_step(0, torch.tensor([5], dtype=torch.int64))
+        assert child.request_kv_length_offsets[0].item() == 5
+
+        avail_after_prefill = child.kv_block_allocator.total_avail
+
+        # Draft step: append D+1 tokens (base + spec[0..D-1]).
+        for depth in range(D):
+            child._mtp_decode_step(advance_previous=depth > 0)
+        child._mtp_decode_step(advance_previous=True)  # extra append for spec[D-1]
+        child._mtp_finalize_decode_step()
+        assert child.request_kv_length_offsets[0].item() == 5 + (D + 1)  # 8
+
+        # Rewind the rejected drafts (num_to_rewind = D - accepted).
+        active = slice(0, 1)
+        accepted_counts = torch.tensor([accepted], dtype=torch.int64)
+        blocks_to_release, remove_mask = rewind_kv_cache(
+            accepted_counts=accepted_counts,
+            prefill_status=child.request_in_prefill_status_tensor[active],
+            last_kv_block_offset=child.request_last_kv_block_offset[active],
+            kv_length_offsets=child.request_kv_length_offsets[active],
+            kv_block_counts=child.request_kv_block_counts[active],
+            last_kv_block_id=child.request_last_kv_block_id[active],
+            kv_block_ids=child.request_to_kv_block_ids[active],
+            num_speculative_tokens=D,
+            block_size_tokens=child.block_size_tokens,
+            num_active_requests=1,
+        )
+        to_release = blocks_to_release[remove_mask]
+        if to_release.numel() > 0:
+            child.kv_block_allocator.release_memory_blocks(to_release)
+
+        # Committed child length == prefill(5) + base(1) + accepted spec.
+        assert child.request_kv_length_offsets[0].item() == 5 + 1 + accepted
+        # Full acceptance keeps every appended token; block usage stays put.
+        if accepted == D:
+            assert to_release.numel() == 0
+        # All draft blocks beyond the committed length are returned.
+        expected_blocks = (5 + 1 + accepted + child.block_size_tokens - 1) // child.block_size_tokens
+        assert child.request_kv_block_counts[0].item() == expected_blocks
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mtp_kv_cache_chunked_prefill_alignment(self):
+        """A prompt split across prefill chunks keeps the child's chunked row
+        aligned with the parent across the hide/re-adopt cycle."""
+        ctx = self._get_mtp_dynamic_context(
+            block_size_tokens=16, enable_chunked_prefill=True
+        )
+        child = ctx.mtp_inference_context
+
+        # A background request so the chunked request is not the only row.
+        self._add_prompt_request(ctx, 10, prompt_length=6)
+
+        # Chunk 1 of request 11: add a partial prefill and mark it chunked,
+        # mimicking the engine's schedule_chunked_prefill.
+        req = DynamicInferenceRequest(
+            request_id=11,
+            prompt_tokens=torch.arange(0, 20, dtype=torch.long, device='cpu'),
+            sampling_params=SamplingParams(num_tokens_to_generate=8),
+        )
+        ctx.add_request(req, prefill_chunk_length=10)
+        ctx.chunked_prefill_request_id = 11
+        self._assert_mtp_child_aligned(ctx)
+
+        # Advance the request as the engine does between chunks.
+        req.prompt_tokens = req.prompt_tokens  # unchanged
+        req_remaining = req.remaining_prompt_tokens[10:]
+        req.finished_chunk_token_count += 10
+
+        # Decode/bookkeep step: the chunked request is hidden at total_request_count.
+        active_requests_mask = torch.tensor([1, 1], device='cpu').int()
+        new_tokens = torch.tensor([100, 101], device='cpu').int()
+        new_speculative_tokens = torch.zeros(
+            (ctx.num_speculative_tokens, 2), dtype=torch.int32, device='cpu'
+        )
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # The chunked request (11) is hidden just past total_request_count in both.
+        chunked_idx = ctx.get_index_of_chunked_prefill_request(safe=False)
+        assert chunked_idx == ctx.total_request_count
+        assert child.request_ids[chunked_idx] == ctx.request_ids[chunked_idx] == 11
+        assert child.total_request_count == ctx.total_request_count
+
     @pytest.mark.internal
     def test_is_static_batching(self):
 

@@ -352,6 +352,7 @@ class LanguageModule(MegatronModule):
         next_token_ids: Tensor,
         position_ids: Tensor,
         depth: Optional[int] = None,
+        mtp_inference_context=None,
         eager: bool = False,
         cache_key=None,
     ) -> tuple:
@@ -367,6 +368,9 @@ class LanguageModule(MegatronModule):
             depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
                 False (each depth uses a distinct layer). Omit for repeated-layer models so that a
                 single CUDA graph can serve all depths.
+            mtp_inference_context (optional): Dedicated MTP KV cache context. When provided, the MTP
+                self-attention reads and appends to it (attending over each request's full history);
+                ``None`` keeps the legacy KV-cache-free path.
             eager, cache_key: The `CudaGraphManager` works by monkey-patching this argument onto the
                 function signature. Explictly including them removes the need for a monkey-patch,
                 and makes it straightforward to call the same method with and without eager mode.
@@ -383,6 +387,7 @@ class LanguageModule(MegatronModule):
             next_token_ids=next_token_ids,
             position_ids=position_ids,
             embedding=self.embedding,
+            inference_context=mtp_inference_context,
         )
 
         output_weight = None

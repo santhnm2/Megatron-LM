@@ -1242,6 +1242,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_sin: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        inference_context: Optional[InferenceParams] = None,
     ) -> Tensor:
         """Forward for single positions without roll_tensor (speculative decoding).
 
@@ -1255,6 +1256,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             next_token_ids (Tensor): The correct next token IDs [B, N].
             position_ids (Tensor): Position IDs for the next tokens [B, N].
             embedding (Callable): The embedding module.
+            inference_context (Optional[InferenceParams]): When provided, the inner
+                transformer layer's self-attention reads and appends to this KV
+                cache (the dedicated MTP KV cache context). ``None`` keeps the
+                legacy KV-cache-free MTP path (attends only to the current token).
 
         Returns:
             Tensor: MTP hidden states [N, B, H].
@@ -1272,6 +1277,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            inference_params=inference_context,
         )
         return hidden_states
 

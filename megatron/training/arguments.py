@@ -1927,6 +1927,13 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--enable-mtp-kv-cache', dest='enable_mtp_kv_cache',
+                       action='store_true', default=False,
+                       help='Give the MTP draft module its own paged KV cache so it attends over '
+                            'each request\'s full history (repeated-layer, attention-based MTP '
+                            'only). Acceptance-rate optimization; generated tokens are unchanged.')
+    group.add_argument('--mtp-kv-cache-buffer-size-gb', type=float, default=2,
+                       help='GPU memory (GB) reserved for the MTP KV cache.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,

@@ -751,77 +751,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.initialize_all_tensors()
 
         # Nested MTP KV cache context. Built only for the top-level context when
-        # enabled; the child sets `layer_map` and therefore never recurses.
+        # enabled; the child sets `layer_map` and therefore never recurses. Built
+        # before the NVLS wiring below so the top-level context wins the shared
+        # real-token-count class tensor (the reduced child has no MoE/NVLS).
         self.mtp_inference_context: Optional["DynamicInferenceContext"] = None
         if not self.is_mtp_child and getattr(inference_config, "enable_mtp_kv_cache", False):
             self.mtp_inference_context = self._build_mtp_inference_context(
                 model_config, inference_config
             )
-
-    def _build_mtp_inference_context(
-        self, model_config: TransformerConfig, inference_config: InferenceConfig
-    ) -> "DynamicInferenceContext":
-        """Construct the nested, pared-down MTP KV cache context.
-
-        Reuses `DynamicInferenceContext` configured for the single repeated MTP
-        attention layer: geometry is shared with the main model, while Mamba, MoE,
-        and prefix caching are stripped and it owns an independent (small) KV pool.
-        Only the repeated-layer, attention-based MTP configuration is supported in v1.
-
-        Args:
-            model_config (TransformerConfig): The main model's config.
-            inference_config (InferenceConfig): The main inference config.
-
-        Returns:
-            DynamicInferenceContext: The nested MTP KV cache context.
-        """
-        import copy
-
-        from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
-
-        # v1 scope guards.
-        assert self.num_speculative_tokens > 0, (
-            "enable_mtp_kv_cache requires num_speculative_tokens > 0."
-        )
-        assert getattr(model_config, "mtp_num_layers", None), (
-            "enable_mtp_kv_cache requires an MTP model (mtp_num_layers set)."
-        )
-        assert getattr(model_config, "mtp_use_repeated_layer", False) or (
-            model_config.mtp_num_layers == 1
-        ), (
-            "enable_mtp_kv_cache (v1) supports only the repeated-layer MTP configuration "
-            "(mtp_use_repeated_layer=True, or a single MTP layer). Independent multi-layer "
-            "MTP is not yet supported."
-        )
-
-        # Reduced model config: a single pure-attention layer. Shallow-copy and
-        # override fields directly to avoid re-running the heavy
-        # TransformerConfig.__post_init__ validation on hybrid/MoE base configs.
-        reduced_model_config = copy.copy(model_config)
-        reduced_model_config.num_layers = 1
-        reduced_model_config.num_moe_experts = None
-        reduced_model_config.moe_enable_routing_replay = False
-        reduced_model_config.mtp_num_layers = None
-
-        # Reduced inference config: own small buffer, no Mamba / prefix caching, and
-        # no recursive MTP child. Match the parent's resolved request capacity so
-        # per-request row indices stay aligned under lifecycle forwarding.
-        reduced_inference_config = copy.copy(inference_config)
-        reduced_inference_config.buffer_size_gb = inference_config.mtp_kv_cache_buffer_size_gb
-        reduced_inference_config.paused_buffer_size_gb = None
-        reduced_inference_config.mamba_inference_state_config = None
-        reduced_inference_config.mamba_memory_ratio = None
-        reduced_inference_config.enable_prefix_caching = False
-        reduced_inference_config.enable_mtp_kv_cache = False
-        reduced_inference_config.max_requests = self.max_requests
-
-        # Map the MTP layer's global layer_number -> cache index 0.
-        mtp_layer_number = 1 + get_mtp_layer_offset(model_config, vp_stage=None)
-        layer_map = {mtp_layer_number - 1: 0}
-
-        return DynamicInferenceContext(
-            reduced_model_config, reduced_inference_config, layer_map=layer_map
-        )
 
         # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
         # so it can mask out CUDA-graph padding tokens during routing. The
@@ -914,6 +851,93 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if inference_config._verbose and torch.distributed.get_rank() == 0:
             logging.info("\n".join(log_lines))
+
+    def _build_mtp_inference_context(
+        self, model_config: TransformerConfig, inference_config: InferenceConfig
+    ) -> "DynamicInferenceContext":
+        """Construct the nested, pared-down MTP KV cache context.
+
+        Reuses `DynamicInferenceContext` configured for the single repeated MTP
+        attention layer: geometry is shared with the main model, while Mamba, MoE,
+        and prefix caching are stripped and it owns an independent (small) KV pool.
+        Only the repeated-layer, attention-based MTP configuration is supported in v1.
+
+        Args:
+            model_config (TransformerConfig): The main model's config.
+            inference_config (InferenceConfig): The main inference config.
+
+        Returns:
+            DynamicInferenceContext: The nested MTP KV cache context.
+        """
+        import copy
+
+        from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
+
+        # v1 scope guards.
+        assert self.num_speculative_tokens > 0, (
+            "enable_mtp_kv_cache requires num_speculative_tokens > 0."
+        )
+        assert getattr(model_config, "mtp_num_layers", None), (
+            "enable_mtp_kv_cache requires an MTP model (mtp_num_layers set)."
+        )
+        assert getattr(model_config, "mtp_use_repeated_layer", False) or (
+            model_config.mtp_num_layers == 1
+        ), (
+            "enable_mtp_kv_cache (v1) supports only the repeated-layer MTP configuration "
+            "(mtp_use_repeated_layer=True, or a single MTP layer). Independent multi-layer "
+            "MTP is not yet supported."
+        )
+
+        # Reduced model config: a single pure-attention layer. Shallow-copy and
+        # override fields directly to avoid re-running the heavy
+        # TransformerConfig.__post_init__ validation on hybrid/MoE base configs.
+        reduced_model_config = copy.copy(model_config)
+        reduced_model_config.num_layers = 1
+        reduced_model_config.num_moe_experts = None
+        reduced_model_config.moe_enable_routing_replay = False
+        reduced_model_config.mtp_num_layers = None
+
+        # Reduced inference config: own small buffer, no Mamba / prefix caching, and
+        # no recursive MTP child. Match the parent's resolved request capacity so
+        # per-request row indices stay aligned under lifecycle forwarding.
+        reduced_inference_config = copy.copy(inference_config)
+        reduced_inference_config.buffer_size_gb = inference_config.mtp_kv_cache_buffer_size_gb
+        reduced_inference_config.paused_buffer_size_gb = None
+        reduced_inference_config.mamba_inference_state_config = None
+        reduced_inference_config.mamba_memory_ratio = None
+        reduced_inference_config.enable_prefix_caching = False
+        reduced_inference_config.enable_mtp_kv_cache = False
+        reduced_inference_config.max_requests = self.max_requests
+        # The MTP draft appends exactly one token per depth, so each child forward
+        # is a single-token decode step (no speculative fan-out within the child).
+        reduced_inference_config.num_speculative_tokens = 0
+
+        # Map the MTP layer's global layer_number -> cache index 0.
+        mtp_layer_number = 1 + get_mtp_layer_offset(model_config, vp_stage=None)
+        layer_map = {mtp_layer_number - 1: 0}
+
+        child = DynamicInferenceContext(
+            reduced_model_config, reduced_inference_config, layer_map=layer_map
+        )
+
+        # The MTP forward supplies exactly the controller's padded query count
+        # (active_request_count, rounded only for sequence parallelism), not the
+        # REQUEST_ROUNDER / TOKEN_ROUNDER-padded decode batch the main context
+        # uses. Shadow the round-up helpers with tp-only rounding so the child's
+        # attention metadata request count matches the queries provided; otherwise
+        # the decode reshape (q.shape[0] // num_requests) divides to zero.
+        def _round_to_tp(value, tp_size=None):
+            if tp_size is None:
+                tp_size = (
+                    parallel_state.get_tensor_model_parallel_world_size()
+                    if parallel_state.is_initialized()
+                    else 1
+                )
+            return tp_size * int(math.ceil(int(value) / tp_size))
+
+        child.round_up_requests = _round_to_tp
+        child.round_up_tokens = _round_to_tp
+        return child
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
@@ -2731,6 +2755,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # monotonic so the engine's periodic logging cadence
         # (step_count % logging_step_interval) still fires for short requests.
 
+        # Forward the reset onto the nested MTP KV cache context so it releases
+        # its blocks and zeroes its row counts in lockstep with this context.
+        if self.mtp_inference_context is not None and not self.is_mtp_child:
+            self.mtp_inference_context.reset(preserve_prefix_cache=preserve_prefix_cache)
+
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -3224,6 +3253,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.prefix_cache_prefill_skipped_tokens += prefix_skip_tokens
         self.total_request_count += 1
         self.num_prefill_requests += 1
+
+        # Mirror the add onto the nested MTP KV cache context so its per-request
+        # row indices stay aligned with this (parent) context. The child owns an
+        # independent KV pool; only the row bookkeeping is kept in lockstep, and KV
+        # blocks are allocated lazily when the MTP forward actually appends. This
+        # runs after the parent's state is fully consistent (counts incremented).
+        if self.mtp_inference_context is not None and not self.is_mtp_child:
+            self.mtp_inference_context._mtp_establish_request_row(
+                request_id=req.request_id,
+                output_length=int(self.request_output_lengths[current_id].item()),
+                is_new=req.finished_chunk_token_count == 0,
+            )
 
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
@@ -3795,6 +3836,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
+            if self.mtp_inference_context is not None and not self.is_mtp_child:
+                self._reconcile_mtp_child()
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -4142,10 +4185,294 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
 
+        # Reconcile the nested MTP KV cache context to this context's final row
+        # layout (surviving requests permuted into place, finished/evicted rows
+        # released). Kept aligned so the controller can drive MTP attention with
+        # the parent's active/paused slices.
+        if self.mtp_inference_context is not None and not self.is_mtp_child:
+            self._reconcile_mtp_child()
+
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
         }
+
+    def _reconcile_mtp_child(self) -> None:
+        """Align the nested MTP KV cache child's row layout to this context.
+
+        After ``update_requests`` reorders rows (pause / evict / resume / chunked
+        hiding), the child must present the same per-request row order so the
+        controller can index both contexts with the same active/paused slices.
+
+        Rather than replaying the parent's lifecycle decisions -- which branch on
+        the parent's own KV-block-pool occupancy and would diverge for the child's
+        independent (single-layer) pool -- the child simply matches the parent's
+        final ``request_ids`` order: surviving requests are permuted into place and
+        dropped (finished / evicted) requests have their child KV blocks released.
+        """
+        child = self.mtp_inference_context
+
+        # Parent's post-update layout. A chunked-prefill request, if active this
+        # step, is hidden at index ``total_request_count`` (update_requests step
+        # 6.d); preserve it on the child at the same index.
+        parent_total = self.total_request_count
+        chunked_idx = self.get_index_of_chunked_prefill_request(safe=False)
+        high = parent_total + 1 if chunked_idx == parent_total else parent_total
+
+        desired_ids = self.request_ids[:high].tolist()
+        desired_set = set(desired_ids)
+
+        # Child rows currently occupied (add_request keeps total_request_count in
+        # lockstep, so [0, child.total_request_count) covers all live child rows).
+        child_occupied = child.total_request_count
+        child_ids = child.request_ids[:child_occupied].tolist()
+
+        # Release child KV blocks for requests the parent dropped this step.
+        dropped_rows = [r for r, rid in enumerate(child_ids) if rid not in desired_set]
+        if dropped_rows:
+            child.release_memory_blocks_from_request_indexes(
+                torch.tensor(dropped_rows, dtype=torch.int64, device='cpu')
+            )
+
+        # Permute surviving child rows into the parent's request order.
+        id_to_child_row = {rid: r for r, rid in enumerate(child_ids)}
+        src = torch.tensor(
+            [id_to_child_row[rid] for rid in desired_ids], dtype=torch.int64, device='cpu'
+        )
+        child._permute_request_rows(src, child_occupied)
+
+        child.paused_request_count = self.paused_request_count
+        child.total_request_count = parent_total
+        child.chunked_prefill_request_id = self.chunked_prefill_request_id
+
+    def _permute_request_rows(self, src: Tensor, occupied: int) -> None:
+        """Reorder per-request bookkeeping so row ``i`` holds ``old_row[src[i]]``.
+
+        Used by the MTP KV cache child to mirror the parent's row layout. Rows in
+        ``[len(src), occupied)`` are cleared to sentinels after the gather. Only
+        row-indexed (per-request) tensors are permuted; token-level bookkeeping is
+        rebuilt separately when the MTP forward pass is driven.
+
+        Args:
+            src (Tensor): 1D int64 source row indices, one per destination row.
+            occupied (int): Number of currently-occupied rows before the permute.
+        """
+        high = src.numel()
+        row_tensors = [
+            self.request_ids,
+            self.request_kv_length_offsets,
+            self.request_query_lengths,
+            self.request_in_prefill_status_tensor,
+            self.request_output_lengths,
+            self.request_kv_block_counts,
+            self.request_last_kv_block_id,
+            self.request_last_kv_block_offset,
+        ]
+        # Advanced indexing copies, so reads see pre-permute values before the
+        # in-place write-back; no aliasing between src reads and [:high] writes.
+        for t in row_tensors:
+            t[:high] = t[src]
+        self.request_to_kv_block_ids[:high] = self.request_to_kv_block_ids[src]
+        for m in self.request_metadata.values():
+            m[:high] = m[src]
+
+        # Clear now-stale rows above the new high-water mark. Their blocks were
+        # either released (dropped) or copied to a surviving row (survivors), so
+        # dropping the stale block references here avoids double bookkeeping.
+        if occupied > high:
+            self.request_ids[high:occupied] = -1
+            self.request_to_kv_block_ids[high:occupied] = -1
+
+    # ------------------------------------------------------------------ #
+    # MTP KV cache child: request add + stripped-down decode bookkeeping
+    # ------------------------------------------------------------------ #
+
+    def _mtp_establish_request_row(
+        self, request_id: int, output_length: int, is_new: bool
+    ) -> None:
+        """Establish (or re-adopt) a child KV cache row, without allocating blocks.
+
+        The add_request analog for the MTP KV cache child. Blocks are allocated
+        lazily on the first append (``_mtp_decode_step`` for decode, MTP prefill in
+        a later phase), so this only records the row identity and marks it in
+        prefill. Called from the parent's ``add_request`` hook, so the child row
+        index equals the parent's (both take ``current_id = total_request_count``).
+
+        Args:
+            request_id (int): Request id, matching the parent row.
+            output_length (int): Total sequence length target (mirrors parent).
+            is_new (bool): True for a request's first chunk; False re-adopts the
+                chunked-prefill row hidden past ``total_request_count``, preserving
+                its accumulated KV state.
+        """
+        current_id = self.total_request_count
+        self.request_ids[current_id] = request_id
+        self.request_output_lengths[current_id] = output_length
+        self.request_in_prefill_status_tensor[current_id] = 1
+        if is_new:
+            self.request_kv_length_offsets[current_id] = 0
+            self.request_query_lengths[current_id] = 0
+            self.request_kv_block_counts[current_id] = 0
+            self.request_last_kv_block_id[current_id] = -1
+            self.request_last_kv_block_offset[current_id] = 0
+            self.request_to_kv_block_ids[current_id] = -1
+        self.total_request_count += 1
+        self.num_prefill_requests += 1
+
+    def _mtp_decode_step(self, advance_previous: bool) -> int:
+        """Stripped-down ``update_requests`` for a single MTP decode token.
+
+        The child never recomputes pause / evict / resume -- its row layout is
+        mirrored from the parent by ``_reconcile_mtp_child`` -- so this performs
+        only the deterministic KV + token bookkeeping that ``update_requests``
+        steps 7-8 do, specialized to one generated token. Because the child has
+        ``num_speculative_tokens == 0`` this is always the fast, no-boundary-
+        crossing token path, and the boundary-crossing block allocation that
+        ``update_requests`` routes through the pause/resume cycle is done directly.
+
+        Call it once per MTP depth, before that depth's forward pass (which appends
+        one K/V per active request at the request's current KV length). Follow with
+        ``transfer_bookkeeping_to_gpu()``.
+
+        Args:
+            advance_previous (bool): When True, first advance each active request's
+                KV length by the previous depth's query length (the token appended
+                by the prior MTP forward). False on the first depth, where the
+                append slot is the KV length set by prefill / reconcile.
+
+        Returns:
+            int: Number of active requests (== query tokens) prepared.
+        """
+        lo = self.paused_request_count
+        hi = self.total_request_count
+        active = hi - lo
+        active_slice = slice(lo, hi)
+
+        self.num_prefill_requests = 0
+        self.active_token_count = active
+        if active == 0:
+            self.initialize_attention_state()
+            return 0
+
+        # Advance the KV length for the token appended by the previous MTP forward.
+        if advance_previous:
+            self.request_kv_length_offsets[active_slice].add_(
+                self.request_query_lengths[active_slice]
+            )
+        self.request_query_lengths[active_slice] = 1
+        self.request_in_prefill_status_tensor[active_slice] = 0
+
+        # Append slot == current KV length. Allocate a fresh block whenever the
+        # slot begins a new block (update_requests does this via pause->resume).
+        offsets = self.request_kv_length_offsets[active_slice]
+        needs_block = offsets >= self.request_kv_block_counts[active_slice] * self.block_size_tokens
+        num_new = int(needs_block.sum().item())
+        if num_new > 0:
+            block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new)
+            if block_ids is None or len(block_ids) != num_new:
+                raise BlockOverflowError(request_id=-1)
+            rows = lo + torch.nonzero(needs_block, as_tuple=True)[0]
+            cols = self.request_kv_block_counts[rows]
+            self.request_to_kv_block_ids[rows, cols] = block_ids
+            self.request_kv_block_counts[rows] += 1
+            self.request_last_kv_block_id[rows] = block_ids
+
+        self.request_last_kv_block_offset[active_slice] = offsets % self.block_size_tokens
+
+        # Token bookkeeping (update_requests step 8, fast path for num_spec == 0).
+        positions = self.request_kv_length_offsets[active_slice]
+        self.token_to_request_idx[:active] = torch.arange(lo, hi, device='cpu')
+        self.token_to_pos_ids[:active] = positions
+        self.token_to_position_in_request[:active] = positions
+        self.token_to_local_position_within_kv_block[:active] = positions % self.block_size_tokens
+        self.token_to_block_idx[:active] = self.request_last_kv_block_id[active_slice]
+
+        self.initialize_attention_state()
+        return active
+
+    def _mtp_finalize_decode_step(self) -> None:
+        """Advance KV lengths for the final MTP depth's appended token.
+
+        ``_mtp_decode_step`` advances the previous depth's append lazily at the top
+        of the next depth; after the last depth one token remains uncommitted. This
+        advances it so the child's KV length reflects all appended draft tokens
+        (which a later rewind phase trims back to the accepted prefix).
+        """
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        self.request_kv_length_offsets[active_slice].add_(
+            self.request_query_lengths[active_slice]
+        )
+
+    def _mtp_prefill_step(self, row_start: int, append_counts: Tensor) -> int:
+        """Set up a varlen MTP prompt-prefill append for the child (roll-by-one).
+
+        The child appends ``append_counts[j]`` KV entries for the j-th prefill
+        request (row ``row_start + j``), starting at that request's current KV
+        length (0 for a request's first chunk). Allocates blocks, writes packed
+        token-level bookkeeping, and initializes attention state so the caller can
+        run one varlen MTP forward that appends the prompt K/V. Follow with
+        ``transfer_bookkeeping_to_gpu()``, the forward, then
+        ``_mtp_finalize_prefill_step``.
+
+        Args:
+            row_start (int): Child row index of the first prefill request.
+            append_counts (Tensor): 1D CPU int tensor, KV entries to append per
+                prefill request (``prompt_len - 1`` for a full prompt).
+
+        Returns:
+            int: Total packed prefill tokens (== sum(append_counts)).
+        """
+        n = append_counts.numel()
+        total_tokens = int(append_counts.sum().item())
+        self.num_prefill_requests = n
+        self.active_token_count = total_tokens
+
+        tok = 0
+        for j in range(n):
+            count = int(append_counts[j].item())
+            if count == 0:
+                continue
+            r = row_start + j
+            offset = int(self.request_kv_length_offsets[r].item())
+            needed_blocks = (offset + count + self.block_size_tokens - 1) // self.block_size_tokens
+            have = int(self.request_kv_block_counts[r].item())
+            if needed_blocks > have:
+                new_blocks = self.kv_block_allocator.allocate_memory_blocks(needed_blocks - have)
+                if new_blocks is None or len(new_blocks) != needed_blocks - have:
+                    raise BlockOverflowError(request_id=-1)
+                self.request_to_kv_block_ids[r, have:needed_blocks] = new_blocks
+                self.request_kv_block_counts[r] = needed_blocks
+
+            self.request_query_lengths[r] = count
+            self.request_in_prefill_status_tensor[r] = 1
+
+            pos = torch.arange(offset, offset + count, device='cpu')
+            self.token_to_request_idx[tok : tok + count] = r
+            self.token_to_pos_ids[tok : tok + count] = pos
+            self.token_to_position_in_request[tok : tok + count] = pos
+            self.token_to_local_position_within_kv_block[tok : tok + count] = (
+                pos % self.block_size_tokens
+            )
+            self.token_to_block_idx[tok : tok + count] = self.request_to_kv_block_ids[r][
+                pos // self.block_size_tokens
+            ]
+            self.request_last_kv_block_id[r] = self.request_to_kv_block_ids[r][needed_blocks - 1]
+            self.request_last_kv_block_offset[r] = (offset + count - 1) % self.block_size_tokens
+            tok += count
+
+        self.initialize_attention_state()
+        return total_tokens
+
+    def _mtp_finalize_prefill_step(self, row_start: int, append_counts: Tensor) -> None:
+        """Advance child KV lengths after the prompt-prefill forward appended.
+
+        Leaves each prefill request's KV length at ``prompt_len - 1`` (roll-by-one),
+        so the decode loop's first depth appends at that request's next position.
+        """
+        for j in range(append_counts.numel()):
+            count = int(append_counts[j].item())
+            if count > 0:
+                self.request_kv_length_offsets[row_start + j] += count
 
     def _processed_log_probs(
         self,

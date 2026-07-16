@@ -948,9 +948,6 @@ class TextGenerationController:
             token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
 
         # --- Prefill requests: seed prompt positions s..e-2 from main hiddens (roll-by-one). ---
-        # `carry_block_row` is set to a chunked request's block table when a boundary carry-in
-        # pseudo-request is appended (seeds position s-1 from the previous chunk's stashed hidden).
-        carry_block_row = None
         if active_request_count > num_decode_requests:
             query_lengths = (
                 context.request_query_lengths[active_slice][
@@ -968,8 +965,6 @@ class TextGenerationController:
                 .to(device, non_blocking=True)
                 .to(torch.long)
             )
-            append_parts.append(query_lengths - 1)
-            start_parts.append(prefill_offsets)
             # Prefill token count = active_token_count - decode_len (both host ints, no sync).
             total_prompt = context.active_token_count - decode_len
             prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
@@ -978,38 +973,53 @@ class TextGenerationController:
             ].to(device)
             seg_start = torch.cumsum(query_lengths, 0) - query_lengths
             seg_end = torch.cumsum(query_lengths, 0) - 1
-            keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
-            keep_hidden[seg_end] = False  # drop each request's last hidden (no next token)
-            keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
-            keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
-            hidden_parts.append(prefill_hidden[keep_hidden])
-            token_parts.append(prefill_tokens[keep_token])
 
-            # Chunked-prefill boundary carry. Host-side scalars are fine: a step with a prefill
-            # request is never CUDA-graphed (commit_graphed requires decode-only), so this runs eager.
+            # Chunked-prefill boundary carry-in: find a continuation request (offset s>0) whose
+            # deferred boundary hidden we stashed last chunk. Host scalars are fine here (a step with
+            # a prefill request is never CUDA-graphed). At most one such request.
+            ci, carry_hidden, pf_ids = -1, None, None
             if context.is_chunked_prefill_enabled():
                 pf_ids = context.request_ids[active_slice][
                     num_decode_requests:active_request_count
                 ].tolist()
-                pf_off = prefill_offsets.tolist()
-                # CARRY-IN: a continuation request (offset s_r>0) whose boundary hidden we stashed
-                # last chunk gets one extra pseudo-request writing position s_r-1 = (stash, t_{s_r}).
-                for li, (rid, off) in enumerate(zip(pf_ids, pf_off)):
-                    carry_hidden = context._mtp_chunk_carry_get(rid)
-                    if off > 0 and carry_hidden is not None:
-                        first_tok = prefill_tokens[seg_start[li]].view(1)
-                        hidden_parts.append(carry_hidden)
-                        token_parts.append(first_tok)
-                        append_parts.append(torch.ones(1, device=device, dtype=torch.long))
-                        start_parts.append(
-                            torch.full((1,), off - 1, device=device, dtype=torch.long)
-                        )
-                        carry_block_row = context.request_to_kv_block_ids[active_slice][
-                            num_decode_requests + li
-                        ]
+                for li, (rid, off) in enumerate(zip(pf_ids, prefill_offsets.tolist())):
+                    ch = context._mtp_chunk_carry_get(rid)
+                    if off > 0 and ch is not None:
+                        ci, carry_hidden = li, ch
                         break
-                # CARRY-OUT: stash the still-chunking request's last chunk hidden (position e-1) to
-                # seed its boundary next chunk. If it finished chunking, drop any stale carry.
+
+            append_counts_pf = query_lengths - 1  # within-chunk pairs per request
+            start_pf = prefill_offsets.clone()
+            keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
+            keep_hidden[seg_end] = False  # drop each request's last hidden (no next token)
+            keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
+            keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
+            if ci >= 0:
+                # Fuse the carry into request ci's OWN row (no extra request row, which would
+                # overflow the per-request mha buffers at full batch): keep its first token t_s,
+                # prepend the stashed hidden h_{s-1}, shift start to s-1, +1 pair. Positions become
+                # (s-1)..e-2: pair 0 = (stash, t_s) -> s-1, then the within-chunk pairs.
+                keep_token[seg_start[ci]] = True
+                append_counts_pf = append_counts_pf.clone()
+                append_counts_pf[ci] += 1
+                start_pf = start_pf.clone()
+                start_pf[ci] -= 1
+            append_parts.append(append_counts_pf)
+            start_parts.append(start_pf)
+
+            kept_hidden = prefill_hidden[keep_hidden]
+            if ci >= 0:
+                # Insert the stash before request ci's kept-hidden segment (host-known offset).
+                ins = int((query_lengths[:ci] - 1).sum().item())
+                kept_hidden = torch.cat(
+                    [kept_hidden[:ins], carry_hidden.reshape(1, 1, -1), kept_hidden[ins:]], dim=0
+                )
+            hidden_parts.append(kept_hidden)
+            token_parts.append(prefill_tokens[keep_token])
+
+            # CARRY-OUT: stash the still-chunking request's last chunk hidden (position e-1) to seed
+            # its boundary next chunk. If nothing is still chunking, drop any (already-consumed) stash.
+            if context.is_chunked_prefill_enabled():
                 cid = context.chunked_prefill_request_id
                 if cid != -1 and cid in pf_ids:
                     co = pf_ids.index(cid)
@@ -1017,7 +1027,6 @@ class TextGenerationController:
                         cid, prefill_hidden[seg_end[co]].reshape(1, 1, -1)
                     )
                 else:
-                    # No request is still chunking (carry-in above already consumed any stash).
                     context._mtp_chunk_carry_clear()
 
         append_counts = torch.cat(append_parts)
@@ -1036,13 +1045,6 @@ class TextGenerationController:
             .to(device, non_blocking=True)
             .to(context.gpu_view.mha_block_table.dtype)
         )
-        # A carry-in pseudo-request needs its own block-table row (the chunked request's), appended
-        # so its index in the setup's per-request `rows` maps to the right blocks.
-        setup_request_count = active_request_count
-        if carry_block_row is not None:
-            carry_row = carry_block_row.to(device, non_blocking=True).to(block_table.dtype)
-            block_table = torch.cat([block_table, carry_row.unsqueeze(0)], dim=0)
-            setup_request_count += 1
 
         # Graphed path: pad the write-token count to a fixed bucket so the captured graph's shape is
         # stable across steps. The bucket must be >= the max possible `total`: each decode request
@@ -1067,7 +1069,7 @@ class TextGenerationController:
             append_counts=append_counts,
             block_table_prefill=block_table,
             padded_token_count=padded_total,
-            padded_request_count=setup_request_count,
+            padded_request_count=active_request_count,
             request_start_positions=request_start_positions,
         )
         if context._nvls_dispatcher:

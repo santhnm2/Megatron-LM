@@ -164,6 +164,10 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
+    enable_mtp_kv_cache: bool = False
+    """Give the MTP draft attention its own KV cache (one extra attention-layer plane in the
+    shared KV buffer) during dynamic inference. Requires num_speculative_tokens > 0."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -176,11 +180,14 @@ class InferenceSetupConfig:
     space is needed."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
-        "longest_prefix", "first_prefix_block", "round_robin"
-    ] = "first_prefix_block"
-    """Coordinator routing policy for prefix caching. "first_prefix_block" (default) routes based on
-    the first block hash only. "longest_prefix" routes to the rank with the longest matching prefix.
-    "round_robin" ignores prefix affinity and cycles through ranks."""
+        "longest_prefix", "first_prefix_block", "load_balanced"
+    ] = "load_balanced"
+    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
+    with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
+    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
+    prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
+    balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
+    match exists."""
 
     inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
     """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
@@ -362,6 +369,7 @@ class InferenceSetupConfig:
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
+            enable_mtp_kv_cache=self.enable_mtp_kv_cache,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,

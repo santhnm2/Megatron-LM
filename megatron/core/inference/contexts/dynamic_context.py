@@ -278,6 +278,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
+        # Prefill compute accounting (drained into engine accumulators each step).
+        # computed = prompt tokens actually run through the model this step;
+        # skipped = prompt tokens whose prefill was skipped via a prefix-cache hit.
+        # A high skipped fraction confirms prefix caching is saving prefill compute
+        # (so any per-step latency growth is attention-over-context, not re-prefill).
+        self.prefix_cache_prefill_computed_tokens = 0
+        self.prefix_cache_prefill_skipped_tokens = 0
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
@@ -388,6 +395,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
+
+        # MTP KV cache (v1): reserve one extra attention-layer plane in the shared KV `memory_buffer`
+        # for the repeated MTP draft attention. Main KV position i and MTP KV position i are
+        # position-aligned and MTP length <= main length, so the MTP layer reuses main's block
+        # table; only its per-request length offset is tracked separately. The MTP forward routes
+        # its append/read to this slot via the `_mtp_forward_active` flag (see
+        # append_key_value_cache / key_value_cache), so no attention-layer renumbering is needed.
+        self.enable_mtp_kv_cache = inference_config.enable_mtp_kv_cache
+        self._mtp_forward_active = False
+        if self.enable_mtp_kv_cache:
+            self.mtp_kv_layer_slot = self.num_attention_layers
+            self.num_attention_layers += 1
+        else:
+            self.mtp_kv_layer_slot = None
 
         if self.num_attention_layers == 0:
             raise NotImplementedError(
@@ -631,6 +652,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
+        # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        self._nvls_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        )
+
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
         self._training_ep_dispatcher = (
@@ -675,12 +702,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        # Both dispatchers need _valid_tokens_tensor initialized even at EP=1:
-        # mcore_fused_moe's Triton kernel reads it as a pointer regardless of EP size.
-        if model_config.inference_moe_token_dispatcher_type == 'nccl':
+        #
+        # The shared _valid_tokens_tensor scalar is read as a pointer by both fused
+        # MoE backends (mcore_fused_moe and vllm_fused_moe) regardless of EP size, so
+        # allocate it unconditionally (covers EP=1, where no dispatcher comm buffers
+        # exist). The EP>1 dispatchers below reallocate it as part of their own buffer
+        # setup, which is harmless.
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
-        elif get_pg_size(self.expert_model_parallel_group) > 1:
-            # Use moe_latent_size if set, else hidden_size.
+        elif self._nvls_dispatcher:
+            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
@@ -688,10 +720,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
             )
-        else:
-            # EP=1 with nvls: skip symmetric memory init (requires NVLink between
-            # multiple GPUs) and just initialize the shared valid_tokens scalar.
-            InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -710,7 +738,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
+        self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
+
+        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
+        # so it can mask out CUDA-graph padding tokens during routing. The
+        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
+        # dispatcher requires equal token counts across ranks already.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
         active_blocks = self.kv_block_allocator.active_count
@@ -971,6 +1008,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             pin_memory=True,
         )
 
+        # MTP KV cache (v1): per-request committed length of the MTP draft attention's KV.
+        # At settled step boundaries this equals request_kv_length_offsets - 1 (roll-by-one);
+        # it is advanced per MTP depth and rewound alongside the main KV after verification.
+        # The MTP layer reuses `request_to_kv_block_ids` (main's block table), so no separate
+        # block-count / last-block bookkeeping is needed. GPU mirror is allocated lazily.
+        if self.enable_mtp_kv_cache:
+            self.mtp_request_kv_length_offsets = torch.zeros(
+                self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+            )
+
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
         # `active_request_metadata` (also CPU pinned, refreshed each step).
@@ -1017,6 +1064,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
+        # Scalar: real (unpadded) token count for the current step. Refreshed
+        # in transfer_bookkeeping_to_gpu(); read on GPU via
+        # `gpu_view.real_token_count` (MoE routing masks padding tokens).
+        _real_token_count_bytes = 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata. max_bs == max_requests.
         _mha_query_lengths_bytes = self.max_requests * 4
@@ -1028,6 +1079,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             3 * _tok_int64_bytes
             + 3 * _tok_int32_bytes
             + 7 * _req_4byte_bytes
+            + _real_token_count_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
             + _mha_kv_seq_lengths_bytes
@@ -1153,6 +1205,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _req_4byte_bytes
         ].view(torch.int32)
         _off += _req_4byte_bytes
+
+        # Scalar staging slot for the real (unpadded) token count. Refreshed
+        # from `self.batch_dimensions.token_count` in transfer_bookkeeping_to_gpu()
+        # and read on GPU via `gpu_view.real_token_count`.
+        self._staging_real_token_count = self._cpu_bookkeeping_buf[
+            _off : _off + _real_token_count_bytes
+        ].view(torch.int32)
+        _off += _real_token_count_bytes
 
         # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
         max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
@@ -1553,7 +1613,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
-        attention_layer_number = self.layer_map[layer_number - 1]
+        if self._mtp_forward_active:
+            # Redirect the MTP draft attention to its reserved KV-buffer slot regardless of the
+            # inner layer's layer_number (which reuses decoder numbering for router/aux-loss).
+            attention_layer_number = self.mtp_kv_layer_slot
+        else:
+            attention_layer_number = self.layer_map[layer_number - 1]
 
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
             # currently does not support MLA latent cache
@@ -1604,7 +1669,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer as well as the block table.
         """
-        attention_layer_number = self.layer_map[layer_number - 1]
+        if self._mtp_forward_active:
+            attention_layer_number = self.mtp_kv_layer_slot
+        else:
+            attention_layer_number = self.layer_map[layer_number - 1]
 
         assert self.active_attn_metadata is not None
 
@@ -1620,6 +1688,221 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
+
+    # ------------------------------------------------------------------
+    # MTP KV cache (v1) — decode-step bookkeeping.
+    #
+    # The MTP draft attention reuses this context's KV `memory_buffer` (extra slot
+    # `mtp_kv_layer_slot`) and main's block table, but tracks its own per-request
+    # committed length in `mtp_request_kv_length_offsets`. Each MTP draft depth is a
+    # decode-style forward: every active request contributes exactly one token, written
+    # at its own MTP position and attending over its own MTP history (write-then-attend).
+    #
+    # For the eager draft loop we drive the attention metadata directly on the GPU
+    # (bypassing the coalesced CPU->GPU bookkeeping transfer) so the MTP forwards do not
+    # disturb the main step's Mamba/H2D state. `_mtp_begin_decode` snapshots the active
+    # MTP lengths + block table to GPU scratch; `_mtp_setup_decode_step` populates the
+    # write maps + MHA read metadata for one depth; `_mtp_advance_decode_step` bumps the
+    # lengths after the forward; `_mtp_end_decode` restores non-MTP mode and persists the
+    # advanced lengths back to the CPU canonical tensor. RoPE is assumed absent (v1).
+    # ------------------------------------------------------------------
+    def _mtp_begin_decode(self, active_request_count: int, padded_count: int) -> None:
+        """Enter MTP-forward mode and snapshot active MTP KV state to GPU scratch."""
+        assert self.enable_mtp_kv_cache
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        device = self.gpu_view.token_to_block_idx.device
+        self._mtp_active_request_count = active_request_count
+        self._mtp_padded_count = padded_count
+        # Working copy of the MTP committed lengths for the active requests (advanced
+        # per depth on the GPU, persisted back to CPU in `_mtp_end_decode`).
+        self._mtp_offsets_gpu = self.mtp_request_kv_length_offsets[active_slice][
+            :active_request_count
+        ].to(device, non_blocking=True)
+        # Block table for the active requests. Sourced from the CPU canonical
+        # `request_to_kv_block_ids` (post-rewind correct) rather than the stale gpu_view
+        # mirror. MTP positions are a subset of main's, so these blocks always exist.
+        self._mtp_block_table_gpu = (
+            self.request_to_kv_block_ids[active_slice][:active_request_count]
+            .to(device, non_blocking=True)
+            .to(self.gpu_view.mha_block_table.dtype)
+        )
+        self._mtp_forward_active = True
+
+    def _mtp_setup_decode_step(self) -> None:
+        """Populate token write maps + MHA read metadata for one MTP draft depth."""
+        gv = self.gpu_view
+        device = gv.token_to_block_idx.device
+        n = self._mtp_active_request_count
+        padded = self._mtp_padded_count
+        block_size = self.block_size_tokens
+
+        positions = self._mtp_offsets_gpu  # [n] int, MTP write position P_r for this depth
+        block_within = (positions // block_size).to(torch.long)
+        local = positions % block_size
+        rows = torch.arange(n, device=device)
+
+        # Token write maps (one token per active request).
+        gv.token_to_block_idx[:n] = self._mtp_block_table_gpu[rows, block_within].to(
+            gv.token_to_block_idx.dtype
+        )
+        gv.token_to_local_position_within_kv_block[:n] = local.to(
+            gv.token_to_local_position_within_kv_block.dtype
+        )
+        gv.token_to_request_idx[:n] = rows.to(gv.token_to_request_idx.dtype)
+        gv.token_to_position_in_request[:n] = positions.to(gv.token_to_position_in_request.dtype)
+        gv.token_to_pos_ids[:n] = positions.to(gv.token_to_pos_ids.dtype)
+
+        # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
+        kv_len = positions + 1
+        gv.mha_query_lengths[:n] = 1
+        gv.mha_cu_query_seq_lengths[: n + 1] = torch.arange(
+            0, n + 1, device=device, dtype=gv.mha_cu_query_seq_lengths.dtype
+        )
+        gv.mha_kv_seq_lengths[:n] = kv_len.to(gv.mha_kv_seq_lengths.dtype)
+        gv.mha_cu_kv_seq_lengths[0] = 0
+        gv.mha_cu_kv_seq_lengths[1 : n + 1] = torch.cumsum(kv_len, dim=0).to(
+            gv.mha_cu_kv_seq_lengths.dtype
+        )
+        gv.mha_block_table[:n] = self._mtp_block_table_gpu
+
+        # Zero/sentinel-pad the padding rows so padded slots never index real KV.
+        if padded > n:
+            gv.token_to_block_idx[n:padded] = self.kv_block_allocator.dummy_block_idx
+            gv.token_to_local_position_within_kv_block[n:padded] = 0
+            gv.mha_query_lengths[n:padded] = 0
+            gv.mha_cu_query_seq_lengths[n + 1 : padded + 1] = gv.mha_cu_query_seq_lengths[n]
+            gv.mha_kv_seq_lengths[n:padded] = 0
+            gv.mha_cu_kv_seq_lengths[n + 1 : padded + 1] = gv.mha_cu_kv_seq_lengths[n]
+            gv.mha_block_table[n:padded] = -1
+
+        max_seqlen_k = int(kv_len.max().item()) if n > 0 else 1
+        mha = self.non_graph_attn_metadata["mha_metadata"]
+        mha.set_state_data(
+            padded_active_request_count=padded, max_seqlen_q=1, max_seqlen_k=max_seqlen_k
+        )
+
+        # Route this context's forward to the MTP slot / eager attention state.
+        self.active_attn_metadata = self.non_graph_attn_metadata
+        self.active_token_count = n
+        self.padded_active_token_count = padded
+        self._using_cuda_graph_this_step = False
+
+    def _mtp_setup_prefill_step(
+        self,
+        append_counts: Tensor,
+        block_table_prefill: Tensor,
+        padded_token_count: Optional[int] = None,
+        padded_request_count: Optional[int] = None,
+    ) -> None:
+        """Populate token write maps + MHA metadata for the MTP prompt-seeding forward.
+
+        This is a varlen causal prefill over the roll-by-one prompt: for each prefill request
+        with prompt length L, the MTP attention processes positions 0..L-2 (append_count = L-1),
+        seeding the MTP KV from an empty state. `append_counts` and `block_table_prefill` are GPU
+        tensors for the P prefill requests (in the active-slice decode-first ordering, prefill last).
+        """
+        assert self.enable_mtp_kv_cache
+        gv = self.gpu_view
+        device = gv.token_to_block_idx.device
+        block_size = self.block_size_tokens
+        num_prefill = append_counts.numel()
+        total = int(append_counts.sum().item())
+        padded_total = total if padded_token_count is None else padded_token_count
+        padded_p = num_prefill if padded_request_count is None else padded_request_count
+
+        # Per-token request row and MTP write position (0..count-1 within each request).
+        rows = torch.repeat_interleave(
+            torch.arange(num_prefill, device=device), append_counts
+        )
+        seg_start = torch.cumsum(append_counts, 0) - append_counts
+        positions = torch.arange(total, device=device) - seg_start[rows]
+
+        gv.token_to_block_idx[:total] = block_table_prefill[
+            rows, (positions // block_size).to(torch.long)
+        ].to(gv.token_to_block_idx.dtype)
+        gv.token_to_local_position_within_kv_block[:total] = (positions % block_size).to(
+            gv.token_to_local_position_within_kv_block.dtype
+        )
+        gv.token_to_request_idx[:total] = rows.to(gv.token_to_request_idx.dtype)
+        gv.token_to_position_in_request[:total] = positions.to(gv.token_to_position_in_request.dtype)
+        gv.token_to_pos_ids[:total] = positions.to(gv.token_to_pos_ids.dtype)
+
+        # MHA metadata: fresh causal prefill, so per-request kv_length == query_length.
+        p = num_prefill
+        gv.mha_query_lengths[:p] = append_counts.to(gv.mha_query_lengths.dtype)
+        gv.mha_cu_query_seq_lengths[0] = 0
+        cu = torch.cumsum(append_counts, 0).to(gv.mha_cu_query_seq_lengths.dtype)
+        gv.mha_cu_query_seq_lengths[1 : p + 1] = cu
+        gv.mha_kv_seq_lengths[:p] = append_counts.to(gv.mha_kv_seq_lengths.dtype)
+        gv.mha_cu_kv_seq_lengths[0] = 0
+        gv.mha_cu_kv_seq_lengths[1 : p + 1] = cu
+        gv.mha_block_table[:p] = block_table_prefill
+
+        if padded_total > total:
+            gv.token_to_block_idx[total:padded_total] = self.kv_block_allocator.dummy_block_idx
+            gv.token_to_local_position_within_kv_block[total:padded_total] = 0
+        if padded_p > p:
+            gv.mha_query_lengths[p:padded_p] = 0
+            gv.mha_cu_query_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_query_seq_lengths[p]
+            gv.mha_kv_seq_lengths[p:padded_p] = 0
+            gv.mha_cu_kv_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_kv_seq_lengths[p]
+            gv.mha_block_table[p:padded_p] = -1
+
+        max_seqlen = int(append_counts.max().item()) if p > 0 else 1
+        mha = self.non_graph_attn_metadata["mha_metadata"]
+        mha.set_state_data(
+            padded_active_request_count=padded_p, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen
+        )
+        self.active_attn_metadata = self.non_graph_attn_metadata
+        self.active_token_count = total
+        self.padded_active_token_count = padded_total
+        self._using_cuda_graph_this_step = False
+        self._mtp_forward_active = True
+
+    def _mtp_finalize_prefill_step(
+        self, prefill_row_start: int, append_counts: Tensor
+    ) -> None:
+        """Persist seeded MTP lengths (L-1 per prefill request) and exit MTP-forward mode."""
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        p = append_counts.numel()
+        row_slice = slice(prefill_row_start, prefill_row_start + p)
+        self.mtp_request_kv_length_offsets[active_slice][row_slice] = append_counts.to("cpu").to(
+            self.mtp_request_kv_length_offsets.dtype
+        )
+        self._mtp_forward_active = False
+
+    def _mtp_rewind_offsets(
+        self, accepted_counts: Tensor, prefill_status: Tensor, num_speculative_tokens: int
+    ) -> None:
+        """Trim MTP length offsets by ``(D - accepted)`` rejected drafts per request.
+
+        The decode loop appended ``D + 1`` entries (matching the main model's forward); this
+        rewind mirrors the main KV rewind with the same accepted counts so the MTP offset
+        returns to ``main_len - 1``. Requests prefilling this step (prefill_status == 1) had no
+        prior draft and are skipped. All inputs are CPU tensors aligned with the active slice.
+        """
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        n = accepted_counts.numel()
+        num_to_rewind = torch.where(
+            prefill_status[:n] == 1,
+            torch.zeros_like(accepted_counts),
+            num_speculative_tokens - accepted_counts,
+        ).to(self.mtp_request_kv_length_offsets.dtype)
+        offsets = self.mtp_request_kv_length_offsets[active_slice]
+        offsets[:n] = (offsets[:n] - num_to_rewind).clamp_(min=0)
+
+    def _mtp_advance_decode_step(self) -> None:
+        """Advance each active request's MTP KV length by one after a depth forward."""
+        self._mtp_offsets_gpu += 1
+
+    def _mtp_end_decode(self) -> None:
+        """Exit MTP-forward mode and persist advanced MTP lengths to the CPU canonical."""
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        n = self._mtp_active_request_count
+        self.mtp_request_kv_length_offsets[active_slice][:n] = self._mtp_offsets_gpu.to(
+            "cpu"
+        ).to(self.mtp_request_kv_length_offsets.dtype)
+        self._mtp_forward_active = False
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
@@ -2377,6 +2660,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
 
+        # Record whether this step produces real output — false on CUDA-graph
+        # capture (warmup) or dummy EP steps. Used by transfer_bookkeeping_to_gpu
+        # to publish real_token_count=0 so MoE routing masks all padding tokens.
+        self._bookkeeping_no_real_work = (
+            construct_graph_dimensions is not None or is_expert_parallel_dummy_cuda_graph_step
+        )
+
         # Run the H2D transfer here so callers that bypass the controller
         # (e.g. unit tests that call `model.forward()` directly after
         # `initialize_attention_state()`) see populated GPU bookkeeping. The
@@ -2453,6 +2743,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._staging_request_query_lengths[n_active:padded_active] = 0
             self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
+        # Real (unpadded) token count for this step. CUDA-graph replay pads
+        # the token dim to a captured size; MoE routing reads this on GPU and
+        # rewrites padding rows' routing entries to -1 so they don't go to
+        # any expert. Set to 0 on CUDA-graph capture / dummy EP steps so
+        # every row gets masked out.
+        self._staging_real_token_count[0] = (
+            0 if self._bookkeeping_no_real_work else self.batch_dimensions.token_count
+        )
+
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
@@ -2494,12 +2793,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-    def reset_metadata(self) -> None:
+    def reset_metadata(self, preserve_prefix_cache: bool = False) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV block allocator's prefix-cache
+                state (hash index, ref counts, cached blocks) intact. Used by the idle
+                ``dummy_forward`` path, which only needs to clear the transient one-token
+                step state -- wiping the allocator there would destroy cross-request prefix
+                reuse for any subsequent request (the engine idles between requests at low
+                concurrency, especially with EP > 1).
         """
+        # No cache to preserve when prefix caching is off: fall back to a full
+        # reset so the disabled path is byte-identical to the original behavior.
+        preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
 
         # Reset request/token counts.
         self.total_request_count = 0
@@ -2522,7 +2832,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
-        self.kv_block_allocator.reset()
+        if not preserve_prefix_cache:
+            self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset chunked prefill state
@@ -2534,7 +2845,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def reset(self) -> None:
+    def reset(self, preserve_prefix_cache: bool = False) -> None:
         """Reset entire context.
 
         This method does:
@@ -2545,18 +2856,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
+                state (hash indices, cached blocks/slots, LRU clock) intact. Used by
+                the idle ``dummy_forward`` path so an idle step between requests does
+                not destroy cross-request prefix reuse.
         """
+        # No cache to preserve when prefix caching is off: fall back to a full
+        # reset so the disabled path is byte-identical to the original behavior.
+        preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
         self.reset_tensors()
-        self.reset_metadata()
+        self.reset_metadata(preserve_prefix_cache=preserve_prefix_cache)
 
         # Reset lifetime counters (not reset in reset_metadata, which is also
         # called during suspend/resume where these must persist).
-        self.step_count = 0
-        self.prefix_cache_lru_clock = 0
+        if not preserve_prefix_cache:
+            self.step_count = 0
+            self.prefix_cache_lru_clock = 0
 
-        # Reset Mamba cache state
-        if self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.reset()
+            # Reset Mamba cache state
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.reset()
+        # When preserving prefix cache (idle dummy_forward), keep step_count
+        # monotonic so the engine's periodic logging cadence
+        # (step_count % logging_step_interval) still fires for short requests.
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -3027,23 +3351,28 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self._pending_mamba_zeros.append(mamba_idx)
 
-            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
-            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
-            # because commit_intermediate_states() reads the CPU state after the
-            # forward pass.
-            if self.mamba_slot_allocator is not None:
-                self.mamba_slot_allocator.compute_and_store_offsets(
-                    req,
-                    current_id,
-                    prefix_skip_tokens,
-                    prefill_chunk_length,
-                    num_matched_blocks,
-                    matched_block_ids,
-                    overall_required_blocks,
-                )
+        # compute_and_store_offsets sets CPU state + GPU staging buffers that
+        # commit_intermediate_states() consumes after the forward pass. Run it for
+        # EVERY prefill chunk (not just the first): the last complete block of a
+        # multi-chunk prompt falls in a continuation chunk, and caching its Mamba
+        # state is precisely what lets a later turn skip prefill on a hybrid model.
+        # Mamba slot allocation / state restore above stays first-chunk-only.
+        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
+            self.mamba_slot_allocator.compute_and_store_offsets(
+                req,
+                current_id,
+                prefix_skip_tokens,
+                prefill_chunk_length,
+                num_matched_blocks,
+                matched_block_ids,
+                overall_required_blocks,
+            )
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
+        if self.enable_prefix_caching:
+            self.prefix_cache_prefill_computed_tokens += effective_prefill_chunk_length
+            self.prefix_cache_prefill_skipped_tokens += prefix_skip_tokens
         self.total_request_count += 1
         self.num_prefill_requests += 1
 

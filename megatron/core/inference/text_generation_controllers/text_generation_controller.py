@@ -898,10 +898,12 @@ class TextGenerationController:
             written by decode depth 0, so this covers the earlier a_r positions (start = base-1-a_r).
           - prefill: the prompt positions 0..L-2 (seed from empty, start = 0).
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
-        """
-        if context.chunked_prefill_request_id != -1:
-            raise NotImplementedError("MTP KV cache does not yet support chunked prefill (v1).")
 
+        Chunked prefill: a prompt is seeded across chunks. For a chunk covering global positions
+        [s, e), the within-chunk roll-by-one seeds s..e-2; position e-1 needs the NEXT chunk's first
+        token, so its main hidden is stashed and paired via a carry-in pseudo-request when the next
+        chunk arrives (writing position s-1). See [[mtp-chunked-prefill-design]].
+        """
         # The commit-pass forward is CUDA-graphed on decode-only graphed steps: its write-token count
         # `total` (= sum of accepted drafts) varies per step, so we pad it up to a fixed bucket
         # (`padded_count * num_speculative_tokens` >= the max possible sum) and reuse a captured graph
@@ -945,7 +947,10 @@ class TextGenerationController:
             hidden_parts.append(decode_hidden[hidden_idx])
             token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
 
-        # --- Prefill requests: seed prompt positions 0..L-2 from main hiddens. ---
+        # --- Prefill requests: seed prompt positions s..e-2 from main hiddens (roll-by-one). ---
+        # `carry_block_row` is set to a chunked request's block table when a boundary carry-in
+        # pseudo-request is appended (seeds position s-1 from the previous chunk's stashed hidden).
+        carry_block_row = None
         if active_request_count > num_decode_requests:
             query_lengths = (
                 context.request_query_lengths[active_slice][
@@ -954,8 +959,17 @@ class TextGenerationController:
                 .to(device, non_blocking=True)
                 .to(torch.long)
             )
+            # Per-request chunk start = request_kv_length_offsets (0 for fresh prompts, s_r>0 for a
+            # continuation chunk). Fresh prompts thus seed 0..L-2 exactly as before.
+            prefill_offsets = (
+                context.request_kv_length_offsets[active_slice][
+                    num_decode_requests:active_request_count
+                ]
+                .to(device, non_blocking=True)
+                .to(torch.long)
+            )
             append_parts.append(query_lengths - 1)
-            start_parts.append(torch.zeros_like(query_lengths))
+            start_parts.append(prefill_offsets)
             # Prefill token count = active_token_count - decode_len (both host ints, no sync).
             total_prompt = context.active_token_count - decode_len
             prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
@@ -970,6 +984,41 @@ class TextGenerationController:
             keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
             hidden_parts.append(prefill_hidden[keep_hidden])
             token_parts.append(prefill_tokens[keep_token])
+
+            # Chunked-prefill boundary carry. Host-side scalars are fine: a step with a prefill
+            # request is never CUDA-graphed (commit_graphed requires decode-only), so this runs eager.
+            if context.is_chunked_prefill_enabled():
+                pf_ids = context.request_ids[active_slice][
+                    num_decode_requests:active_request_count
+                ].tolist()
+                pf_off = prefill_offsets.tolist()
+                # CARRY-IN: a continuation request (offset s_r>0) whose boundary hidden we stashed
+                # last chunk gets one extra pseudo-request writing position s_r-1 = (stash, t_{s_r}).
+                for li, (rid, off) in enumerate(zip(pf_ids, pf_off)):
+                    carry_hidden = context._mtp_chunk_carry_get(rid)
+                    if off > 0 and carry_hidden is not None:
+                        first_tok = prefill_tokens[seg_start[li]].view(1)
+                        hidden_parts.append(carry_hidden)
+                        token_parts.append(first_tok)
+                        append_parts.append(torch.ones(1, device=device, dtype=torch.long))
+                        start_parts.append(
+                            torch.full((1,), off - 1, device=device, dtype=torch.long)
+                        )
+                        carry_block_row = context.request_to_kv_block_ids[active_slice][
+                            num_decode_requests + li
+                        ]
+                        break
+                # CARRY-OUT: stash the still-chunking request's last chunk hidden (position e-1) to
+                # seed its boundary next chunk. If it finished chunking, drop any stale carry.
+                cid = context.chunked_prefill_request_id
+                if cid != -1 and cid in pf_ids:
+                    co = pf_ids.index(cid)
+                    context._mtp_chunk_carry_set(
+                        cid, prefill_hidden[seg_end[co]].reshape(1, 1, -1)
+                    )
+                else:
+                    # No request is still chunking (carry-in above already consumed any stash).
+                    context._mtp_chunk_carry_clear()
 
         append_counts = torch.cat(append_parts)
         request_start_positions = torch.cat(start_parts)
@@ -987,6 +1036,13 @@ class TextGenerationController:
             .to(device, non_blocking=True)
             .to(context.gpu_view.mha_block_table.dtype)
         )
+        # A carry-in pseudo-request needs its own block-table row (the chunked request's), appended
+        # so its index in the setup's per-request `rows` maps to the right blocks.
+        setup_request_count = active_request_count
+        if carry_block_row is not None:
+            carry_row = carry_block_row.to(device, non_blocking=True).to(block_table.dtype)
+            block_table = torch.cat([block_table, carry_row.unsqueeze(0)], dim=0)
+            setup_request_count += 1
 
         # Graphed path: pad the write-token count to a fixed bucket so the captured graph's shape is
         # stable across steps. The bucket must be >= the max possible `total`: each decode request
@@ -1011,7 +1067,7 @@ class TextGenerationController:
             append_counts=append_counts,
             block_table_prefill=block_table,
             padded_token_count=padded_total,
-            padded_request_count=active_request_count,
+            padded_request_count=setup_request_count,
             request_start_positions=request_start_positions,
         )
         if context._nvls_dispatcher:

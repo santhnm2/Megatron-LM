@@ -405,6 +405,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_mtp_kv_cache = inference_config.enable_mtp_kv_cache
         self._mtp_forward_active = False
         self._mtp_graph_safe_bounds = False
+        # Chunked-prefill boundary carry for the MTP roll-by-one seed. When a prompt is prefilled in
+        # chunks, position e-1 of each chunk needs the NEXT chunk's first token, so its main hidden
+        # is stashed here (gathered/full space) and paired with that token when the next chunk lands.
+        # At most one request is chunked at a time, so a single [1,1,H] slot suffices. Lazily
+        # allocated (needs hidden_size). See [[mtp-chunked-prefill-design]].
+        self._mtp_chunk_carry_hidden = None
+        self._mtp_chunk_carry_req_id = -1
         if self.enable_mtp_kv_cache:
             self.mtp_kv_layer_slot = self.num_attention_layers
             self.num_attention_layers += 1
@@ -1940,6 +1947,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._mtp_forward_active = False
         self.num_prefill_requests = self._mtp_saved_num_prefill_requests
 
+    def _mtp_chunk_carry_get(self, req_id: int):
+        """Return the stashed chunk-boundary hidden [1,1,H] for ``req_id``, or None if no carry."""
+        if req_id >= 0 and self._mtp_chunk_carry_req_id == req_id:
+            return self._mtp_chunk_carry_hidden
+        return None
+
+    def _mtp_chunk_carry_set(self, req_id: int, hidden: Tensor) -> None:
+        """Stash a chunk's last main hidden [1,1,H] to seed its boundary position next chunk."""
+        if self._mtp_chunk_carry_hidden is None:
+            self._mtp_chunk_carry_hidden = hidden.detach().clone()
+        else:
+            self._mtp_chunk_carry_hidden.copy_(hidden)
+        self._mtp_chunk_carry_req_id = req_id
+
+    def _mtp_chunk_carry_clear(self) -> None:
+        """Invalidate the chunk-boundary carry (request finished chunking or context reset)."""
+        self._mtp_chunk_carry_req_id = -1
+
     def _mtp_setup_dummy_commit(self, n: int, padded_token_count: int) -> None:
         """Set up all-dummy commit-pass (varlen) metadata for graph capture.
 
@@ -2853,6 +2878,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
         self.request_in_prefill_status_tensor.fill_(-1)
+
+        # No chunked request survives a full tensor reset; drop any pending MTP boundary carry.
+        self._mtp_chunk_carry_req_id = -1
 
         # Reset request metadata.
         for metadata_tensor in self.request_metadata.values():

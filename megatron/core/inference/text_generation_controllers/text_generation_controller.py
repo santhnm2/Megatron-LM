@@ -876,32 +876,6 @@ class TextGenerationController:
             eager=True,
         )
 
-    def _rewind_mtp_kv_cache(self) -> None:
-        """Rewind the MTP draft KV length offsets to match the accepted tokens.
-
-        The MTP decode loop appended ``D + 1`` entries last step (base + all D drafts,
-        matching the main model's ``D + 1`` forward positions); this step's verification
-        accepted ``a`` of them. Trim the ``D - a`` rejected entries by decrementing each
-        request's MTP length offset, mirroring the main KV rewind with the SAME accepted
-        counts and ``num_speculative_tokens``. This preserves ``mtp_offset == main_len - 1``
-        at the settled boundary (both net-grow by ``1 + a`` per step). Because the MTP layer
-        shares the main block table, NO blocks are released. Requests prefilling this step
-        (prefill_status == 1) had no prior MTP draft and are skipped. Eager path only (v1).
-        """
-        context = self.inference_wrapped_model.inference_context
-        if not getattr(context, "enable_mtp_kv_cache", False):
-            return
-        if context.using_cuda_graph_this_step():
-            return
-        active_request_count = context.total_request_count - context.paused_request_count
-        if active_request_count == 0:
-            return
-
-        active_slice = slice(context.paused_request_count, context.total_request_count)
-        accepted = self._accepted_token_counts_per_request[:active_request_count].cpu()
-        prefill_status = context.request_in_prefill_status_tensor[active_slice]
-        context._mtp_rewind_offsets(accepted, prefill_status, self.num_speculative_tokens)
-
     def _mtp_prefill_seed(
         self,
         context,
@@ -1002,7 +976,7 @@ class TextGenerationController:
             embedding=unwrapped_model.embedding,
             inference_context=context,
         )
-        context._mtp_finalize_prefill_step(num_decode_requests, append_counts)
+        context._mtp_finalize_prefill_step()
         return True
 
     def _mtp_dummy_prefill_forward(self, context, unwrapped_model) -> None:
@@ -1157,13 +1131,15 @@ class TextGenerationController:
         if context._nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
 
-        # MTP KV cache (v1): give the draft attention its own KV in the shared buffer's
-        # reserved slot. Each depth is a decode-style forward (one token per active request);
-        # `_mtp_setup_decode_step` sets the write maps + read metadata from the per-request MTP
-        # length offsets, and `_mtp_advance_decode_step` bumps them after the forward. Eager only.
+        # MTP KV cache (v1): give the draft attention its own KV in the shared buffer's reserved
+        # slot. Each depth is a decode-style forward (one token per active request). The depth-0
+        # write position is base_position - 1 (roll-by-one): the MTP entry for main position
+        # base_position-1 is computed from H_{base_position-1} + emb(base token). Deriving it from
+        # base_position each step (rather than tracking a separate MTP length) means it can never
+        # desync through compaction/pause/rewind. `_mtp_advance_decode_step` bumps it per depth.
         mtp_kv_cache_on = getattr(context, "enable_mtp_kv_cache", False) and has_mtp
         if mtp_kv_cache_on:
-            context._mtp_begin_decode(active_request_count, padded_count)
+            context._mtp_begin_decode(active_request_count, padded_count, base_position - 1)
 
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
@@ -1225,8 +1201,9 @@ class TextGenerationController:
         # MTP KV cache: append one extra entry for the final draft (spec[D-1]). The loop ran
         # D depths (base + spec[0..D-2]); the main model forwards all D+1 positions next step
         # (base + spec[0..D-1]), so the MTP KV must hold D+1 too, else it is one short at full
-        # acceptance. This forward only populates K/V (its logits feed no further depth). The
-        # next step's _rewind_mtp_kv_cache trims the D - accepted rejected entries.
+        # acceptance. This forward only populates K/V (its logits feed no further depth). No
+        # explicit MTP rewind is needed: next step derives its start from base_position (which
+        # advances by 1 + accepted) and overwrites the rejected drafts' positions.
         if mtp_kv_cache_on and has_mtp:
             token_ids_buf[0, :active_request_count] = next_token_ids
             position_ids_buf[0, :active_request_count] = base_position + self.num_mtp_depths
@@ -2176,10 +2153,13 @@ class TextGenerationController:
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
+                # Snapshot the block table BEFORE rewind releases the rejected-draft blocks;
+                # the MTP draft loop reuses it so its speculative writes land on valid blocks.
+                if getattr(context, "enable_mtp_kv_cache", False):
+                    context._mtp_snapshot_prerewind_block_table()
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
-                # Rewind the MTP draft KV alongside the main KV, using the same accepted
-                # counts (shares the main block table, so no blocks are released).
-                self._rewind_mtp_kv_cache()
+                # No separate MTP rewind: the draft loop re-derives its start from the (rewound)
+                # main KV offsets, so rejected drafts are naturally overwritten next step.
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs

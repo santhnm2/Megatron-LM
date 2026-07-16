@@ -1008,16 +1008,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             pin_memory=True,
         )
 
-        # MTP KV cache (v1): per-request committed length of the MTP draft attention's KV.
-        # At settled step boundaries this equals request_kv_length_offsets - 1 (roll-by-one);
-        # it is advanced per MTP depth and rewound alongside the main KV after verification.
-        # The MTP layer reuses `request_to_kv_block_ids` (main's block table), so no separate
-        # block-count / last-block bookkeeping is needed. GPU mirror is allocated lazily.
-        if self.enable_mtp_kv_cache:
-            self.mtp_request_kv_length_offsets = torch.zeros(
-                self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
-            )
-
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
         # `active_request_metadata` (also CPU pinned, refreshed each step).
@@ -1693,40 +1683,71 @@ class DynamicInferenceContext(BaseInferenceContext):
     # MTP KV cache (v1) — decode-step bookkeeping.
     #
     # The MTP draft attention reuses this context's KV `memory_buffer` (extra slot
-    # `mtp_kv_layer_slot`) and main's block table, but tracks its own per-request
-    # committed length in `mtp_request_kv_length_offsets`. Each MTP draft depth is a
-    # decode-style forward: every active request contributes exactly one token, written
-    # at its own MTP position and attending over its own MTP history (write-then-attend).
+    # `mtp_kv_layer_slot`) and main's block table. Each MTP draft depth is a decode-style
+    # forward: every active request contributes exactly one token, written at its own MTP
+    # position and attending over its own MTP history (write-then-attend).
     #
-    # For the eager draft loop we drive the attention metadata directly on the GPU
-    # (bypassing the coalesced CPU->GPU bookkeeping transfer) so the MTP forwards do not
-    # disturb the main step's Mamba/H2D state. `_mtp_begin_decode` snapshots the active
-    # MTP lengths + block table to GPU scratch; `_mtp_setup_decode_step` populates the
-    # write maps + MHA read metadata for one depth; `_mtp_advance_decode_step` bumps the
-    # lengths after the forward; `_mtp_end_decode` restores non-MTP mode and persists the
-    # advanced lengths back to the CPU canonical tensor. RoPE is assumed absent (v1).
+    # There is NO persistent per-request MTP length. The MTP write position for depth 0 is
+    # DERIVED each step as `base_position - 1` (roll-by-one), where `base_position` is the
+    # main model's next-token position (`request_kv_length_offsets + request_query_lengths`).
+    # Because the main KV offsets are maintained by the context through compaction, pause/
+    # resume, and speculative rewind, the derived MTP position can never desync — and no
+    # separate MTP rewind is needed (rejected drafts are simply overwritten next step, since
+    # `base_position` advances by exactly 1 + accepted).
+    #
+    # For the eager draft loop we drive the attention metadata directly on the GPU (bypassing
+    # the coalesced CPU->GPU bookkeeping transfer) so the MTP forwards do not disturb the main
+    # step's Mamba/H2D state. `_mtp_begin_decode` seeds the GPU scratch from the caller's start
+    # positions + block table; `_mtp_setup_decode_step` populates the write maps + MHA read
+    # metadata for one depth; `_mtp_advance_decode_step` bumps the positions; `_mtp_end_decode`
+    # restores non-MTP mode. RoPE is assumed absent (v1).
     # ------------------------------------------------------------------
-    def _mtp_begin_decode(self, active_request_count: int, padded_count: int) -> None:
-        """Enter MTP-forward mode and snapshot active MTP KV state to GPU scratch."""
+    def _mtp_begin_decode(
+        self, active_request_count: int, padded_count: int, start_positions: Tensor
+    ) -> None:
+        """Enter MTP-forward mode.
+
+        `start_positions[r] == base_position[r] - 1` is the MTP write position for depth 0 of
+        request r (derived from the main KV offsets by the caller), advanced by one per depth.
+        """
         assert self.enable_mtp_kv_cache
         active_slice = slice(self.paused_request_count, self.total_request_count)
         device = self.gpu_view.token_to_block_idx.device
         self._mtp_active_request_count = active_request_count
         self._mtp_padded_count = padded_count
-        # Working copy of the MTP committed lengths for the active requests (advanced
-        # per depth on the GPU, persisted back to CPU in `_mtp_end_decode`).
-        self._mtp_offsets_gpu = self.mtp_request_kv_length_offsets[active_slice][
-            :active_request_count
-        ].to(device, non_blocking=True)
-        # Block table for the active requests. Sourced from the CPU canonical
-        # `request_to_kv_block_ids` (post-rewind correct) rather than the stale gpu_view
-        # mirror. MTP positions are a subset of main's, so these blocks always exist.
+        # Depth-0 write positions on the GPU, advanced per depth. Clone so the advance does not
+        # mutate the caller's tensor.
+        self._mtp_offsets_gpu = (
+            start_positions[:active_request_count].to(device, non_blocking=True).to(torch.int32)
+        ).clone()
+        # Block table for the active requests. MUST use the PRE-REWIND snapshot: the MTP draft
+        # loop writes D+1 speculative positions (up to committed-1+D), which extend past the
+        # accepted range into blocks that `_rewind_kv_cache` releases (and clears to -1) when a
+        # draft crosses a block boundary. Using the post-rewind `request_to_kv_block_ids` would
+        # send the deepest drafts to block -1 (corrupt), decaying acceptance with draft depth.
+        # The pre-rewind table (captured right after the main forward, before rewind) still holds
+        # every block the main model allocated for its own D+1 forward positions.
+        block_table_src = (
+            self._mtp_prerewind_block_table
+            if getattr(self, "_mtp_prerewind_block_table", None) is not None
+            else self.request_to_kv_block_ids
+        )
         self._mtp_block_table_gpu = (
-            self.request_to_kv_block_ids[active_slice][:active_request_count]
+            block_table_src[active_slice][:active_request_count]
             .to(device, non_blocking=True)
             .to(self.gpu_view.mha_block_table.dtype)
         )
         self._mtp_forward_active = True
+
+    def _mtp_snapshot_prerewind_block_table(self) -> None:
+        """Capture the block table before `_rewind_kv_cache` releases draft blocks.
+
+        Called right after the main forward and before the rewind. The MTP draft loop later
+        reuses this snapshot so its speculative writes/reads land on the blocks the main model
+        allocated for its own base+draft forward, not on blocks rewind has since released.
+        """
+        if self.enable_mtp_kv_cache:
+            self._mtp_prerewind_block_table = self.request_to_kv_block_ids.clone()
 
     def _mtp_setup_decode_step(self) -> None:
         """Populate token write maps + MHA read metadata for one MTP draft depth."""
@@ -1859,49 +1880,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._using_cuda_graph_this_step = False
         self._mtp_forward_active = True
 
-    def _mtp_finalize_prefill_step(
-        self, prefill_row_start: int, append_counts: Tensor
-    ) -> None:
-        """Persist seeded MTP lengths (L-1 per prefill request) and exit MTP-forward mode."""
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        p = append_counts.numel()
-        row_slice = slice(prefill_row_start, prefill_row_start + p)
-        self.mtp_request_kv_length_offsets[active_slice][row_slice] = append_counts.to("cpu").to(
-            self.mtp_request_kv_length_offsets.dtype
-        )
+    def _mtp_finalize_prefill_step(self) -> None:
+        """Exit MTP-forward mode after the prompt-seeding forward.
+
+        No length is persisted: the decode loop derives its write positions from the main KV
+        offsets (`base_position - 1`), which already reflect the seeded prompt.
+        """
         self._mtp_forward_active = False
 
-    def _mtp_rewind_offsets(
-        self, accepted_counts: Tensor, prefill_status: Tensor, num_speculative_tokens: int
-    ) -> None:
-        """Trim MTP length offsets by ``(D - accepted)`` rejected drafts per request.
-
-        The decode loop appended ``D + 1`` entries (matching the main model's forward); this
-        rewind mirrors the main KV rewind with the same accepted counts so the MTP offset
-        returns to ``main_len - 1``. Requests prefilling this step (prefill_status == 1) had no
-        prior draft and are skipped. All inputs are CPU tensors aligned with the active slice.
-        """
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        n = accepted_counts.numel()
-        num_to_rewind = torch.where(
-            prefill_status[:n] == 1,
-            torch.zeros_like(accepted_counts),
-            num_speculative_tokens - accepted_counts,
-        ).to(self.mtp_request_kv_length_offsets.dtype)
-        offsets = self.mtp_request_kv_length_offsets[active_slice]
-        offsets[:n] = (offsets[:n] - num_to_rewind).clamp_(min=0)
-
     def _mtp_advance_decode_step(self) -> None:
-        """Advance each active request's MTP KV length by one after a depth forward."""
+        """Advance each active request's MTP write position by one after a depth forward."""
         self._mtp_offsets_gpu += 1
 
     def _mtp_end_decode(self) -> None:
-        """Exit MTP-forward mode and persist advanced MTP lengths to the CPU canonical."""
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        n = self._mtp_active_request_count
-        self.mtp_request_kv_length_offsets[active_slice][:n] = self._mtp_offsets_gpu.to(
-            "cpu"
-        ).to(self.mtp_request_kv_length_offsets.dtype)
+        """Exit MTP-forward mode. No persistent MTP length state to write back."""
         self._mtp_forward_active = False
 
     def mamba_states_cache(
@@ -2205,10 +2197,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
-        if self.enable_mtp_kv_cache:
-            # Reset the MTP draft KV length for the (possibly reused) row so a new request never
-            # inherits a stale offset (e.g. a length-1 prompt whose seed writes nothing).
-            self.mtp_request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
@@ -2779,8 +2767,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths.fill_(0)
         self.request_output_lengths.fill_(0)
         self.request_kv_length_offsets.fill_(0)
-        if self.enable_mtp_kv_cache:
-            self.mtp_request_kv_length_offsets.fill_(0)
         self.request_kv_block_counts.fill_(0)
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
@@ -3283,12 +3269,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ] = new_block_ids
 
         self.request_kv_length_offsets[current_id] = effective_kv_offset
-        if self.enable_mtp_kv_cache:
-            # Fresh request: reset the MTP draft KV length for this (possibly reused) row so it
-            # never inherits a stale offset. The prompt seed sets it to L-1 during the step;
-            # a length-1 prompt (seed writes nothing) correctly stays at 0. Prefix caching (a
-            # nonzero effective_kv_offset) is guarded off for the MTP cache.
-            self.mtp_request_kv_length_offsets[current_id] = 0
         self.request_kv_block_counts[current_id] = overall_required_blocks
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
@@ -3395,11 +3375,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
-        if self.enable_mtp_kv_cache:
-            # Keep the MTP draft KV length aligned with its request during compaction.
-            self.mtp_request_kv_length_offsets[dst_idxs] = self.mtp_request_kv_length_offsets[
-                src_idxs
-            ]
         self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
             src_idxs
         ]
@@ -3826,13 +3801,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
-            if self.enable_mtp_kv_cache:
-                # The MTP draft KV length must follow its request through compaction, exactly
-                # like the main KV offset; otherwise it desyncs as requests finish and acceptance
-                # decays over time.
-                self.mtp_request_kv_length_offsets[dst_idxs] = self.mtp_request_kv_length_offsets[
-                    survivor_idxs
-                ]
             self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
                 survivor_idxs
             ]

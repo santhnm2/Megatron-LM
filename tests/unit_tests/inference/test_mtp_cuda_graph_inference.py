@@ -95,7 +95,12 @@ class TestMTPCudaGraphInference:
     # ---- helpers ---------------------------------------------------------- #
 
     def _build_model(
-        self, *, sequence_parallel=False, mtp_num_layers=2, mtp_use_repeated_layer=False
+        self,
+        *,
+        sequence_parallel=False,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        kv_channels=None,
     ):
         """Build a GPT model with MTP layers and local CUDA graph support."""
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
@@ -103,6 +108,9 @@ class TestMTPCudaGraphInference:
             num_layers=self.NUM_LAYERS,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=self.NUM_ATTN_HEADS,
+            # kv_channels (head_dim) is set to 64 for the MTP-KV-cache tests: the paged
+            # flash-attention decode path the cache uses rejects irregular head dims (e.g. 8).
+            kv_channels=kv_channels,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.local,
             params_dtype=torch.bfloat16,
@@ -141,6 +149,8 @@ class TestMTPCudaGraphInference:
         mtp_use_repeated_layer=False,
         num_speculative_tokens=2,
         max_requests=16,
+        enable_mtp_kv_cache=False,
+        kv_channels=None,
     ):
         """Build a DynamicInferenceEngine with automatic MTP CUDA graph warmup.
 
@@ -152,6 +162,7 @@ class TestMTPCudaGraphInference:
             sequence_parallel=sequence_parallel,
             mtp_num_layers=mtp_num_layers,
             mtp_use_repeated_layer=mtp_use_repeated_layer,
+            kv_channels=kv_channels,
         )
         config = model.config
         context = DynamicInferenceContext(
@@ -165,6 +176,7 @@ class TestMTPCudaGraphInference:
                 max_requests=max_requests,
                 num_cuda_graphs=-1,
                 sampling_backend='torch',
+                enable_mtp_kv_cache=enable_mtp_kv_cache,
             ),
         )
         wrapped = GPTInferenceWrapper(model, context)
@@ -194,6 +206,32 @@ class TestMTPCudaGraphInference:
             if n > 0:
                 sizes.add(n)
         return sorted(sizes)
+
+    @staticmethod
+    def _setup_mtp_distinct_decode(context, n):
+        """Set up n dummy MTP decode requests with a DISTINCT block per request.
+
+        Unlike `_mtp_setup_dummy_decode` (which points every request at the shared dummy block —
+        fine for capture where output is discarded), this gives each request its own block so
+        `append_key_value_cache`'s scatter has no duplicate indices. Without that the scatter is
+        nondeterministic (which duplicate write wins) and graph vs eager can legitimately diverge.
+        Each request writes/reads position 0 of its own block, so the output is deterministic.
+        """
+        import torch as _torch
+
+        context.paused_request_count = 0
+        context.total_request_count = n
+        context.num_prefill_requests = 0
+        device = context.gpu_view.token_to_block_idx.device
+        context.request_to_kv_block_ids[:n, 0] = _torch.arange(
+            n, dtype=context.request_to_kv_block_ids.dtype
+        )
+        context._mtp_prerewind_block_table = None
+        context._mtp_begin_decode(
+            n, n, _torch.zeros(n, device=device, dtype=_torch.int64)
+        )
+        context._mtp_graph_safe_bounds = True
+        context._mtp_setup_decode_step()
 
     @staticmethod
     def _mtp_kwargs(use_graph, batch_size, mtp_depth):
@@ -291,6 +329,75 @@ class TestMTPCudaGraphInference:
             )
             torch.testing.assert_close(
                 logits_graph, logits_eager, msg=f"Logits mismatch at batch_size={batch_size}"
+            )
+
+        self._assert_mtp_cuda_graphs_were_replayed(model, True)
+
+    # ---- Test 1b: graph matches eager WITH the MTP KV cache --------------- #
+
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
+    @torch.inference_mode()
+    def test_cuda_graph_output_matches_eager_with_mtp_kv_cache(self, mtp_use_repeated_layer):
+        """With the MTP KV cache on, CUDA-graph replay of the MTP forward matches eager.
+
+        The warmup captures the MTP graph WITH `mtp_inference_context` and the paged-KV
+        attention. Both the graph and eager calls run over identical fresh dummy decode state
+        (set up exactly as the real controller does), so their hidden/logits must be identical.
+        kv_channels=64 so the paged flash-attention decode path accepts the head dim.
+        """
+        engine = self._build_engine(
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+            enable_mtp_kv_cache=True,
+            kv_channels=64,
+        )
+        model = engine.controller.inference_wrapped_model.model
+        unwrapped = unwrap_model(model)
+        context = engine.context
+        assert context.enable_mtp_kv_cache and context.mtp_kv_layer_slot is not None
+        batch_sizes = self._get_mtp_warmed_batch_sizes(engine)
+        assert len(batch_sizes) > 0, "Engine did not warm up any MTP CUDA graphs"
+        mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
+
+        for batch_size in batch_sizes[:3]:
+            hidden = torch.randn(
+                batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+            )
+            dist.broadcast(hidden, src=0)
+            token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
+            dist.broadcast(token_ids, src=0)
+            position_ids = torch.arange(batch_size, device='cuda', dtype=torch.int64).unsqueeze(0)
+
+            # Graph replay: set up dummy decode state (+ slot routing + graph-safe bounds) first.
+            self._setup_mtp_distinct_decode(context, batch_size)
+            h_graph, logits_graph = unwrapped.compute_mtp_single_step(
+                hidden_states=hidden.clone(),
+                next_token_ids=token_ids.clone(),
+                position_ids=position_ids.clone(),
+                depth=mtp_depth,
+                mtp_inference_context=context,
+                cache_key=("mtp", batch_size, mtp_depth),
+            )
+            h_graph = h_graph.clone()
+            logits_graph = logits_graph.clone()
+            context._mtp_end_decode()
+
+            # Eager over identical fresh state (attends over its own just-written K/V).
+            self._setup_mtp_distinct_decode(context, batch_size)
+            h_eager, logits_eager = unwrapped.compute_mtp_single_step(
+                hidden_states=hidden.clone(),
+                next_token_ids=token_ids.clone(),
+                position_ids=position_ids.clone(),
+                depth=mtp_depth,
+                mtp_inference_context=context,
+                eager=True,
+            )
+            context._mtp_end_decode()
+
+            torch.testing.assert_close(
+                h_graph, h_eager, msg=f"Hidden mismatch (cache) at batch_size={batch_size}"
+            )
+            torch.testing.assert_close(
+                logits_graph, logits_eager, msg=f"Logits mismatch (cache) at batch_size={batch_size}"
             )
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)

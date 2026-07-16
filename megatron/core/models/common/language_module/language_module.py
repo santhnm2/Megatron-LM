@@ -77,6 +77,15 @@ class LanguageModule(MegatronModule):
                 need_backward=False,
                 inline_capture=True,
             )
+            # Separate manager for the commit-pass KV-write forward. It has a different (padded
+            # write-token) shape than the per-depth forwards, so it needs its own runner table.
+            self._mtp_kv_write_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_kv_write",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -395,6 +404,36 @@ class LanguageModule(MegatronModule):
         logits = self._scale_logits(logits)
 
         return mtp_hidden, logits
+
+    def compute_mtp_kv_write(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        eager: bool = False,
+        cache_key=None,
+        mtp_inference_context=None,
+    ) -> Tensor:
+        """Run one MTP-layer forward that only populates the draft KV cache (no output layer).
+
+        Used by the speculative-decoding "commit pass" (vLLM-style first pass) to refresh committed
+        positions' draft KV from the MAIN hidden states. The K/V are pure projections of the input
+        (no RoPE), so the output hidden is discarded; only the KV writes matter. Kept separate from
+        ``compute_mtp_single_step`` so the (large) output-layer projection is skipped and so this
+        pass gets its own ``CudaGraphManager`` bucket keyed on the padded write-token count.
+
+        ``eager, cache_key`` are consumed by the wrapping ``CudaGraphManager`` if it exists (same
+        monkey-patch convention as ``compute_mtp_single_step``).
+        """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
+        return self.mtp.layers[0].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+            inference_context=mtp_inference_context,
+        )
 
     def sharded_state_dict(
         self,

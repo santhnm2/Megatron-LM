@@ -5,6 +5,7 @@ import concurrent.futures
 import logging
 import math
 import multiprocessing
+import os
 import socket
 import time
 import warnings
@@ -479,6 +480,16 @@ class DynamicInferenceEngine(AbstractEngine):
                         mtp_seen_batch_sizes.add(n)
                         device = torch.cuda.current_device()
                         batch_dim = n // tp_size if sp_enabled else n
+                        # MTP KV cache: set up n dummy decode requests + attention metadata so the
+                        # captured graph has valid MTP slot routing / shapes, and pass the same
+                        # `mtp_inference_context` kwarg the real graphed step passes (capture and
+                        # replay kwargs must match exactly, else the CUDA-graph arg check trips).
+                        mtp_cache_on = getattr(context, "enable_mtp_kv_cache", False)
+                        if mtp_cache_on:
+                            context._mtp_setup_dummy_decode(n)
+                        mtp_ctx_kwargs = (
+                            {"mtp_inference_context": context} if mtp_cache_on else {}
+                        )
                         # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
                         for depth in mtp_warmup_depths:
                             unwrapped.compute_mtp_single_step(
@@ -491,7 +502,35 @@ class DynamicInferenceEngine(AbstractEngine):
                                 position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
                                 depth=depth,
                                 cache_key=("mtp", n, depth),
+                                **mtp_ctx_kwargs,
                             )
+                        if mtp_cache_on:
+                            context._mtp_end_decode()
+                            # Capture the commit-pass KV-write graph for this batch size. Its write-
+                            # token count is padded to a fixed bucket (n * num_speculative_tokens)
+                            # so the graphed decode-only commit pass replays a stable shape.
+                            commit_bucket = n * controller.num_speculative_tokens
+                            if sp_enabled:
+                                commit_bucket = round_up_to_nearest_multiple(commit_bucket, tp_size)
+                            if commit_bucket > 0:
+                                context._mtp_setup_dummy_commit(n, commit_bucket)
+                                cb = commit_bucket // tp_size if sp_enabled else commit_bucket
+                                unwrapped.compute_mtp_kv_write(
+                                    hidden_states=torch.zeros(
+                                        (cb, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, commit_bucket), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, commit_bucket), device=device, dtype=torch.int64
+                                    ),
+                                    cache_key=("mtp_commit", n),
+                                    mtp_inference_context=context,
+                                )
+                                context._mtp_finalize_prefill_step()
 
                 context.reset()
 
@@ -1996,6 +2035,17 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time = 0.0
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
+
+        # nsys: self-gated cudaProfiler window on step_count (env NSYS_PROF_START/END)
+        # so an outer `nsys --capture-range=cudaProfilerApi` traces only these steps.
+        _ps = os.environ.get("NSYS_PROF_START")
+        if _ps is not None:
+            if self.context.step_count == int(_ps):
+                torch.cuda.cudart().cudaProfilerStart()
+            else:
+                _pe = os.environ.get("NSYS_PROF_END")
+                if _pe is not None and self.context.step_count == int(_pe):
+                    torch.cuda.cudart().cudaProfilerStop()
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 

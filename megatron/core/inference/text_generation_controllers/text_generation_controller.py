@@ -884,6 +884,7 @@ class TextGenerationController:
         num_decode_requests: int,
         active_request_count: int,
         base_position,
+        padded_count: int,
     ) -> bool:
         """Refresh every committed position's draft KV from the MAIN hidden (vLLM's first pass).
 
@@ -901,6 +902,15 @@ class TextGenerationController:
         if context.chunked_prefill_request_id != -1:
             raise NotImplementedError("MTP KV cache does not yet support chunked prefill (v1).")
 
+        # The commit-pass forward is CUDA-graphed on decode-only graphed steps: its write-token count
+        # `total` (= sum of accepted drafts) varies per step, so we pad it up to a fixed bucket
+        # (`padded_count * num_speculative_tokens` >= the max possible sum) and reuse a captured graph
+        # keyed on `padded_count`. On mixed prefill/decode steps (or eager steps) the token count is
+        # large/unbounded, so it stays eager. Decode-only <=> no prefill requests this step.
+        commit_graphed = (
+            context._mtp_graph_safe_bounds and active_request_count == num_decode_requests
+        )
+
         device = gathered_hidden.device
         stride = self.num_speculative_tokens + 1
         decode_len = num_decode_requests * stride
@@ -909,6 +919,9 @@ class TextGenerationController:
         hidden_parts, token_parts, append_parts, start_parts = [], [], [], []
 
         # --- Decode requests: refresh accepted-draft positions from main hiddens. ---
+        # Parts are built UNCONDITIONALLY (empty when a request accepted 0 drafts / no prefill) so
+        # this path has no data-dependent `.item()` host syncs beyond the one repeat_interleave
+        # already needs to size the ragged gather.
         if num_decode_requests > 0:
             accepted = (
                 self._accepted_token_counts_per_request[:num_decode_requests]
@@ -918,19 +931,19 @@ class TextGenerationController:
             append_parts.append(accepted)
             # start of each request's refreshed run: (last committed MTP pos) - a_r.
             start_parts.append(base_position[:num_decode_requests] - 1 - accepted)
-            total_a = int(accepted.sum().item())
-            if total_a > 0:
-                decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
-                decode_tokens = context.gpu_view.token_to_input_ids[:decode_len].to(device)
-                rows_d = torch.repeat_interleave(
-                    torch.arange(num_decode_requests, device=device), accepted
-                )
-                within_d = torch.arange(total_a, device=device) - (
-                    torch.cumsum(accepted, 0) - accepted
-                )[rows_d]
-                hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
-                hidden_parts.append(decode_hidden[hidden_idx])
-                token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
+            decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
+            decode_tokens = context.gpu_view.token_to_input_ids[:decode_len].to(device)
+            # repeat_interleave sizes rows_d to accepted.sum() (one unavoidable host sync);
+            # read the token count from rows_d.numel() rather than a second `.item()`.
+            rows_d = torch.repeat_interleave(
+                torch.arange(num_decode_requests, device=device), accepted
+            )
+            within_d = torch.arange(rows_d.numel(), device=device) - (
+                torch.cumsum(accepted, 0) - accepted
+            )[rows_d]
+            hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
+            hidden_parts.append(decode_hidden[hidden_idx])
+            token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
 
         # --- Prefill requests: seed prompt positions 0..L-2 from main hiddens. ---
         if active_request_count > num_decode_requests:
@@ -943,41 +956,53 @@ class TextGenerationController:
             )
             append_parts.append(query_lengths - 1)
             start_parts.append(torch.zeros_like(query_lengths))
-            total_prompt = int(query_lengths.sum().item())
-            if total_prompt > 0:
-                prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
-                prefill_tokens = context.gpu_view.token_to_input_ids[
-                    decode_len : decode_len + total_prompt
-                ].to(device)
-                seg_start = torch.cumsum(query_lengths, 0) - query_lengths
-                seg_end = torch.cumsum(query_lengths, 0) - 1
-                keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
-                keep_hidden[seg_end] = False  # drop each request's last hidden (no next token)
-                keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
-                keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
-                hidden_parts.append(prefill_hidden[keep_hidden])
-                token_parts.append(prefill_tokens[keep_token])
+            # Prefill token count = active_token_count - decode_len (both host ints, no sync).
+            total_prompt = context.active_token_count - decode_len
+            prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
+            prefill_tokens = context.gpu_view.token_to_input_ids[
+                decode_len : decode_len + total_prompt
+            ].to(device)
+            seg_start = torch.cumsum(query_lengths, 0) - query_lengths
+            seg_end = torch.cumsum(query_lengths, 0) - 1
+            keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
+            keep_hidden[seg_end] = False  # drop each request's last hidden (no next token)
+            keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
+            keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
+            hidden_parts.append(prefill_hidden[keep_hidden])
+            token_parts.append(prefill_tokens[keep_token])
 
         append_counts = torch.cat(append_parts)
         request_start_positions = torch.cat(start_parts)
-        total = int(append_counts.sum().item())
-        if total == 0:
-            # Nothing committed to (re)write this step (e.g. all decode requests accepted 0 drafts
-            # and no prefill). Caller runs a dummy slot so the EP forward count stays matched.
-            return False
-
         packed_hidden = torch.cat(hidden_parts)  # [total, 1, H], decode-first request order
         packed_tokens = torch.cat(token_parts)  # [total]
+        total = packed_hidden.shape[0]  # == sum(append_counts); a host-known shape, not an .item()
+        if total == 0 and not commit_graphed:
+            # Nothing committed to (re)write this step (e.g. all decode requests accepted 0 drafts
+            # and no prefill). Caller runs a dummy slot so the EP forward count stays matched.
+            # On the graphed path we instead run the fixed-bucket forward (all padding rows) so the
+            # shape stays static and the EP forward count is unconditionally matched.
+            return False
         block_table = (
             context.request_to_kv_block_ids[active_slice][:active_request_count]
             .to(device, non_blocking=True)
             .to(context.gpu_view.mha_block_table.dtype)
         )
 
-        padded_total = total
-        if self._sp_enabled:
+        # Graphed path: pad the write-token count to a fixed bucket so the captured graph's shape is
+        # stable across steps. The bucket must be >= the max possible `total`: each decode request
+        # can refresh at most `num_speculative_tokens` accepted-draft positions, so
+        # `padded_count * num_speculative_tokens` bounds it. Eager path pads only for SP alignment.
+        if commit_graphed:
+            padded_total = padded_count * self.num_speculative_tokens
+            if self._sp_enabled:
+                padded_total = round_up_to_nearest_multiple(padded_total, self._tp_size)
+        elif self._sp_enabled:
             padded_total = round_up_to_nearest_multiple(total, self._tp_size)
+        else:
+            padded_total = total
+        if padded_total > total:
             packed_hidden = F.pad(packed_hidden, (0, 0, 0, 0, 0, padded_total - total))
+        if self._sp_enabled:
             packed_hidden = scatter_to_sequence_parallel_region(
                 packed_hidden, group=self.inference_wrapped_model.tp_group
             )
@@ -999,13 +1024,17 @@ class TextGenerationController:
             token_ids = F.pad(token_ids, (0, padded_total - total))
             position_ids = F.pad(position_ids, (0, padded_total - total))
 
-        # Run the MTP attention to populate K/V only (output hidden discarded).
-        unwrapped_model.mtp.layers[0].forward_single_position(
+        # Run the MTP attention to populate K/V only (output hidden discarded). On decode-only
+        # graphed steps this replays a captured graph keyed on `padded_count`; otherwise it runs
+        # eager. `compute_mtp_kv_write` (vs the direct layer call) routes through the dedicated
+        # CudaGraphManager, which consumes `eager`/`cache_key`.
+        unwrapped_model.compute_mtp_kv_write(
             hidden_states=packed_hidden,
             next_token_ids=token_ids,
             position_ids=position_ids,
-            embedding=unwrapped_model.embedding,
-            inference_context=context,
+            eager=not commit_graphed,
+            cache_key=("mtp_commit", padded_count) if commit_graphed else None,
+            mtp_inference_context=context,
         )
         context._mtp_finalize_prefill_step()
         return True
@@ -1104,29 +1133,9 @@ class TextGenerationController:
         # Cast to int64 to match CUDA graph capture dtype expectations.
         base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
-        # MTP KV cache (v1): before the draft loop, refresh every committed position's draft KV
-        # from the MAIN model hidden states (vLLM's per-step "first pass"), so committed KV never
-        # carries a stale chained-draft-hidden value (which would decay acceptance with depth).
-        # Covers prefill prompts (seed) and decode accepted drafts (refresh) in one forward.
-        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            issued_slot = self._mtp_commit_pass(
-                context,
-                unwrapped_model,
-                hidden_states,
-                num_decode_requests=active_request_count - context.num_prefill_requests,
-                active_request_count=active_request_count,
-                base_position=base_position,
-            )
-            if not issued_slot:
-                # EP consistency: every rank runs exactly one commit-pass forward per step (real
-                # above, or this dummy) so the MoE all-to-alls stay count-matched.
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
-
-        # Start with the freshly sampled base token.
-        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
-        current_hidden = last_accepted_hidden if has_mtp else None
-
-        # Compute padding needed to make batch compatible with SP and CUDA graphs.
+        # Compute padding needed to make batch compatible with SP and CUDA graphs. Hoisted above the
+        # commit pass (which reuses it to size its graphed KV-write bucket); the hidden-state padding
+        # that consumes `pad_count` still happens below, after the commit pass.
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             # CUDA-graph path: use the EP-synced padded count.
             padded_count = self._mtp_resolved_padded_count
@@ -1139,6 +1148,33 @@ class TextGenerationController:
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
+
+        # MTP KV cache (v1): before the draft loop, refresh every committed position's draft KV
+        # from the MAIN model hidden states (vLLM's per-step "first pass"), so committed KV never
+        # carries a stale chained-draft-hidden value (which would decay acceptance with depth).
+        # Covers prefill prompts (seed) and decode accepted drafts (refresh) in one forward.
+        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
+            # Capture the main step's graph state now, before the commit pass / decode setup
+            # clobber `_using_cuda_graph_this_step` to False. The MTP metadata setups read this
+            # to choose capture-safe (conservative) flash-attention max_seqlen bounds.
+            context._mtp_graph_safe_bounds = context.using_cuda_graph_this_step()
+            issued_slot = self._mtp_commit_pass(
+                context,
+                unwrapped_model,
+                hidden_states,
+                num_decode_requests=active_request_count - context.num_prefill_requests,
+                active_request_count=active_request_count,
+                base_position=base_position,
+                padded_count=padded_count,
+            )
+            if not issued_slot:
+                # EP consistency: every rank runs exactly one commit-pass forward per step (real
+                # above, or this dummy) so the MoE all-to-alls stay count-matched.
+                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+
+        # Start with the freshly sampled base token.
+        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
+        current_hidden = last_accepted_hidden if has_mtp else None
 
         # Pad hidden states and scatter for sequence parallelism.
         if has_mtp:
@@ -1174,6 +1210,17 @@ class TextGenerationController:
         if mtp_kv_cache_on:
             context._mtp_begin_decode(active_request_count, padded_count, base_position - 1)
 
+        # Whether this step's MTP forwards are graph-captured. When the MTP KV cache is on, the
+        # per-depth `_mtp_setup_decode_step` clobbers `using_cuda_graph_this_step()` to False, so
+        # read the main-step flag captured before the commit pass instead. When off, the flag is
+        # untouched. Drives eager/cache_key and the (kwarg-matched) mtp_inference_context passing.
+        mtp_step_graphed = (
+            context._mtp_graph_safe_bounds
+            if mtp_kv_cache_on
+            else context.using_cuda_graph_this_step()
+        )
+        mtp_ctx_kwargs = {"mtp_inference_context": context} if mtp_kv_cache_on else {}
+
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
@@ -1191,13 +1238,9 @@ class TextGenerationController:
                     next_token_ids=token_ids_buf,
                     position_ids=position_ids_buf,
                     depth=mtp_depth,
-                    eager=not context.using_cuda_graph_this_step(),
-                    cache_key=(
-                        ("mtp", padded_count, mtp_depth)
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    ),
-                    mtp_inference_context=context if mtp_kv_cache_on else None,
+                    eager=not mtp_step_graphed,
+                    cache_key=("mtp", padded_count, mtp_depth) if mtp_step_graphed else None,
+                    **mtp_ctx_kwargs,
                 )
                 if mtp_kv_cache_on:
                     context._mtp_advance_decode_step()
@@ -1251,14 +1294,19 @@ class TextGenerationController:
                 next_token_ids=token_ids_buf,
                 position_ids=position_ids_buf,
                 depth=extra_depth,
-                eager=not context.using_cuda_graph_this_step(),
-                cache_key=None,
-                mtp_inference_context=context,
+                eager=not mtp_step_graphed,
+                # Reuse the warmup-captured graph for extra_depth (same shape as the depth loop).
+                cache_key=("mtp", padded_count, extra_depth) if mtp_step_graphed else None,
+                **mtp_ctx_kwargs,
             )
             context._mtp_advance_decode_step()
 
         if mtp_kv_cache_on:
             context._mtp_end_decode()
+            # The MTP setups clobbered `_using_cuda_graph_this_step` to False (to route the MTP
+            # forward's attention onto the directly-written metadata). Restore the main step's
+            # value so end-of-step logging / any downstream reader reflects the real graph state.
+            context._using_cuda_graph_this_step = context._mtp_graph_safe_bounds
 
         # In eager mode forward() assigns the hidden states tensor directly to
         # the context attribute; release it so the tensor can be garbage
@@ -1930,33 +1978,43 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
-        # When the MTP KV cache is active (eager), real ranks run one prefill-slot forward
-        # BEFORE the depth loop and one extra-append forward AFTER it. Mirror both here so the
-        # dummy rank issues the same number of MoE all-to-alls (else the shared collective hangs).
-        mtp_cache_active = (
-            getattr(context, "enable_mtp_kv_cache", False)
-            and not context.using_cuda_graph_this_step()
-        )
-        if mtp_cache_active and has_mtp:
+        # The MTP KV cache makes real ranks run one commit-pass forward BEFORE the depth loop and
+        # one extra-append forward AFTER it. Mirror both here so the dummy rank issues the same
+        # number of MoE all-to-alls (else the shared collective hangs). The commit pass is always
+        # EAGER (even on graph steps), so the dummy commit slot is the eager dummy prefill.
+        graphed = context.using_cuda_graph_this_step()
+        mtp_cache_on = getattr(context, "enable_mtp_kv_cache", False)
+        if mtp_cache_on and has_mtp:
             self._mtp_dummy_prefill_forward(context, unwrapped_model)
+
+        # On graph steps the captured MTP graphs (depth + extra) include `mtp_inference_context`
+        # and read the MTP attention metadata, so set up dummy decode state and pass the same
+        # kwarg the real ranks pass (capture/replay kwargs + metadata shapes must match). On eager
+        # steps the dummy forwards run cache-free (kwarg omitted) — only the all-to-all count matters.
+        if mtp_cache_on and has_mtp and graphed:
+            context._mtp_setup_dummy_decode(padded_count)
+            dummy_mtp_ctx = {"mtp_inference_context": context}
+        else:
+            dummy_mtp_ctx = {}
 
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                if mtp_cache_on and graphed:
+                    context._mtp_setup_decode_step()
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
                     position_ids=dummy_position_ids,
                     depth=mtp_depth,
-                    eager=not context.using_cuda_graph_this_step(),
-                    cache_key=(
-                        ("mtp", padded_count, mtp_depth)
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    ),
+                    eager=not graphed,
+                    cache_key=("mtp", padded_count, mtp_depth) if graphed else None,
+                    **dummy_mtp_ctx,
                 )
+                if mtp_cache_on and graphed:
+                    context._mtp_advance_decode_step()
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
@@ -1971,20 +2029,28 @@ class TextGenerationController:
 
         # Extra-append forward to match the real path's D+1th MTP forward (no PP broadcast,
         # mirroring the real extra append which does not broadcast its logits).
-        if mtp_cache_active and has_mtp:
+        if mtp_cache_on and has_mtp:
             extra_depth = (
                 None
                 if unwrapped_model.mtp.mtp_use_repeated_layer
                 else self.num_mtp_depths - 1
             )
+            if graphed:
+                context._mtp_setup_decode_step()
             unwrapped_model.compute_mtp_single_step(
                 hidden_states=dummy_hidden,
                 next_token_ids=dummy_token_ids,
                 position_ids=dummy_position_ids,
                 depth=extra_depth,
-                eager=not context.using_cuda_graph_this_step(),
-                cache_key=None,
+                eager=not graphed,
+                cache_key=("mtp", padded_count, extra_depth) if graphed else None,
+                **dummy_mtp_ctx,
             )
+            if mtp_cache_on and graphed:
+                context._mtp_advance_decode_step()
+
+        if mtp_cache_on and has_mtp and graphed:
+            context._mtp_end_decode()
 
     def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
         """Batch GPU-to-CPU transfer of sampled tokens.

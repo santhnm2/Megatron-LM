@@ -1207,7 +1207,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_cos=rotary_pos_cos,
                         rotary_pos_sin=rotary_pos_sin,
                         attention_bias=attention_bias,
-                        inference_params=inference_params,
+                        # Pass as `inference_context` (not the legacy `inference_params`) so the
+                        # inner TransformerLayer's local-cudagraph check `kwargs['inference_context']`
+                        # sees it; matches the hybrid (mtp_layer_pattern) branch above.
+                        inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,

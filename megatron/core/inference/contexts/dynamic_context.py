@@ -2205,6 +2205,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
+        if self.enable_mtp_kv_cache:
+            # Reset the MTP draft KV length for the (possibly reused) row so a new request never
+            # inherits a stale offset (e.g. a length-1 prompt whose seed writes nothing).
+            self.mtp_request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
@@ -2775,6 +2779,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths.fill_(0)
         self.request_output_lengths.fill_(0)
         self.request_kv_length_offsets.fill_(0)
+        if self.enable_mtp_kv_cache:
+            self.mtp_request_kv_length_offsets.fill_(0)
         self.request_kv_block_counts.fill_(0)
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
@@ -3277,6 +3283,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             ] = new_block_ids
 
         self.request_kv_length_offsets[current_id] = effective_kv_offset
+        if self.enable_mtp_kv_cache:
+            # Fresh request: reset the MTP draft KV length for this (possibly reused) row so it
+            # never inherits a stale offset. The prompt seed sets it to L-1 during the step;
+            # a length-1 prompt (seed writes nothing) correctly stays at 0. Prefix caching (a
+            # nonzero effective_kv_offset) is guarded off for the MTP cache.
+            self.mtp_request_kv_length_offsets[current_id] = 0
         self.request_kv_block_counts[current_id] = overall_required_blocks
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
@@ -3383,6 +3395,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
+        if self.enable_mtp_kv_cache:
+            # Keep the MTP draft KV length aligned with its request during compaction.
+            self.mtp_request_kv_length_offsets[dst_idxs] = self.mtp_request_kv_length_offsets[
+                src_idxs
+            ]
         self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
             src_idxs
         ]
@@ -3809,6 +3826,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
+            if self.enable_mtp_kv_cache:
+                # The MTP draft KV length must follow its request through compaction, exactly
+                # like the main KV offset; otherwise it desyncs as requests finish and acceptance
+                # decays over time.
+                self.mtp_request_kv_length_offsets[dst_idxs] = self.mtp_request_kv_length_offsets[
+                    survivor_idxs
+                ]
             self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
                 survivor_idxs
             ]

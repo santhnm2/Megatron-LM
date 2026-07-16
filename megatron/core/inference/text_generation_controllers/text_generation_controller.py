@@ -876,71 +876,100 @@ class TextGenerationController:
             eager=True,
         )
 
-    def _mtp_prefill_seed(
+    def _mtp_commit_pass(
         self,
         context,
         unwrapped_model,
         gathered_hidden,
         num_decode_requests: int,
         active_request_count: int,
-    ) -> None:
-        """Seed the MTP KV cache from the prompt hidden states (roll-by-one prefill).
+        base_position,
+    ) -> bool:
+        """Refresh every committed position's draft KV from the MAIN hidden (vLLM's first pass).
 
-        For each prefill request (prompt length L) the MTP attention processes positions
-        0..L-2, pairing main hidden ``h_i`` with the embedding of the next prompt token
-        ``t_{i+1}``, establishing ``mtp_offset == L-1``. Position L-1 is filled by decode
-        depth 0. v1 supports single-chunk prompts only (prefix caching is guarded at the
-        config level; chunked prefill raises here).
+        One varlen roll-by-one forward over all active requests' committed tokens, so a committed
+        position p always holds draft KV = f(h_p^main + emb(t_{p+1})) and never a stale
+        chained-draft-hidden value (the cause of depth-increasing acceptance decay). K/V are pure
+        projections of the input (no RoPE), so only the write positions matter; the output hidden
+        is discarded. Covers, per request:
+          - decode: the a_r accepted-draft positions this step (base + drafts 0..a-2), from this
+            step's main hiddens for the accepted forwarded tokens. The LAST accepted position is
+            written by decode depth 0, so this covers the earlier a_r positions (start = base-1-a_r).
+          - prefill: the prompt positions 0..L-2 (seed from empty, start = 0).
+        Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
         if context.chunked_prefill_request_id != -1:
             raise NotImplementedError("MTP KV cache does not yet support chunked prefill (v1).")
 
-        num_prefill = active_request_count - num_decode_requests
         device = gathered_hidden.device
-        num_spec = self.num_speculative_tokens
-        decode_len = num_decode_requests * (num_spec + 1)
+        stride = self.num_speculative_tokens + 1
+        decode_len = num_decode_requests * stride
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Prompt lengths for the prefill requests (active slice is decode-first, prefill last).
-        query_lengths = (
-            context.request_query_lengths[active_slice][num_decode_requests:active_request_count]
-            .to(device, non_blocking=True)
-            .to(torch.long)
-        )
-        append_counts = query_lengths - 1  # positions 0..L-2 seeded per request
+        hidden_parts, token_parts, append_parts, start_parts = [], [], [], []
+
+        # --- Decode requests: refresh accepted-draft positions from main hiddens. ---
+        if num_decode_requests > 0:
+            accepted = (
+                self._accepted_token_counts_per_request[:num_decode_requests]
+                .to(device, non_blocking=True)
+                .to(torch.long)
+            )
+            append_parts.append(accepted)
+            # start of each request's refreshed run: (last committed MTP pos) - a_r.
+            start_parts.append(base_position[:num_decode_requests] - 1 - accepted)
+            total_a = int(accepted.sum().item())
+            if total_a > 0:
+                decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
+                decode_tokens = context.gpu_view.token_to_input_ids[:decode_len].to(device)
+                rows_d = torch.repeat_interleave(
+                    torch.arange(num_decode_requests, device=device), accepted
+                )
+                within_d = torch.arange(total_a, device=device) - (
+                    torch.cumsum(accepted, 0) - accepted
+                )[rows_d]
+                hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
+                hidden_parts.append(decode_hidden[hidden_idx])
+                token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
+
+        # --- Prefill requests: seed prompt positions 0..L-2 from main hiddens. ---
+        if active_request_count > num_decode_requests:
+            query_lengths = (
+                context.request_query_lengths[active_slice][
+                    num_decode_requests:active_request_count
+                ]
+                .to(device, non_blocking=True)
+                .to(torch.long)
+            )
+            append_parts.append(query_lengths - 1)
+            start_parts.append(torch.zeros_like(query_lengths))
+            total_prompt = int(query_lengths.sum().item())
+            if total_prompt > 0:
+                prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
+                prefill_tokens = context.gpu_view.token_to_input_ids[
+                    decode_len : decode_len + total_prompt
+                ].to(device)
+                seg_start = torch.cumsum(query_lengths, 0) - query_lengths
+                seg_end = torch.cumsum(query_lengths, 0) - 1
+                keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
+                keep_hidden[seg_end] = False  # drop each request's last hidden (no next token)
+                keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
+                keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
+                hidden_parts.append(prefill_hidden[keep_hidden])
+                token_parts.append(prefill_tokens[keep_token])
+
+        append_counts = torch.cat(append_parts)
+        request_start_positions = torch.cat(start_parts)
         total = int(append_counts.sum().item())
         if total == 0:
-            # Every prefill prompt is length 1: nothing to seed (decode fills pos 0). The caller
-            # runs a dummy prefill-slot forward instead so the EP forward count stays matched.
+            # Nothing committed to (re)write this step (e.g. all decode requests accepted 0 drafts
+            # and no prefill). Caller runs a dummy slot so the EP forward count stays matched.
             return False
 
-        total_prompt = int(query_lengths.sum().item())
-        prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]  # [T_p, 1, H]
-        prefill_tokens = context.gpu_view.token_to_input_ids[
-            decode_len : decode_len + total_prompt
-        ].to(device)
-
-        # Roll-by-one selection within the packed prefill region: drop each request's last
-        # hidden (no next token yet) and each request's first token (paired with no earlier
-        # hidden). The two keep-masks yield L-1 aligned (h_i, t_{i+1}) pairs per request.
-        seg_start = torch.cumsum(query_lengths, 0) - query_lengths
-        seg_end = torch.cumsum(query_lengths, 0) - 1
-        keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
-        keep_hidden[seg_end] = False
-        keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
-        keep_token[seg_start] = False
-
-        packed_hidden = prefill_hidden[keep_hidden]  # [total, 1, H]
-        packed_tokens = prefill_tokens[keep_token]  # [total]
-        within = torch.arange(total_prompt, device=device) - torch.repeat_interleave(
-            seg_start, query_lengths
-        )
-        mtp_positions = within[keep_hidden]  # 0..L-2 per request
-
-        block_table_prefill = (
-            context.request_to_kv_block_ids[active_slice][
-                num_decode_requests:active_request_count
-            ]
+        packed_hidden = torch.cat(hidden_parts)  # [total, 1, H], decode-first request order
+        packed_tokens = torch.cat(token_parts)  # [total]
+        block_table = (
+            context.request_to_kv_block_ids[active_slice][:active_request_count]
             .to(device, non_blocking=True)
             .to(context.gpu_view.mha_block_table.dtype)
         )
@@ -955,20 +984,22 @@ class TextGenerationController:
 
         context._mtp_setup_prefill_step(
             append_counts=append_counts,
-            block_table_prefill=block_table_prefill,
+            block_table_prefill=block_table,
             padded_token_count=padded_total,
-            padded_request_count=num_prefill,
+            padded_request_count=active_request_count,
+            request_start_positions=request_start_positions,
         )
         if context._nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(total)
 
         token_ids = packed_tokens.view(1, -1).to(torch.long)
-        position_ids = mtp_positions.view(1, -1).to(torch.long)
+        # Positions are unused for attention (no RoPE); the write positions come from the metadata.
+        position_ids = torch.zeros_like(token_ids)
         if padded_total > total:
             token_ids = F.pad(token_ids, (0, padded_total - total))
             position_ids = F.pad(position_ids, (0, padded_total - total))
 
-        # Directly run the MTP layer's attention (skip the output layer: seeding only).
+        # Run the MTP attention to populate K/V only (output hidden discarded).
         unwrapped_model.mtp.layers[0].forward_single_position(
             hidden_states=packed_hidden,
             next_token_ids=token_ids,
@@ -1059,22 +1090,6 @@ class TextGenerationController:
         # MTP KV cache (v1): seed the draft KV from the prompt for any request prefilling this
         # step (roll-by-one), before the decode draft loop reads/extends it. Uses the gathered
         # decoder hidden states above; runs only on the last PP stage where they exist.
-        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            num_prefill_requests = context.num_prefill_requests
-            issued_prefill_slot = False
-            if num_prefill_requests > 0:
-                issued_prefill_slot = self._mtp_prefill_seed(
-                    context,
-                    unwrapped_model,
-                    hidden_states,
-                    num_decode_requests=active_request_count - num_prefill_requests,
-                    active_request_count=active_request_count,
-                )
-            if not issued_prefill_slot:
-                # EP consistency: every rank runs exactly one MTP prefill-slot forward per step
-                # (real seed above, or this dummy) so the MoE all-to-alls stay count-matched.
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
-
         # Compute position IDs for the next tokens.
         # After rewind, request_kv_length_offsets has been adjusted. Read from
         # CPU context (post-rewind values), NOT gpu_view (stale pre-rewind snapshot).
@@ -1088,6 +1103,24 @@ class TextGenerationController:
         )
         # Cast to int64 to match CUDA graph capture dtype expectations.
         base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
+
+        # MTP KV cache (v1): before the draft loop, refresh every committed position's draft KV
+        # from the MAIN model hidden states (vLLM's per-step "first pass"), so committed KV never
+        # carries a stale chained-draft-hidden value (which would decay acceptance with depth).
+        # Covers prefill prompts (seed) and decode accepted drafts (refresh) in one forward.
+        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
+            issued_slot = self._mtp_commit_pass(
+                context,
+                unwrapped_model,
+                hidden_states,
+                num_decode_requests=active_request_count - context.num_prefill_requests,
+                active_request_count=active_request_count,
+                base_position=base_position,
+            )
+            if not issued_slot:
+                # EP consistency: every rank runs exactly one commit-pass forward per step (real
+                # above, or this dummy) so the MoE all-to-alls stay count-matched.
+                self._mtp_dummy_prefill_forward(context, unwrapped_model)
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()

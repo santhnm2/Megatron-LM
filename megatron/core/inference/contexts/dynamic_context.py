@@ -1814,13 +1814,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_table_prefill: Tensor,
         padded_token_count: Optional[int] = None,
         padded_request_count: Optional[int] = None,
+        request_start_positions: Optional[Tensor] = None,
     ) -> None:
-        """Populate token write maps + MHA metadata for the MTP prompt-seeding forward.
+        """Populate token write maps + MHA metadata for a varlen roll-by-one MTP write forward.
 
-        This is a varlen causal prefill over the roll-by-one prompt: for each prefill request
-        with prompt length L, the MTP attention processes positions 0..L-2 (append_count = L-1),
-        seeding the MTP KV from an empty state. `append_counts` and `block_table_prefill` are GPU
-        tensors for the P prefill requests (in the active-slice decode-first ordering, prefill last).
+        Used for two cases, both roll-by-one over main hidden states (K/V = f(input), independent
+        of the attention window since there is no RoPE, so only the write positions must be right):
+          - PROMPT SEED (prefill requests): each request writes positions 0..L-2 into empty KV
+            (request_start_positions=None -> start at 0).
+          - COMMIT REFRESH (decode requests): rewrite the accepted-draft positions' KV from the
+            MAIN hidden each step (vLLM's "first pass"), so committed KV never carries a stale
+            chained-draft-hidden value. Here each request writes at its own committed offset via
+            `request_start_positions[r]` (the MTP position of the request's first refreshed token).
+        `append_counts`/`block_table_prefill` are GPU tensors for the P requests (active-slice order).
         """
         assert self.enable_mtp_kv_cache
         gv = self.gpu_view
@@ -1831,12 +1837,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_total = total if padded_token_count is None else padded_token_count
         padded_p = num_prefill if padded_request_count is None else padded_request_count
 
-        # Per-token request row and MTP write position (0..count-1 within each request).
+        # Per-token request row and within-request index (0..count-1); then shift each request's
+        # write positions by its start offset (0 for prompt seed; committed offset for refresh).
         rows = torch.repeat_interleave(
             torch.arange(num_prefill, device=device), append_counts
         )
         seg_start = torch.cumsum(append_counts, 0) - append_counts
         positions = torch.arange(total, device=device) - seg_start[rows]
+        if request_start_positions is not None:
+            positions = positions + request_start_positions.to(device)[rows]
 
         gv.token_to_block_idx[:total] = block_table_prefill[
             rows, (positions // block_size).to(torch.long)

@@ -2443,14 +2443,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-        # Exact step counts and KV occupancy depend on sampled token sequences.
-        # With DP-offset sampling seeds, only DP rank 0 matches the golden seed.
+        # Exact step counts depend on sampled token sequences. With DP-offset
+        # sampling seeds, only DP rank 0 matches the golden seed.
         if parallel_state.get_data_parallel_rank() == 0:
             if max_requests is None:
                 assert step_count == 23
             else:
                 assert step_count == 35
-            assert context.kv_block_allocator.active_count == 655
+        # The pool size is static, so it holds on every rank.
+        assert context.kv_block_allocator.total_count == 819
 
     @pytest.mark.internal
     @pytest.mark.skipif(

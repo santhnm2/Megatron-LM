@@ -746,23 +746,42 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
 
     # ------------------------------------------------------------------ prompts
 
-    _blocks_per_gb = None
+    _buffer_fit: dict = {}
 
-    def _calibrate_buffer_gb(self, model, mamba_config, num_blocks, probe_gb=0.01):
+    def _calibrate_buffer_gb(
+        self, model, mamba_config, num_blocks, max_requests=None, request_rounder=4
+    ):
         """Return the buffer size that yields ``num_blocks`` KV blocks.
 
-        Bytes per block depend on the model shape and on context overhead, so a
-        pool size picked as a GB figure is a guess that silently drifts when
-        either changes. Measure it once against a probe engine and solve for the
-        block count the test actually wants.
+        On a hybrid model the buffer covers the live Mamba state for
+        ``max_requests`` concurrent requests before anything is left for KV
+        blocks, so block count is affine in buffer size, not proportional. Bytes
+        per block and that fixed reservation both depend on the model shape, so
+        fit the line from two probe engines and solve it rather than assuming
+        either the slope or the offset. A pool size written as a GB figure is a
+        guess that drifts silently when the model or the request count changes.
         """
         cls = type(self)
-        if cls._blocks_per_gb is None:
-            probe = self._build_engine(
-                model, mamba_config, enable_prefix_caching=True, buffer_size_gb=probe_gb
-            )
-            cls._blocks_per_gb = probe.context.kv_block_allocator.total_count / probe_gb
-        return num_blocks / cls._blocks_per_gb
+        key = (max_requests, request_rounder)
+        if key not in cls._buffer_fit:
+            samples = []
+            for probe_gb in (0.02, 0.05):
+                probe = self._build_engine(
+                    model,
+                    mamba_config,
+                    enable_prefix_caching=True,
+                    buffer_size_gb=probe_gb,
+                    max_requests=max_requests,
+                    request_rounder=request_rounder,
+                )
+                samples.append((probe_gb, probe.context.kv_block_allocator.total_count))
+            (gb_lo, blocks_lo), (gb_hi, blocks_hi) = samples
+            assert blocks_hi > blocks_lo, "probe engines did not scale with buffer size"
+            gb_per_block = (gb_hi - gb_lo) / (blocks_hi - blocks_lo)
+            reserved_gb = gb_lo - blocks_lo * gb_per_block
+            cls._buffer_fit[key] = (gb_per_block, reserved_gb)
+        gb_per_block, reserved_gb = cls._buffer_fit[key]
+        return reserved_gb + num_blocks * gb_per_block
 
     def _pause_prompts(self, chunked, count):
         """Block-aligned prompts sized so the chunked variant genuinely chunks.
@@ -1030,7 +1049,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         mamba_config = MambaInferenceStateConfig.from_model(model)
         if buffer_blocks is not None:
             engine_overrides["buffer_size_gb"] = self._calibrate_buffer_gb(
-                model, mamba_config, buffer_blocks
+                model,
+                mamba_config,
+                buffer_blocks,
+                max_requests=engine_overrides.get("max_requests"),
+                request_rounder=engine_overrides.get("request_rounder", 4),
             )
 
         reference, _, _ = self._run(
@@ -1527,7 +1550,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             model,
             mamba_config,
             enable_prefix_caching=True,
-            buffer_size_gb=self._calibrate_buffer_gb(model, mamba_config, pool_blocks),
+            buffer_size_gb=self._calibrate_buffer_gb(
+                model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
+            ),
             max_requests=num_requests,
             request_rounder=4,
         )

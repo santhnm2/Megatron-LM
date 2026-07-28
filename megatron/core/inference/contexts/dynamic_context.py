@@ -2842,8 +2842,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             req: Request being scheduled.
             prefill_chunk_length: Number of prompt tokens considered in this chunk.
-            record_mamba_match: If True, store the chunk-local executable Mamba
-                match count on the request for diagnostics/tests.
+            record_mamba_match: If True, store chunk-local diagnostics on the
+                request: the executable Mamba match count and the resolved
+                prefill skip. Both describe the first chunk only.
 
         Returns:
             Tuple of (matched_block_ids, num_blocks_from_pool,
@@ -2859,6 +2860,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
             num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
+            if record_mamba_match and finished == 0:
+                req._prefix_skip_tokens = 0
             return (
                 [],
                 num_blocks_from_pool,
@@ -2933,6 +2936,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_blocks_from_pool = max(
             0, overall_required_blocks - already_allocated_blocks - num_matched
         )
+
+        # Record the *resolved* skip, not the match count. On a hybrid model these
+        # differ whenever the back-off above re-resolves the Mamba match under the
+        # two-token cap, or the clamp below rounds the skip down: the request may
+        # match N blocks yet resume from a shallower boundary because the deeper
+        # snapshots were evicted. Only the skip says where the SSM actually
+        # resumed, so it is what tests of the eviction paths need to observe.
+        if record_mamba_match and finished == 0:
+            req._prefix_skip_tokens = prefix_skip_tokens
 
         return (
             matched_block_ids,

@@ -540,7 +540,8 @@ class TestMambaPrefixCachingE2E(_HybridPCHelpers):
                 )
                 assert step_prefill == 256
             elif step == 2:
-                # B: 1 mamba match but raw_skip >= chunk_length, back off to 0 blocks, full recompute (256)
+                # B: 1 mamba match but raw_skip >= chunk_length, back off to 0
+                # blocks, full recompute (256)
                 # C: 1 mamba match, skip 256, effective 256
                 assert reqs[1]._mamba_num_matched_blocks == 1, f"step 2 B"
                 assert reqs[2]._mamba_num_matched_blocks == 1, f"step 2 C"
@@ -550,7 +551,8 @@ class TestMambaPrefixCachingE2E(_HybridPCHelpers):
                 )
                 assert step_prefill == 512  # B=256 (back-off recompute) + C=256
             elif step == 3:
-                # D: 2 mamba matches, raw_skip >= chunk_length, back off to block 0, skip 256, effective 256
+                # D: 2 mamba matches, raw_skip >= chunk_length, back off to
+                # block 0, skip 256, effective 256
                 assert reqs[3]._mamba_num_matched_blocks == 2, f"step 3 D"
                 assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
                 assert step_prefill == 256
@@ -783,6 +785,41 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         gb_per_block, reserved_gb = cls._buffer_fit[key]
         return reserved_gb + num_blocks * gb_per_block
 
+    _mamba_fit: dict = {}
+
+    def _calibrate_mamba_gb(self, model, mamba_config, num_slots, **engine_kwargs):
+        """Return the Mamba budget that yields ``num_slots`` durable cache slots.
+
+        The budget first has to cover the per-step extraction scratch area, whose
+        size follows the token and request budgets, before anything is left for
+        durable slots -- so slot count is affine in the budget, not proportional.
+        Fit the line from two probes and solve, the same way
+        :meth:`_calibrate_buffer_gb` handles the KV pool. A hand-written GB figure
+        is a guess that silently stops constraining anything the moment the model
+        shape or the step budget changes, which for this case would mean the pool
+        is never actually exhausted and the test passes without doing anything.
+        """
+        cls = type(self)
+        key = tuple(sorted(engine_kwargs.items()))
+        if key not in cls._mamba_fit:
+            samples = []
+            for probe_gb in (0.5, 1.0):
+                probe = self._build_engine(
+                    model,
+                    mamba_config,
+                    enable_prefix_caching=True,
+                    prefix_caching_mamba_gb=probe_gb,
+                    **engine_kwargs,
+                )
+                samples.append((probe_gb, probe.context.mamba_slot_allocator.max_slots))
+            (gb_lo, slots_lo), (gb_hi, slots_hi) = samples
+            assert slots_hi > slots_lo, "probe engines did not scale with the Mamba budget"
+            gb_per_slot = (gb_hi - gb_lo) / (slots_hi - slots_lo)
+            reserved_gb = gb_lo - slots_lo * gb_per_slot
+            cls._mamba_fit[key] = (gb_per_slot, reserved_gb)
+        gb_per_slot, reserved_gb = cls._mamba_fit[key]
+        return reserved_gb + num_slots * gb_per_slot
+
     def _pause_prompts(self, chunked, count):
         """Block-aligned prompts sized so the chunked variant genuinely chunks.
 
@@ -820,7 +857,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         seg0, seg1, seg2 = self._seg(0), self._seg(1), self._seg(2)
         return [
             torch.cat([seg0, self._seg(SEG_SEED_TAIL, 44)]),  # 300 tokens -> boundary at block 0
-            torch.cat([seg0, seg1, self._seg(SEG_SEED_TAIL + 1, 44)]),  # 556 tokens -> boundary at block 1
+            # 556 tokens -> boundary at block 1
+            torch.cat([seg0, seg1, self._seg(SEG_SEED_TAIL + 1, 44)]),
             torch.cat(
                 [seg0, seg1, seg2, self._seg(SEG_SEED_TAIL + 2, 44)]
             ),  # 812 tokens -> boundary at block 2
@@ -919,18 +957,20 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         return action
 
     @staticmethod
-    def _evict_mamba_for_hash(get_hash):
+    def _evict_mamba_for_hash(get_hash, log=None):
         """Drop the Mamba snapshot for one specific block, keeping its KV block cached.
 
         Mirrors the bookkeeping of the LRU slot eviction path, but targets a
         chosen block so a case can place a hole at a known depth of the prefix
         chain. ``get_hash`` is called with the finished requests so far and
-        returns the block hash to drop.
+        returns the block hash to drop. The hash is appended to ``log``.
         """
 
         def action(engine, requests):
             msa = engine.context.mamba_slot_allocator
             block_hash = get_hash(requests)
+            if log is not None:
+                log.append(block_hash)
             assert block_hash in msa.hash_to_block_id, "target block has no cached Mamba snapshot"
             block_id = msa.hash_to_block_id.pop(block_hash)
             slot = msa.block_to_slot[block_id].item()
@@ -943,6 +983,86 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             assert block_hash in engine.context.kv_block_allocator.kv_hash_to_block_id
 
         return action
+
+    @staticmethod
+    def _assert_mamba_slot_invariants(engine, requests=None):
+        """Check the Mamba allocator's three-way bookkeeping agrees with itself.
+
+        ``block_to_slot``, ``slot_to_block``, the free-slot stack and
+        ``hash_to_block_id`` are maintained by four separate code paths --
+        allocation, LRU slot eviction, KV-cascade invalidation and commit -- and
+        nothing else in these tests cross-checks them. A slot that is leaked,
+        double-freed, or left pointing at the wrong block does not necessarily
+        change any generated token, so the equivalence assertions can stay green
+        while the pool quietly drains or starts handing out a live slot twice.
+
+        Takes ``requests`` so it can be used directly as an action.
+        """
+        msa = engine.context.mamba_slot_allocator
+        num_blocks = engine.context.kv_block_allocator.total_count
+
+        mapped = torch.nonzero(msa.block_to_slot[:num_blocks] >= 0, as_tuple=True)[0]
+        used_slots = msa.block_to_slot[mapped].to(torch.int64)
+        assert len(set(used_slots.tolist())) == used_slots.numel(), (
+            "two blocks map to the same Mamba slot, so one request's state would "
+            "overwrite another's"
+        )
+        # the reverse map agrees, in both directions
+        assert torch.equal(msa.slot_to_block[used_slots].to(torch.int64), mapped), (
+            "slot_to_block disagrees with block_to_slot"
+        )
+        reverse = torch.nonzero(msa.slot_to_block >= 0, as_tuple=True)[0]
+        assert reverse.numel() == used_slots.numel(), (
+            f"{reverse.numel()} slots claim a block but {used_slots.numel()} blocks "
+            f"claim a slot; a slot was freed without clearing its owner"
+        )
+        # every slot is either free or in use, exactly once
+        free = msa.free_slots[: msa.free_count].to(torch.int64)
+        assert msa.free_count + used_slots.numel() == msa.max_slots, (
+            f"{msa.free_count} free + {used_slots.numel()} used != {msa.max_slots} "
+            f"total slots: slots are being leaked or double-freed"
+        )
+        assert len(set(free.tolist())) == free.numel(), "the free-slot stack has duplicates"
+        assert not (set(free.tolist()) & set(used_slots.tolist())), (
+            "a slot is both free and in use, so it can be handed out while it "
+            "still holds another request's state"
+        )
+        # a cached snapshot must be reachable: its block still owns a slot
+        for block_hash, block_id in msa.hash_to_block_id.items():
+            assert msa.block_to_slot[block_id].item() >= 0, (
+                f"hash {block_hash} maps to block {block_id}, which has no slot; a "
+                f"restore from it would read whatever state that block last held"
+            )
+
+    @staticmethod
+    def _assert_resumed_from_block(req, num_blocks):
+        """Require the request's prefill to have resumed at a specific boundary.
+
+        ``_mamba_num_matched_blocks`` cannot express this. It is the *match*
+        count, recorded before the back-off that re-resolves the match under the
+        two-token cap, so a request can match three blocks and still resume from
+        the first. Only the resolved skip says where the SSM restarted, which is
+        the thing an evicted snapshot is supposed to move.
+        """
+        expected = num_blocks * BLOCK_SIZE
+        actual = getattr(req, "_prefix_skip_tokens", None)
+        assert actual == expected, (
+            f"expected prefill to resume from block boundary {num_blocks} "
+            f"({expected} tokens skipped), but {actual} tokens were skipped"
+        )
+
+    @staticmethod
+    def _deepest_cached_snapshot(engine, block_hashes):
+        """Number of leading blocks up to and including the deepest cached snapshot.
+
+        This is the boundary ``_find_mamba_match_count`` resolves to, computed
+        from the cache as it stands rather than assumed, so a case whose victim
+        is chosen by LRU can still state exactly where the next request must
+        resume.
+        """
+        mamba_map = engine.context.mamba_slot_allocator.hash_to_block_id
+        present = [i for i, h in enumerate(block_hashes) if h in mamba_map]
+        return present[-1] + 1 if present else 0
 
     @staticmethod
     def _chain(*actions):
@@ -1030,6 +1150,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         reference_admit=1,
         stats=None,
         buffer_blocks=None,
+        mamba_slots=None,
         **engine_overrides,
     ):
         """Require the caching run to reproduce an uncached single-pass reference.
@@ -1054,6 +1175,17 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 buffer_blocks,
                 max_requests=engine_overrides.get("max_requests"),
                 request_rounder=engine_overrides.get("request_rounder", 4),
+            )
+        if mamba_slots is not None:
+            # Calibrated after buffer_blocks: the scratch reservation this solves
+            # around depends on the token and request budgets the buffer sets.
+            probe_kwargs = {
+                k: v
+                for k, v in engine_overrides.items()
+                if k in ("buffer_size_gb", "max_requests", "request_rounder", "max_tokens")
+            }
+            engine_overrides["prefix_caching_mamba_gb"] = self._calibrate_mamba_gb(
+                model, mamba_config, mamba_slots, **probe_kwargs
             )
 
         reference, _, _ = self._run(
@@ -1104,6 +1236,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             assert block_hash in self._mamba_map(engine)
         if not chunked:
             assert requests[-1]._mamba_num_matched_blocks == 1
+            # and it actually skipped that block rather than recomputing it
+            self._assert_resumed_from_block(requests[-1], 1)
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
@@ -1131,8 +1265,10 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
 
         if not chunked:
-            # the probe matched the two surviving blocks rather than all three
+            # the probe matched the two surviving blocks rather than all three,
+            # and resumed from the deeper of them
             assert requests[-1]._mamba_num_matched_blocks == 2
+            self._assert_resumed_from_block(requests[-1], 2)
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
@@ -1145,17 +1281,32 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         """
         prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
         evicted = []
+        expected_resume = []
 
         def check_kv_survives(engine, requests):
             assert len(evicted) == 1, f"expected one snapshot evicted, got {evicted}"
             assert evicted[0] not in self._mamba_map(engine)
             assert evicted[0] in self._kv_map(engine), "the KV block should have stayed cached"
             # every block the seeds registered is still matchable
-            for block_hash in requests[2].precomputed_block_hashes:
+            seed_hashes = requests[2].precomputed_block_hashes
+            for block_hash in seed_hashes:
                 assert block_hash in self._kv_map(engine)
+            # LRU picks the victim, so record where the probe must now resume
+            # rather than hardcoding it. Captured here, before the probe commits
+            # snapshots of its own and changes the answer.
+            expected_resume.append(self._deepest_cached_snapshot(engine, seed_hashes))
 
         actions = {2: self._chain(self._evict_mamba(1, log=evicted), check_kv_survives)}
-        self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+        requests, _ = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+        assert expected_resume and expected_resume[0] < 3, (
+            "the evicted snapshot was not one the probe would have resumed from, "
+            "so this case is indistinguishable from test_single_block_match"
+        )
+        if not chunked:
+            # the KV prefix still matches in full; only the resume point moved
+            assert requests[-1]._mamba_num_matched_blocks == 3
+            self._assert_resumed_from_block(requests[-1], expected_resume[0])
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
@@ -1197,6 +1348,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             # only blocks 0-1 survive in KV, and only block 0 has state, so the
             # probe resumes from the first boundary
             assert requests[-1]._mamba_num_matched_blocks == 1
+            self._assert_resumed_from_block(requests[-1], 1)
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
@@ -1226,8 +1378,10 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     def test_mamba_snapshot_evicted_then_recomputed(self, chunked):
         """An evicted Mamba snapshot is re-extracted by one request and used by the next."""
         prompts = self._seed_prompts() + [
-            self._probe(3, tail_index=SEG_PROBE_TAIL),  # re-extracts a snapshot on its divergence boundary
-            self._probe(3, tail_index=SEG_PROBE_TAIL + 1),  # resumes from the re-extracted snapshot
+            # re-extracts a snapshot on its divergence boundary
+            self._probe(3, tail_index=SEG_PROBE_TAIL),
+            # resumes from the re-extracted snapshot
+            self._probe(3, tail_index=SEG_PROBE_TAIL + 1),
         ]
         evicted = []
 
@@ -1236,13 +1390,33 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             assert evicted[0] not in self._mamba_map(engine)
             assert evicted[0] in self._kv_map(engine)
 
-        actions = {2: self._chain(self._evict_mamba(1, log=evicted), check_gone)}
+        # Target the deepest snapshot rather than taking the LRU one. Only that
+        # block sits on the next request's divergence boundary, so only its
+        # eviction is one the following prefill re-extracts -- with a shallower
+        # victim there is nothing to re-extract and the case tests nothing. The
+        # LRU slot path is covered by test_mamba_snapshot_evicted and
+        # test_eviction_stress; what this case is for is the re-extraction.
+        actions = {
+            2: self._chain(
+                self._evict_mamba_for_hash(
+                    lambda requests: requests[2].precomputed_block_hashes[2], log=evicted
+                ),
+                check_gone,
+            )
+        }
         requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
 
         # the snapshot was re-extracted and is available again
         assert evicted[0] in self._mamba_map(engine), "the snapshot was never re-extracted"
         if not chunked:
-            assert requests[-1]._mamba_num_matched_blocks > 0
+            # the middle request resumed from the surviving block-1 snapshot and
+            # re-extracted block 2's on the way past it...
+            assert requests[3]._mamba_num_matched_blocks == 2
+            self._assert_resumed_from_block(requests[3], 2)
+            # ...so the last request resumes from the re-extracted boundary, one
+            # block deeper than the middle one could
+            assert requests[-1]._mamba_num_matched_blocks == 3
+            self._assert_resumed_from_block(requests[-1], 3)
 
     @torch.inference_mode()
     def test_snapshot_hole_under_tight_prefill_chunk(self):
@@ -1270,6 +1444,77 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         # the prefix still matches all three blocks; only the resume point moved
         assert requests[-1]._mamba_num_matched_blocks == 3
         assert requests[-1].precomputed_block_hashes[1] not in self._mamba_map(engine)
+        # The skip gives back block 2 to leave more than one token to compute,
+        # then finds block 1's snapshot gone and gives back a second block. Both
+        # steps are invisible in the match count above, which stays at 3.
+        self._assert_resumed_from_block(requests[-1], 1)
+
+    @torch.inference_mode()
+    def test_mamba_slot_pool_exhausted_naturally(self):
+        """The Mamba slot pool runs dry on its own and evicts to keep going.
+
+        Every other case here drives Mamba eviction from the test, by reaching
+        into the allocator and dropping snapshots by hand. That covers what
+        happens *after* a snapshot is gone, but never the path that decides to
+        drop one: ``allocate_slots_batch`` finding the free pool empty and
+        calling ``_evict_lru_slots_batch`` itself. With the default budget that
+        path is unreachable -- the durable pool is sized far above the number of
+        KV blocks, and a block can hold at most one slot, so the free pool never
+        empties no matter how much churn the run generates.
+
+        So the Mamba budget is calibrated down to fewer slots than there are KV
+        blocks, making the slot pool the binding constraint rather than the block
+        pool, and the prompts keep introducing new snapshot boundaries so the
+        pool has to turn over. Requests run one at a time against a roomy block
+        pool, isolating slot eviction from block eviction.
+        """
+        # 3 seeds, then 9 prompts that each share block 0 but end on a block of
+        # their own, so each contributes a new snapshot boundary the pool has to
+        # find room for.
+        prompts = self._seed_prompts()
+        for k in range(9):
+            prompts.append(
+                torch.cat(
+                    [
+                        self._seg(0),
+                        self._seg(SEG_PROBE_TAIL + k),
+                        self._seg(SEG_PROBE_TAIL + 9 + k, 44),
+                    ]
+                )
+            )
+
+        natural_evictions = []
+
+        def instrument(engine):
+            msa = engine.context.mamba_slot_allocator
+            original = msa._evict_lru_slots_batch
+
+            def counting(num_needed):
+                natural_evictions.append(num_needed)
+                return original(num_needed)
+
+            msa._evict_lru_slots_batch = counting
+
+        actions = {i: self._assert_mamba_slot_invariants for i in range(len(prompts))}
+        _, engine = self._assert_equivalent(
+            prompts, actions=actions, on_engine=instrument, mamba_slots=8
+        )
+
+        msa = engine.context.mamba_slot_allocator
+        # The slot pool, not the block pool, is what ran out. Without this the
+        # test could pass having never pressured the slot pool at all.
+        assert msa.max_slots < engine.context.kv_block_allocator.total_count, (
+            f"the Mamba budget was not the binding constraint: {msa.max_slots} "
+            f"slots for {engine.context.kv_block_allocator.total_count} KV blocks, "
+            f"so the free slot pool can never empty"
+        )
+        assert natural_evictions, (
+            "the allocator never had to evict a Mamba slot to satisfy a commit, "
+            "so _evict_lru_slots_batch was not reached from the allocation path. "
+            "Lower mamba_slots or add prompts that introduce more distinct "
+            "snapshot boundaries."
+        )
+        self._assert_mamba_slot_invariants(engine)
 
     @torch.inference_mode()
     def test_eviction_stress(self):
@@ -1343,13 +1588,23 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         # Drop a Mamba snapshot every third request and force an extra block
         # eviction every fifth, on top of the churn the small pool causes on its
         # own, so slot eviction and block eviction interleave throughout.
+        # The slot bookkeeping is re-checked after every request, not just at the
+        # end: a leak or a double-free can be masked later by an eviction that
+        # rebuilds the mapping, so the run has to be checked as it goes.
         mamba_evicted, kv_evicted = [], []
         actions = {}
         for i in range(num_prompts):
             if i % 3 == 2:
-                actions[i] = self._evict_mamba(1, log=mamba_evicted, optional=True)
+                step = self._evict_mamba(1, log=mamba_evicted, optional=True)
             elif i % 5 == 4:
-                actions[i] = self._evict_kv(1, log=kv_evicted, optional=True)
+                step = self._evict_kv(1, log=kv_evicted, optional=True)
+            else:
+                step = None
+            actions[i] = (
+                self._chain(step, self._assert_mamba_slot_invariants)
+                if step is not None
+                else self._assert_mamba_slot_invariants
+            )
 
         _, engine = self._assert_equivalent(
             prompts,
@@ -1426,6 +1681,32 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             return result
 
         ctx.resume_paused_requests = wrapped
+
+    @staticmethod
+    def _instrument_block_sharing(engine, stats):
+        """Record the highest KV block reference count reached during the run.
+
+        A block held by two requests at once is the only direct evidence that a
+        match was reused rather than reallocated. Counting entries in the hash
+        map cannot show this: under a pool small enough to force pausing, the map
+        size is bounded by the pool, so any bound loose enough to hold is
+        satisfied whether or not anything was shared.
+
+        Sampled after each admission because a shared pin is transient -- the
+        second holder releases as soon as it finishes.
+        """
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
+        original = ctx.add_request
+
+        def wrapped(req, prefill_chunk_length=None):
+            result = original(req, prefill_chunk_length)
+            stats["max_block_ref_count"] = max(
+                stats.get("max_block_ref_count", 0), int(alloc.block_ref_counts.max())
+            )
+            return result
+
+        ctx.add_request = wrapped
 
     def _assert_paused(self, stats):
         """Fail unless requests were actually paused and resumed."""
@@ -1606,21 +1887,47 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             f"only {len(shared)} matching (request, position) snapshots across the "
             f"two runs; not enough to compare"
         )
-        nonzero = 0
+        rtol = atol = 2e-2
         for key in shared:
             ssm_clean, conv_clean = clean_snaps[key]
             ssm_tight, conv_tight = tight_snaps[key]
-            if ssm_clean.abs().sum() > 0:
-                nonzero += 1
             for name, a, b in (("ssm", ssm_clean, ssm_tight), ("conv", conv_clean, conv_tight)):
-                assert torch.allclose(a, b, rtol=2e-2, atol=2e-2), (
+                assert torch.allclose(a, b, rtol=rtol, atol=atol), (
                     f"request {key[0]} at position {key[1]}: {name} state diverged "
                     f"from the clean run (max abs diff {(a - b).abs().max().item():.4g}, "
                     f"reference max {a.abs().max().item():.4g})"
                 )
-        assert nonzero >= len(shared) // 2, (
-            "most sampled states were all-zero, so the comparison would pass even "
-            "if the state were never restored"
+
+        # The comparison above is only worth anything if the tolerance can tell two
+        # states apart at all. A fixed magnitude threshold cannot establish that --
+        # it presumes a scale for these tensors. So establish it directly: compare
+        # *different* requests at the same position, which are genuinely different
+        # recurrent states (the prompts are disjoint token ranges). allclose must
+        # reject those. If it accepts them, then the states are near-zero or the
+        # tolerance swamps their scale, and the equality check above would pass
+        # even if the state were never restored.
+        by_position: dict = {}
+        for req_id, pos in shared:
+            by_position.setdefault(pos, []).append(req_id)
+        indistinguishable, comparisons = [], 0
+        for pos, req_ids in by_position.items():
+            for a_id, b_id in zip(req_ids, req_ids[1:]):
+                comparisons += 1
+                ssm_a, conv_a = clean_snaps[(a_id, pos)]
+                ssm_b, conv_b = clean_snaps[(b_id, pos)]
+                if torch.allclose(ssm_a, ssm_b, rtol=rtol, atol=atol) and torch.allclose(
+                    conv_a, conv_b, rtol=rtol, atol=atol
+                ):
+                    indistinguishable.append((pos, a_id, b_id))
+        assert comparisons > 0, (
+            "no two requests were sampled at the same position, so the tolerance's "
+            "discriminating power could not be established"
+        )
+        assert not indistinguishable, (
+            f"{len(indistinguishable)} of {comparisons} pairs of *different* "
+            f"requests compared equal at rtol={rtol} atol={atol} (e.g. "
+            f"{indistinguishable[0]}), so the equality assertions above prove "
+            f"nothing: the states are too small for this tolerance to resolve"
         )
 
     @torch.inference_mode()
@@ -1975,14 +2282,21 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             admit=len(prompts),
             reference_admit=len(prompts),
             stats=stats,
+            on_engine=lambda e: self._instrument_block_sharing(e, stats),
             buffer_blocks=pool_blocks,
             max_requests=len(prompts),
             request_rounder=4,
         )
         self._assert_paused_under_eviction(stats)
-        # the duplicated prompts really did share a block rather than each
-        # allocating their own
-        assert len(self._kv_map(engine)) <= len(pairs)
+        # The duplicated prompts really did share a block rather than each
+        # allocating their own: two requests held the same block at once, which
+        # only happens when the second matched the first's block and pinned it.
+        assert stats.get("max_block_ref_count", 0) >= 2, (
+            "no KV block was ever held by two requests at once, so the identical "
+            "prompts did not share a block and this case is not exercising a "
+            f"cache-pinned pool (saw a peak ref count of "
+            f"{stats.get('max_block_ref_count', 0)})"
+        )
 
     @torch.inference_mode()
     def test_concurrent_block_aligned_requests_pause_and_resume(self):

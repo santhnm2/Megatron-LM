@@ -1399,8 +1399,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             admit=num_requests,
             reference_admit=num_requests,
             stats=stats,
-            # a handful of blocks, against the two per request this batch needs
-            buffer_size_gb=0.004,
+            # A handful of blocks, against the two per request this batch needs.
+            # Chunked prefill spends most of its per-step token budget on one
+            # prompt, so fewer requests are in flight at once and the pool has to
+            # be tighter to starve the free pool at the same points.
+            buffer_size_gb=0.0025 if chunked else 0.004,
             max_requests=num_requests,
             request_rounder=4,
         )
@@ -1429,7 +1432,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             admit=len(prompts),
             reference_admit=len(prompts),
             stats=stats,
-            buffer_size_gb=0.004,
+            buffer_size_gb=0.0025 if chunked else 0.004,
             max_requests=len(prompts),
             request_rounder=4,
         )

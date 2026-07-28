@@ -1397,12 +1397,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
 
         def wrapped(active_request_count, newly_paused_request_ids):
             paused = ctx.paused_request_count
-            # update_requests pause-marks boundary-crossing requests before
-            # calling this, so the rise over what was left paused last time is
-            # how many requests just crossed a block boundary.
-            stats["pause_marks"] = stats.get("pause_marks", 0) + max(
-                0, paused - stats.get("_left_after_resume", 0)
-            )
+            # update_requests pause-marks boundary-crossing requests and hands the
+            # ids here before resumption trims them, so this is an exact count of
+            # requests that just needed another block.
+            if newly_paused_request_ids is not None:
+                stats["pause_marks"] = stats.get("pause_marks", 0) + int(
+                    newly_paused_request_ids.numel()
+                )
             if paused > 0:
                 stats["resume_with_paused"] = stats.get("resume_with_paused", 0) + 1
                 stats["max_paused"] = max(stats.get("max_paused", 0), paused)
@@ -1411,7 +1412,6 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 if alloc.free_count == 0 and int(alloc.get_evictable_block_count()) > 0:
                     stats["resume_needing_eviction"] = stats.get("resume_needing_eviction", 0) + 1
             result = original(active_request_count, newly_paused_request_ids)
-            stats["_left_after_resume"] = ctx.paused_request_count
             if ctx.paused_request_count > 0:
                 # resumption could not take every paused request this step: one
                 # of them wanted a block no amount of reclaiming could supply
@@ -1514,28 +1514,34 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             self._instrument_resume(engine, stats)
             ctx = engine.context
             recorded, misses = {}, 0
-            original_sample = engine.controller.sample_from_logits
+            controller = engine.controller
+            original_sample = controller._dynamic_step_sample_logits
 
-            def patched_sample(*args, **kwargs):
+            def patched_sample():
+                # The dynamic path writes one token per active request into
+                # _sampled_tokens_cuda, in the same order row_keys enumerates.
                 nonlocal misses
-                sampled = original_sample(*args, **kwargs)
+                original_sample()
                 keys = row_keys(ctx)
-                if sampled.numel() != len(keys):
-                    # not the one-row-per-active-request shape this assumes
-                    return sampled
+                n = len(keys)
+                if n == 0:
+                    return
+                buffer = controller._sampled_tokens_cuda
                 if golden is None:
-                    for row, key in enumerate(keys):
-                        recorded[key] = int(sampled[row].item())
-                    return sampled
-                replay = sampled.clone()
+                    for row, token in enumerate(buffer[:n].tolist()):
+                        recorded[keys[row]] = token
+                    return
+                replay = buffer[:n].tolist()
                 for row, key in enumerate(keys):
                     if key in golden:
                         replay[row] = golden[key]
                     else:
                         misses += 1
-                return replay
+                buffer[:n].copy_(
+                    torch.tensor(replay, dtype=buffer.dtype, device=buffer.device)
+                )
 
-            engine.controller.sample_from_logits = patched_sample
+            controller._dynamic_step_sample_logits = patched_sample
 
             for i, prompt in enumerate(prompts):
                 engine._add_request(
@@ -2009,6 +2015,31 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
         stats = {}
         self._instrument_resume(engine, stats)
+
+        # Uncontended control: the same batch against a pool big enough to hold
+        # all of it, so nothing ever waits. Used to check the token each
+        # request's prefill produced.
+        roomy = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            buffer_size_gb=self._calibrate_buffer_gb(
+                model,
+                mamba_config,
+                num_requests * 2 + 4,
+                max_requests=num_requests,
+                request_rounder=4,
+            ),
+            max_requests=num_requests,
+            request_rounder=4,
+        )
+        for i, prompt in enumerate(prompts):
+            roomy._add_request(self._make_request(i, prompt, enable_pc=True, num_tokens=generate))
+        roomy_first = {}
+        while roomy.has_unfinished_requests():
+            for record in roomy.step_modern()["finished_request_records"]:
+                merged = record.merge()
+                roomy_first[merged.request_id] = list(merged.generated_tokens)[0]
 
         for i, prompt in enumerate(prompts):
             engine._add_request(self._make_request(i, prompt, enable_pc=True, num_tokens=generate))

@@ -905,22 +905,38 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     def _assert_equivalent(
         self, prompts, actions=None, chunked=False, on_engine=None, **engine_overrides
     ):
-        """Run ``prompts`` with caching off and on; require identical outputs."""
+        """Require the caching run to reproduce an uncached single-pass reference.
+
+        The reference deliberately runs without chunked prefill and without
+        memory pressure: one forward over each whole prompt. Chunked prefill cuts
+        a prompt at different points than a single pass, and the SSM scan is not
+        bitwise invariant to where it is cut, so an uncached *chunked* run is not
+        a stable baseline -- it diverges from the single-pass answer on its own,
+        with caching out of the picture entirely. Comparing against the
+        single-pass answer is both stabler and a stronger claim: whatever the
+        cache skipped, restored or evicted, and however the prompt was chunked,
+        the tokens must match a plain uncached forward.
+        """
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
-        engine_kwargs = {**self._engine_kwargs(chunked), **engine_overrides}
 
-        off, _, _ = self._run(model, mamba_config, prompts, False, **engine_kwargs)
-        on, requests, engine = self._run(
-            model, mamba_config, prompts, True, actions=actions, on_engine=on_engine, **engine_kwargs
+        reference, _, _ = self._run(model, mamba_config, prompts, False)
+        cached, requests, engine = self._run(
+            model,
+            mamba_config,
+            prompts,
+            True,
+            actions=actions,
+            on_engine=on_engine,
+            **{**self._engine_kwargs(chunked), **engine_overrides},
         )
 
-        assert sorted(off) == sorted(on) == list(range(len(prompts)))
-        for req_id in off:
-            assert off[req_id] == on[req_id], (
-                f"request {req_id}: caching disabled produced {off[req_id]}, "
-                f"caching enabled produced {on[req_id]}"
+        assert sorted(reference) == sorted(cached) == list(range(len(prompts)))
+        for req_id in reference:
+            assert reference[req_id] == cached[req_id], (
+                f"request {req_id}: uncached reference produced {reference[req_id]}, "
+                f"caching enabled produced {cached[req_id]}"
             )
         return requests, engine
 
@@ -1079,65 +1095,3 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
 
         assert sum(evicted_blocks) > 0, "the cache never evicted anything; raise the prompt count"
-
-    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
-    @pytest.mark.parametrize("generate", [1, 8], ids=["one_token", "eight_tokens"])
-    @torch.inference_mode()
-    def test_diagnose_prefix_match_state(self, chunked, generate, capsys):
-        """Diagnostic: report what each run actually cached, matched and computed.
-
-        Not an assertion of behaviour -- run with ``-s`` to compare the caching
-        and non-caching runs side by side. ``generate=1`` compares only the token
-        produced directly from the prefill state, isolating prefill correctness
-        from divergence that accumulates over decode steps.
-        """
-        skip_if_mamba_sequence_packing_not_available()
-        model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
-        prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
-        engine_kwargs = self._engine_kwargs(chunked)
-
-        def run(enable_pc):
-            engine = self._build_engine(
-                model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
-            )
-            outputs, rows = {}, []
-            for i, prompt in enumerate(prompts):
-                req = self._make_request(i, prompt, enable_pc, num_tokens=generate)
-                engine._add_request(req)
-                before = engine.context.lifetime_prefill_token_count
-                while engine.has_unfinished_requests():
-                    result = engine.step_modern()
-                    for record in result["finished_request_records"]:
-                        merged = record.merge()
-                        outputs[merged.request_id] = list(merged.generated_tokens)
-                ctx = engine.context
-                rows.append(
-                    dict(
-                        req=i,
-                        prompt_len=len(prompt),
-                        blocks=len(req.precomputed_block_hashes),
-                        mamba_matched=getattr(req, "_mamba_num_matched_blocks", None),
-                        cached_tokens=getattr(req, "num_cached_tokens", 0),
-                        computed=ctx.lifetime_prefill_token_count - before,
-                        kv_cached=len(ctx.kv_block_allocator.kv_hash_to_block_id)
-                        if enable_pc
-                        else 0,
-                        mamba_cached=len(ctx.mamba_slot_allocator.hash_to_block_id)
-                        if enable_pc
-                        else 0,
-                    )
-                )
-            return outputs, rows
-
-        off_out, off_rows = run(False)
-        on_out, on_rows = run(True)
-
-        mode = f"chunked={chunked} generate={generate}"
-        print(f"\n=== {mode} ===")
-        for label, rows in (("pc=off", off_rows), ("pc=on ", on_rows)):
-            for row in rows:
-                print(f"{label} {row}")
-        for req_id in sorted(off_out):
-            same = off_out[req_id] == on_out[req_id]
-            print(f"req {req_id}: match={same}\n  off={off_out[req_id]}\n  on ={on_out[req_id]}")

@@ -798,16 +798,26 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         return action
 
     @staticmethod
-    def _evict_mamba(count):
-        """Evict the ``count`` least-recently-used Mamba snapshots, keeping their KV blocks."""
+    def _evict_mamba(count, optional=False):
+        """Evict the ``count`` least-recently-used Mamba snapshots, keeping their KV blocks.
+
+        With ``optional``, evict whatever is cached (possibly nothing) instead of
+        requiring ``count`` snapshots to exist.
+        """
 
         def action(engine, requests):
             msa = engine.context.mamba_slot_allocator
-            assert len(msa.hash_to_block_id) >= count, (
-                f"expected at least {count} cached Mamba snapshots, "
-                f"have {len(msa.hash_to_block_id)}"
-            )
-            slots = msa._evict_lru_slots_batch(count)
+            available = len(msa.hash_to_block_id)
+            if optional:
+                count_now = min(count, available)
+                if count_now == 0:
+                    return
+            else:
+                assert available >= count, (
+                    f"expected at least {count} cached Mamba snapshots, have {available}"
+                )
+                count_now = count
+            slots = msa._evict_lru_slots_batch(count_now)
             # _evict_lru_slots_batch hands ownership of the freed slots to its
             # caller; return them to the free pool the way allocate_slots_batch
             # would after taking them.
@@ -1057,7 +1067,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
 
         # drop a Mamba snapshot every few requests so slot eviction is exercised
         # alongside the block eviction the small buffer forces on its own
-        actions = {i: self._evict_mamba(1) for i in range(2, len(prompts), 3)}
+        actions = {i: self._evict_mamba(1, optional=True) for i in range(2, len(prompts), 3)}
 
         _, engine = self._assert_equivalent(
             prompts,
@@ -1069,3 +1079,65 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
 
         assert sum(evicted_blocks) > 0, "the cache never evicted anything; raise the prompt count"
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @pytest.mark.parametrize("generate", [1, 8], ids=["one_token", "eight_tokens"])
+    @torch.inference_mode()
+    def test_diagnose_prefix_match_state(self, chunked, generate, capsys):
+        """Diagnostic: report what each run actually cached, matched and computed.
+
+        Not an assertion of behaviour -- run with ``-s`` to compare the caching
+        and non-caching runs side by side. ``generate=1`` compares only the token
+        produced directly from the prefill state, isolating prefill correctness
+        from divergence that accumulates over decode steps.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
+        engine_kwargs = self._engine_kwargs(chunked)
+
+        def run(enable_pc):
+            engine = self._build_engine(
+                model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
+            )
+            outputs, rows = {}, []
+            for i, prompt in enumerate(prompts):
+                req = self._make_request(i, prompt, enable_pc, num_tokens=generate)
+                engine._add_request(req)
+                before = engine.context.lifetime_prefill_token_count
+                while engine.has_unfinished_requests():
+                    result = engine.step_modern()
+                    for record in result["finished_request_records"]:
+                        merged = record.merge()
+                        outputs[merged.request_id] = list(merged.generated_tokens)
+                ctx = engine.context
+                rows.append(
+                    dict(
+                        req=i,
+                        prompt_len=len(prompt),
+                        blocks=len(req.precomputed_block_hashes),
+                        mamba_matched=getattr(req, "_mamba_num_matched_blocks", None),
+                        cached_tokens=getattr(req, "num_cached_tokens", 0),
+                        computed=ctx.lifetime_prefill_token_count - before,
+                        kv_cached=len(ctx.kv_block_allocator.kv_hash_to_block_id)
+                        if enable_pc
+                        else 0,
+                        mamba_cached=len(ctx.mamba_slot_allocator.hash_to_block_id)
+                        if enable_pc
+                        else 0,
+                    )
+                )
+            return outputs, rows
+
+        off_out, off_rows = run(False)
+        on_out, on_rows = run(True)
+
+        mode = f"chunked={chunked} generate={generate}"
+        print(f"\n=== {mode} ===")
+        for label, rows in (("pc=off", off_rows), ("pc=on ", on_rows)):
+            for row in rows:
+                print(f"{label} {row}")
+        for req_id in sorted(off_out):
+            same = off_out[req_id] == on_out[req_id]
+            print(f"req {req_id}: match={same}\n  off={off_out[req_id]}\n  on ={on_out[req_id]}")

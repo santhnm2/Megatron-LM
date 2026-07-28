@@ -1752,6 +1752,27 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             "buffer_size_gb or raise the request count."
         )
 
+    def _assert_paused_under_contention(self, stats):
+        """Fail unless resumption was constrained, in either of the two ways.
+
+        Weaker than :meth:`_assert_paused_under_eviction` and
+        :meth:`_assert_paused_under_scarcity` on purpose, for workloads that
+        cannot be pinned to one form. Which one a run hits depends on whether the
+        blocks under pressure are cached-and-reclaimable or pinned by a live
+        request, and a workload built around *shared* blocks moves between the
+        two: a shared block is pinned by both holders, so pressure on it shows up
+        as requests that simply cannot resume, while the private blocks around it
+        stay reclaimable. Either way the pool ran out; a roomy pool gives neither.
+        """
+        self._assert_paused(stats)
+        assert (
+            stats.get("resume_left_paused", 0) > 0 or stats.get("resume_needing_eviction", 0) > 0
+        ), (
+            "every paused request resumed straight into a spare block, so the "
+            "pool never ran out and nothing here is contended. Lower "
+            "buffer_size_gb or raise the request count."
+        )
+
     @torch.inference_mode()
     def test_paused_request_recurrent_state_matches_uncontended(self):
         """The Mamba recurrent state itself survives pause and resume intact.
@@ -2276,20 +2297,32 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         first's block instead of allocating one, and the resume accounting runs
         against a pool that is part shared, part reclaimable.
 
-        The match may or may not be concurrent. When both members are in flight
-        at once the block carries two references and cannot be evicted to relieve
-        the pressure at all; when the pool is tight enough that they are
-        serialized, the second matches the first's block after it has dropped to
-        ref-zero but before it is reclaimed. Both are the shared-block path, and
-        which one occurs depends on how the scheduler happens to interleave
-        admission, so the assertion below is on the matching -- which is common
-        to both -- rather than on a peak reference count, which is not.
+        Sizing the pool for this is not the same as sizing it for the other pause
+        cases, and the difference is easy to get backwards. The scheduler defers
+        a request whose block hash another in-flight request is about to produce,
+        so a twin is always admitted at least one step after its partner. But
+        ``check_availability`` refuses *every* admission while any request is
+        paused. Squeeze the pool the way the sibling cases do and the two rules
+        compound: the first-of-pair requests fill the pool, all pause the instant
+        they cross their block boundary, admission stops dead, and by the time it
+        reopens the partners have finished and their blocks have been reclaimed.
+        The twins then match nothing and the case silently degenerates into
+        test_paused_requests with duplicate prompts.
+
+        So the pool is sized to let the first-of-pair requests take their second
+        block within the same step, which clears the pause and lets the twins in
+        while their partners are still live. It is still far short of what all 16
+        requests need at once, so the run stays contended.
         """
         pairs = self._pause_prompts(chunked, 8)
         prompts = [pairs[i // 2] for i in range(16)]
         assert all(len(p) % BLOCK_SIZE == 0 for p in prompts)
         blocks_per_request = len(prompts[0]) // BLOCK_SIZE + 1
-        pool_blocks = blocks_per_request + 2 if chunked else 2 * blocks_per_request + 1
+        # Room for one of each pair, prompt and generation block both, plus a
+        # margin -- but not for their twins, which is what keeps it contended.
+        # Chunked admits at most one chunked request at a time, so far fewer are
+        # ever in flight and a much smaller pool already clears the pause.
+        pool_blocks = blocks_per_request + 2 if chunked else len(pairs) * blocks_per_request + 2
 
         stats = {}
         requests, engine = self._assert_equivalent(
@@ -2304,22 +2337,22 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             max_requests=len(prompts),
             request_rounder=4,
         )
-        self._assert_paused_under_eviction(stats)
+        self._assert_paused_under_contention(stats)
 
         # The duplicated prompts really did reuse a block rather than each
-        # allocating their own. Counted per request: a total can be run up by one
-        # prompt matching repeatedly across chunks while the other seven never
-        # match at all. Not every second-of-pair is guaranteed to match -- the
-        # first's block can be reclaimed before its twin is admitted, since the
-        # pool is deliberately too small -- so require most of them, which a
-        # non-sharing implementation still cannot reach (it would score zero).
+        # allocating their own. Counted per request, not in aggregate: a total
+        # can be run up by one prompt matching repeatedly across chunks while the
+        # other seven never match at all. Require most of the twins rather than
+        # all of them -- a partner's block can still be reclaimed before its twin
+        # is admitted -- which a non-sharing implementation cannot reach either
+        # way, since it would score zero.
         matched = [r for r in requests if r.num_cached_tokens > 0]
         assert len(matched) >= len(pairs) // 2, (
             f"only {len(matched)} of {len(prompts)} requests matched a cached "
             f"block, so the identical prompts were not sharing and this case is "
-            f"not exercising a partly-shared pool. Peak block ref count was "
-            f"{stats.get('max_block_ref_count', 0)} (>1 means a shared block was "
-            f"also pinned by two in-flight requests at once)"
+            f"not exercising a partly-shared pool -- see the note on pool sizing "
+            f"above. Peak block ref count was {stats.get('max_block_ref_count', 0)} "
+            f"(>1 means a shared block was pinned by two live requests at once)"
         )
 
     @torch.inference_mode()

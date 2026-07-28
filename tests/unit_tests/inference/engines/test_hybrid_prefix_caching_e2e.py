@@ -919,32 +919,58 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         actions=None,
         on_engine=None,
         generate=EVICTION_TOKENS_TO_GENERATE,
+        admit=1,
+        stats=None,
         **engine_kwargs,
     ):
-        """Issue each prompt as its own request, draining it before the next.
+        """Issue the prompts in groups of ``admit``, draining each group before the next.
+
+        With the default ``admit=1`` every request runs alone, so batch
+        composition is identical between runs. A larger group admits requests
+        together, which is what lets them compete for blocks and be paused.
 
         ``actions`` maps a prompt index to a callable invoked with the engine
-        once that prompt's request has finished. Actions run only when prefix
+        once that prompt's group has finished. Actions run only when prefix
         caching is on, since they manipulate cache state that does not otherwise
-        exist.
+        exist. ``stats`` collects observations about what the engine had to do.
         """
         engine = self._build_engine(
             model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
         )
         if on_engine is not None:
             on_engine(engine)
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
         outputs, requests = {}, []
-        for i, prompt in enumerate(prompts):
-            req = self._make_request(i, prompt, enable_pc, num_tokens=generate)
-            engine._add_request(req)
+        for start in range(0, len(prompts), admit):
+            group = range(start, min(start + admit, len(prompts)))
+            for i in group:
+                req = self._make_request(i, prompts[i], enable_pc, num_tokens=generate)
+                engine._add_request(req)
+                requests.append(req)
+            steps = 0
             while engine.has_unfinished_requests():
+                steps += 1
+                assert steps < 500, (
+                    f"engine stopped making progress with {len(outputs)} of "
+                    f"{len(prompts)} requests finished"
+                )
                 result = engine.step_modern()
+                if stats is not None:
+                    stats["max_paused"] = max(stats.get("max_paused", 0), ctx.paused_request_count)
+                    if (
+                        enable_pc
+                        and alloc.total_avail == 0
+                        and int(alloc.get_evictable_block_count()) > 0
+                    ):
+                        stats["starved_with_evictable"] = True
                 for record in result["finished_request_records"]:
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
-            requests.append(req)
-            if enable_pc and actions and i in actions:
-                actions[i](engine, requests)
+            if enable_pc and actions:
+                for i in group:
+                    if i in actions:
+                        actions[i](engine, requests)
         return outputs, requests, engine
 
     def _assert_equivalent(
@@ -954,6 +980,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         chunked=False,
         on_engine=None,
         generate=EVICTION_TOKENS_TO_GENERATE,
+        admit=1,
+        stats=None,
         **engine_overrides,
     ):
         """Require the caching run to reproduce an uncached single-pass reference.
@@ -981,6 +1009,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             actions=actions,
             on_engine=on_engine,
             generate=generate,
+            admit=admit,
+            stats=stats,
             **{**self._engine_kwargs(chunked), **engine_overrides},
         )
 
@@ -1284,3 +1314,148 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
         # and the forced block evictions found something to take each time
         assert kv_evicted, "the periodic KV eviction never had a block to evict"
+
+    def _assert_paused(self, stats):
+        """Fail unless the run actually paused a request and ran the pool dry."""
+        assert stats.get("max_paused", 0) > 0, (
+            "no request was ever paused, so the resume path was never entered. "
+            "Lower buffer_size_gb or raise the request count."
+        )
+        assert stats.get("starved_with_evictable"), (
+            "the free pool never emptied while cached blocks remained, so resume "
+            "never had to reclaim capacity that only eviction could supply."
+        )
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_paused_requests(self, chunked):
+        """Requests paused mid-decode and resumed still produce the reference tokens.
+
+        Every prompt is exactly one block, so each request needs a second block
+        the moment it generates, and they are admitted together against a pool
+        that cannot serve them all at once. Requests are therefore paused and
+        resumed while the cache holds evictable blocks.
+
+        One token per request is compared: admitting as a batch means the batch
+        composition necessarily differs from the sequential reference, and that
+        alone perturbs decode-step numerics. The first token is the one the
+        prefill state and a correct resume determine, which is the property
+        pausing puts at risk.
+        """
+        num_requests = 6
+        prompts = [self._seg(i) for i in range(num_requests)]
+        assert all(len(p) == BLOCK_SIZE for p in prompts), "prompts must be exactly one block"
+
+        stats = {}
+        _, engine = self._assert_equivalent(
+            prompts,
+            chunked=chunked,
+            generate=1,
+            admit=num_requests,
+            stats=stats,
+            # a handful of blocks, against the two per request this batch needs
+            buffer_size_gb=0.004,
+            max_requests=4,
+            request_rounder=4,
+        )
+        self._assert_paused(stats)
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_paused_requests_sharing_cached_blocks(self, chunked):
+        """Pausing while the blocks under contention are shared and cache-pinned.
+
+        Prompts come in identical pairs, so the second of each pair matches the
+        first's block and raises its reference count instead of allocating. A
+        pinned block cannot be evicted to relieve the pressure, which changes
+        which requests can resume and when, so the resume accounting is exercised
+        against a pool that is part shared, part reclaimable.
+        """
+        pairs = [self._seg(i) for i in range(3)]
+        prompts = [pairs[i // 2] for i in range(6)]
+        assert all(len(p) == BLOCK_SIZE for p in prompts)
+
+        stats = {}
+        _, engine = self._assert_equivalent(
+            prompts,
+            chunked=chunked,
+            generate=1,
+            admit=len(prompts),
+            stats=stats,
+            buffer_size_gb=0.004,
+            max_requests=4,
+            request_rounder=4,
+        )
+        self._assert_paused(stats)
+        # the duplicated prompts really did share a block rather than each
+        # allocating their own
+        assert len(self._kv_map(engine)) <= len(pairs)
+
+    @torch.inference_mode()
+    def test_concurrent_block_aligned_requests_pause_and_resume(self):
+        """Requests that exhaust the pool mid-decode are paused and later resume.
+
+        Every prompt is exactly one block long, so each request needs a *second*
+        block the moment it generates its first token. Several run concurrently
+        against a pool that cannot hand out that second block to all of them at
+        once, so requests get paused and resumed as capacity frees up.
+
+        This is the state prefill-time eviction never reaches. Under LRU, a
+        finished request's complete blocks stay registered rather than returning
+        to the free pool, so at the moment a paused request wants to resume the
+        free pool can be empty while the capacity it needs sits in
+        reclaimable-but-still-cached blocks. Resumption has to count that
+        capacity, not just the free pool.
+
+        The assertion is progress and accounting rather than token equality:
+        requests are admitted as a batch here, so batch composition differs from
+        an uncached run by construction.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        num_requests, generate = 6, 4
+        prompts = [self._seg(i) for i in range(num_requests)]
+        assert all(len(p) == BLOCK_SIZE for p in prompts), "prompts must be exactly one block"
+
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            # only a handful of blocks, against the two per request this batch
+            # needs at once
+            buffer_size_gb=0.004,
+            max_requests=4,
+            request_rounder=4,
+        )
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
+
+        for i, prompt in enumerate(prompts):
+            engine._add_request(self._make_request(i, prompt, enable_pc=True, num_tokens=generate))
+
+        finished, stats, steps = {}, {}, 0
+        while engine.has_unfinished_requests():
+            steps += 1
+            assert steps < 500, (
+                f"engine stopped making progress after {len(finished)} of "
+                f"{num_requests} requests finished"
+            )
+            result = engine.step_modern()
+            stats["max_paused"] = max(stats.get("max_paused", 0), ctx.paused_request_count)
+            # the free pool is empty but cached blocks could still be reclaimed
+            if alloc.total_avail == 0 and int(alloc.get_evictable_block_count()) > 0:
+                stats["starved_with_evictable"] = True
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                finished[merged.request_id] = list(merged.generated_tokens)
+
+        assert sorted(finished) == list(
+            range(num_requests)
+        ), f"only {sorted(finished)} of {num_requests} requests finished"
+        for req_id, tokens in finished.items():
+            assert (
+                len(tokens) == generate
+            ), f"request {req_id} produced {len(tokens)} tokens, expected {generate}"
+        self._assert_paused(stats)

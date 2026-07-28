@@ -2457,11 +2457,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not (self._pending_mamba_restores or self._pending_mamba_zeros):
             return
 
-        # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
+        # Restore cached Mamba state to live buffers. A restore is queued only
+        # when prefill tokens were skipped for that request, and those tokens are
+        # never fed to the SSM, so there is no valid fallback here: zeroing the
+        # state would silently start the recurrence mid-sequence from zeros.
         for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
             restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
-            if not restored:
-                self._pending_mamba_zeros.append(mamba_idx)
+            assert restored, (
+                f"Mamba state for block {block_id} is missing at restore time; request "
+                f"{request_idx} skipped prefill tokens that the SSM will never consume"
+            )
         self._pending_mamba_restores.clear()
 
         # Batch-zero newly allocated Mamba slots.
@@ -2886,22 +2891,32 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_mamba_matched <= num_matched
             ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
             if num_mamba_matched > 0 and block_aligned:
-                raw_skip = num_mamba_matched * self.block_size_tokens
-                if raw_skip >= prefill_chunk_length:
-                    # Back off to previous block with cached Mamba state
-                    mamba_map = self.mamba_slot_allocator.hash_to_block_id
-                    backed_off_blocks = 0
-                    for j in range(num_mamba_matched - 2, -1, -1):
-                        if req.precomputed_block_hashes[j] in mamba_map:
-                            backed_off_blocks = j + 1
-                            break
-                    prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
-                else:
-                    prefix_skip_tokens = raw_skip
+                # Cap the skip so at least two tokens remain to compute this
+                # chunk; see the effective_prefill_chunk_length clamp below for
+                # why a single-token chunk is not usable. Re-resolving the Mamba
+                # match under that cap (rather than truncating the token count
+                # afterwards) keeps the skip on a boundary that actually has
+                # cached state to resume from: the capped boundary may have been
+                # evicted even though a deeper one survived.
+                max_skip_blocks = (
+                    min(num_mamba_matched, (prefill_chunk_length - 2) // self.block_size_tokens)
+                    if prefill_chunk_length >= 2
+                    else 0
+                )
+                skip_blocks = self._find_mamba_match_count(
+                    req, already_allocated_blocks, already_allocated_blocks + max_skip_blocks
+                )
+                prefix_skip_tokens = skip_blocks * self.block_size_tokens
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model and finished == 0:
-            if record_mamba_match:
+        elif self.is_hybrid_model:
+            # Either Mamba caching is disabled, or this is a continuation chunk.
+            # A continuation chunk resumes from the live state the previous chunk
+            # left behind and has no snapshot to restore from, so it must compute
+            # every token it covers even when those tokens are cached in KV --
+            # skipping them would advance the KV offset past tokens the SSM never
+            # consumed.
+            if record_mamba_match and finished == 0:
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 

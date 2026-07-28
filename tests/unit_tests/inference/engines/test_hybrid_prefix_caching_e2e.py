@@ -87,10 +87,12 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
-class TestMambaPrefixCachingE2E:
-    """End-to-end test for Mamba prefix caching with a real hybrid model."""
+class _HybridPCHelpers:
+    """Model, engine, and request fixtures shared by the hybrid prefix-caching tests.
+
+    Not collected by pytest (no ``Test`` prefix); mixed into the test classes
+    below so they share one hybrid model definition and engine builder.
+    """
 
     @classmethod
     def setup_class(cls):
@@ -275,6 +277,12 @@ class TestMambaPrefixCachingE2E:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)
         return finished, engine.context.lifetime_prefill_token_count
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
+class TestMambaPrefixCachingE2E(_HybridPCHelpers):
+    """End-to-end test for Mamba prefix caching with a real hybrid model."""
 
     def _get_ref_count(self, alloc, block_hash):
         bid = alloc.kv_hash_to_block_id.get(block_hash)
@@ -704,3 +712,350 @@ class TestMambaPrefixCachingE2E:
             "Reuse request should restore Mamba state from the token-768 snapshot "
             f"(3 matched blocks), got {reuse._mamba_num_matched_blocks}."
         )
+
+
+EVICTION_BASE_TOKEN = 20000
+EVICTION_TOKENS_TO_GENERATE = 8
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
+class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
+    """Generated tokens must not depend on the state of the prefix cache.
+
+    Every case runs one prompt sequence twice against the same hybrid model --
+    once with prefix caching disabled, once enabled -- and requires identical
+    output tokens. Requests are issued one at a time and drained to completion,
+    so batch composition is identical between the two runs and any divergence is
+    attributable to the cache path alone.
+
+    Between requests in the caching run, the cache is driven into a specific
+    state through the LRU eviction entry points, so each case covers a different
+    combination of surviving KV blocks and surviving Mamba snapshots. Each case
+    runs both as a single prefill chunk per request and under chunked prefill,
+    where a prompt's blocks are matched across several chunks.
+    """
+
+    # ------------------------------------------------------------------ prompts
+
+    @staticmethod
+    def _seg(index, length=BLOCK_SIZE):
+        """A block-sized (or shorter) run of token ids unique to ``index``."""
+        start = EVICTION_BASE_TOKEN + index * BLOCK_SIZE
+        return torch.arange(
+            start, start + length, dtype=torch.int64, device=torch.cuda.current_device()
+        )
+
+    def _seed_prompts(self):
+        """Three prompts that populate Mamba snapshots at block boundaries 0, 1 and 2.
+
+        A prompt caches Mamba state at its last full-block boundary, so prompt
+        lengths are chosen to place that boundary one block further along each
+        time. They share a common prefix, so each also matches the blocks the
+        previous ones registered.
+        """
+        seg0, seg1, seg2 = self._seg(0), self._seg(1), self._seg(2)
+        return [
+            torch.cat([seg0, self._seg(10, 44)]),  # 300 tokens -> boundary at block 0
+            torch.cat([seg0, seg1, self._seg(11, 44)]),  # 556 tokens -> boundary at block 1
+            torch.cat([seg0, seg1, seg2, self._seg(12, 44)]),  # 812 tokens -> boundary at block 2
+        ]
+
+    def _probe(self, num_shared_blocks, tail_index, tail_len=44):
+        """A prompt sharing ``num_shared_blocks`` leading blocks with the seeds."""
+        shared = [self._seg(i) for i in range(num_shared_blocks)]
+        return torch.cat(shared + [self._seg(tail_index, tail_len)])
+
+    # ----------------------------------------------------------------- eviction
+
+    @staticmethod
+    def _kv_map(engine):
+        return engine.context.kv_block_allocator.kv_hash_to_block_id
+
+    @staticmethod
+    def _mamba_map(engine):
+        return engine.context.mamba_slot_allocator.hash_to_block_id
+
+    @staticmethod
+    def _evict_kv(count):
+        """Evict the ``count`` least-recently-used cached KV blocks."""
+
+        def action(engine, requests):
+            assert engine.context.kv_block_allocator.evict_lru_blocks(
+                count
+            ), f"expected at least {count} evictable KV blocks"
+
+        return action
+
+    @staticmethod
+    def _evict_mamba(count):
+        """Evict the ``count`` least-recently-used Mamba snapshots, keeping their KV blocks."""
+
+        def action(engine, requests):
+            msa = engine.context.mamba_slot_allocator
+            assert len(msa.hash_to_block_id) >= count, (
+                f"expected at least {count} cached Mamba snapshots, "
+                f"have {len(msa.hash_to_block_id)}"
+            )
+            slots = msa._evict_lru_slots_batch(count)
+            # _evict_lru_slots_batch hands ownership of the freed slots to its
+            # caller; return them to the free pool the way allocate_slots_batch
+            # would after taking them.
+            for slot in slots:
+                msa.free_slots[msa.free_count] = slot
+                msa.free_count += 1
+
+        return action
+
+    @staticmethod
+    def _evict_mamba_for_hash(get_hash):
+        """Drop the Mamba snapshot for one specific block, keeping its KV block cached.
+
+        Mirrors the bookkeeping of the LRU slot eviction path, but targets a
+        chosen block so a case can place a hole at a known depth of the prefix
+        chain. ``get_hash`` is called with the finished requests so far and
+        returns the block hash to drop.
+        """
+
+        def action(engine, requests):
+            msa = engine.context.mamba_slot_allocator
+            block_hash = get_hash(requests)
+            assert block_hash in msa.hash_to_block_id, "target block has no cached Mamba snapshot"
+            block_id = msa.hash_to_block_id.pop(block_hash)
+            slot = msa.block_to_slot[block_id].item()
+            assert slot >= 0
+            msa.block_to_slot[block_id] = -1
+            msa.slot_to_block[slot] = -1
+            msa.free_slots[msa.free_count] = slot
+            msa.free_count += 1
+            # the KV block itself stays cached and matchable
+            assert block_hash in engine.context.kv_block_allocator.kv_hash_to_block_id
+
+        return action
+
+    @staticmethod
+    def _chain(*actions):
+        def action(engine, requests):
+            for a in actions:
+                a(engine, requests)
+
+        return action
+
+    # -------------------------------------------------------------------- runner
+
+    def _engine_kwargs(self, chunked):
+        if not chunked:
+            return {}
+        # max_tokens below the prompt lengths forces each request across several
+        # prefill chunks. 300 is not a multiple of BLOCK_SIZE, so the scheduler
+        # has to choose the cuts rather than inheriting them from the prompt.
+        return dict(
+            enable_chunked_prefill=True, max_tokens=300, max_requests=4, request_rounder=4
+        )
+
+    def _run(
+        self, model, mamba_config, prompts, enable_pc, actions=None, on_engine=None, **engine_kwargs
+    ):
+        """Issue each prompt as its own request, draining it before the next.
+
+        ``actions`` maps a prompt index to a callable invoked with the engine
+        once that prompt's request has finished. Actions run only when prefix
+        caching is on, since they manipulate cache state that does not otherwise
+        exist.
+        """
+        engine = self._build_engine(
+            model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
+        )
+        if on_engine is not None:
+            on_engine(engine)
+        outputs, requests = {}, []
+        for i, prompt in enumerate(prompts):
+            req = self._make_request(i, prompt, enable_pc, num_tokens=EVICTION_TOKENS_TO_GENERATE)
+            engine._add_request(req)
+            while engine.has_unfinished_requests():
+                result = engine.step_modern()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    outputs[merged.request_id] = list(merged.generated_tokens)
+            requests.append(req)
+            if enable_pc and actions and i in actions:
+                actions[i](engine, requests)
+        return outputs, requests, engine
+
+    def _assert_equivalent(
+        self, prompts, actions=None, chunked=False, on_engine=None, **engine_overrides
+    ):
+        """Run ``prompts`` with caching off and on; require identical outputs."""
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        engine_kwargs = {**self._engine_kwargs(chunked), **engine_overrides}
+
+        off, _, _ = self._run(model, mamba_config, prompts, False, **engine_kwargs)
+        on, requests, engine = self._run(
+            model, mamba_config, prompts, True, actions=actions, on_engine=on_engine, **engine_kwargs
+        )
+
+        assert sorted(off) == sorted(on) == list(range(len(prompts)))
+        for req_id in off:
+            assert off[req_id] == on[req_id], (
+                f"request {req_id}: caching disabled produced {off[req_id]}, "
+                f"caching enabled produced {on[req_id]}"
+            )
+        return requests, engine
+
+    # ---------------------------------------------------------------- the cases
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_single_block_match(self, chunked):
+        """A request sharing one leading block with a cached prompt, nothing evicted."""
+        prompts = self._seed_prompts() + [self._probe(1, tail_index=20)]
+        requests, engine = self._assert_equivalent(prompts, chunked=chunked)
+
+        if not chunked:
+            assert requests[-1]._mamba_num_matched_blocks == 1
+            assert requests[-1].precomputed_block_hashes[0] in self._mamba_map(engine)
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_kv_block_evicted(self, chunked):
+        """A cached KV block is evicted before a request that would have matched it.
+
+        Evicting a KV block also drops the Mamba snapshot anchored to it, while
+        snapshots on the blocks that survive are left in place.
+        """
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=20)]
+        seeds = 3
+
+        def check_cascade(engine, requests):
+            # whatever the leaf peel took, no Mamba snapshot outlives its KV block
+            for block_hash in self._mamba_map(engine):
+                assert block_hash in self._kv_map(engine)
+
+        actions = {seeds - 1: self._chain(self._evict_kv(1), check_cascade)}
+        self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_mamba_snapshot_evicted(self, chunked):
+        """A Mamba snapshot is evicted while its KV block stays cached.
+
+        The request that follows can still match the KV block, but has to resume
+        the SSM from a shallower boundary -- or recompute from the start if no
+        snapshot survives below its match.
+        """
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=20)]
+
+        def check_kv_survives(engine, requests):
+            assert len(self._kv_map(engine)) >= len(self._mamba_map(engine))
+
+        actions = {2: self._chain(self._evict_mamba(1), check_kv_survives)}
+        self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_kv_block_and_mamba_snapshot_evicted(self, chunked):
+        """Both a KV block and an unrelated Mamba snapshot are evicted."""
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=20)]
+        actions = {2: self._chain(self._evict_mamba(1), self._evict_kv(1))}
+        self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_kv_block_evicted_then_recomputed(self, chunked):
+        """An evicted KV block is recomputed by one request and matched by the next."""
+        prompts = self._seed_prompts() + [
+            self._probe(3, tail_index=20),  # recomputes what was evicted
+            self._probe(3, tail_index=21),  # matches the recomputed blocks
+        ]
+        actions = {2: self._evict_kv(1)}
+        requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+        # the recomputed prefix is cached again by the time the last request runs
+        for block_hash in requests[-1].precomputed_block_hashes:
+            assert block_hash in self._kv_map(engine)
+
+    @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
+    @torch.inference_mode()
+    def test_mamba_snapshot_evicted_then_recomputed(self, chunked):
+        """An evicted Mamba snapshot is re-extracted by one request and used by the next."""
+        prompts = self._seed_prompts() + [
+            self._probe(3, tail_index=20),  # re-extracts a snapshot on its divergence boundary
+            self._probe(3, tail_index=21),  # resumes from the re-extracted snapshot
+        ]
+        actions = {2: self._evict_mamba(1)}
+        requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+        if not chunked:
+            assert requests[-1]._mamba_num_matched_blocks > 0
+
+    @torch.inference_mode()
+    def test_snapshot_hole_under_tight_prefill_chunk(self):
+        """A prompt one token past its last shared block, with a snapshot hole beneath it.
+
+        The deepest cached snapshot covers every token but one of this prompt, so
+        the skip has to give back a block to leave something to compute. The
+        boundary it gives back to has had its snapshot evicted, so the resume
+        point is a block shallower still.
+        """
+        seeds = self._seed_prompts()
+        # 3 shared blocks + 1 token: skipping to the block-2 boundary would leave
+        # a single token for this chunk, so the skip has to give that block back.
+        probe = self._probe(3, tail_index=20, tail_len=1)
+        assert len(probe) == 3 * BLOCK_SIZE + 1
+
+        # Drop the snapshot at block index 1 -- the boundary the skip falls back
+        # to -- so the usable resume point is block 0, two boundaries below the
+        # deepest snapshot the prefix matches.
+        actions = {
+            2: self._evict_mamba_for_hash(lambda requests: requests[2].precomputed_block_hashes[1])
+        }
+        requests, engine = self._assert_equivalent(seeds + [probe], actions=actions)
+
+        # the prefix still matches all three blocks; only the resume point moved
+        assert requests[-1]._mamba_num_matched_blocks == 3
+        assert requests[-1].precomputed_block_hashes[1] not in self._mamba_map(engine)
+
+    @torch.inference_mode()
+    def test_eviction_stress(self):
+        """Many overlapping prompts through a cache far too small to hold them.
+
+        Blocks are evicted and recomputed continuously while requests are also
+        losing Mamba snapshots, so the run covers a long sequence of cache states
+        rather than one constructed one. Output still has to match an uncached
+        run token for token.
+        """
+        prompts = []
+        for i in range(12):
+            # overlap depth cycles 1..3 blocks so prefixes are repeatedly
+            # re-matched, re-evicted and recomputed at different depths
+            shared = (i % 3) + 1
+            prompts.append(self._probe(shared, tail_index=30 + i, tail_len=44 + (i % 4) * 64))
+
+        evicted_blocks = []
+
+        def instrument(engine):
+            alloc = engine.context.kv_block_allocator
+            original = alloc._deregister_blocks
+
+            def counting(block_ids):
+                evicted_blocks.append(int(block_ids.numel()))
+                return original(block_ids)
+
+            alloc._deregister_blocks = counting
+
+        # drop a Mamba snapshot every few requests so slot eviction is exercised
+        # alongside the block eviction the small buffer forces on its own
+        actions = {i: self._evict_mamba(1) for i in range(2, len(prompts), 3)}
+
+        _, engine = self._assert_equivalent(
+            prompts,
+            actions=actions,
+            chunked=True,
+            on_engine=instrument,
+            # far too small to hold 12 prompts of up to four blocks each
+            buffer_size_gb=0.02,
+        )
+
+        assert sum(evicted_blocks) > 0, "the cache never evicted anything; raise the prompt count"

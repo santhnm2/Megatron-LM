@@ -719,7 +719,8 @@ EVICTION_TOKENS_TO_GENERATE = 8
 # 0-2 are the shared prefix blocks, and the rest are per-prompt tails.
 SEG_SEED_TAIL = 3  # 3 seed prompts -> indices 3, 4, 5
 SEG_PROBE_TAIL = 6  # probe prompts -> indices 6, 7
-SEG_STRESS_TAIL = 8  # stress prompts -> indices 8..19
+SEG_STRESS_UNIQUE = 8  # per-prompt full block for the stress run -> indices 8..27
+SEG_STRESS_TAIL = 28  # partial tail shared by every stress prompt
 
 
 @pytest.mark.internal
@@ -1062,12 +1063,23 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         rather than one constructed one. Output still has to match an uncached
         run token for token.
         """
+        # Each prompt is 1-3 shared leading blocks, then a full block of content
+        # unique to it, then a partial tail every prompt shares. The unique block
+        # is what fills the cache: a partial tail is never registered, so prompts
+        # whose only complete blocks are shared ones give the cache nothing to
+        # evict. 20 prompts therefore register 3 shared + 20 unique = 23 blocks.
+        num_prompts = 20
         prompts = []
-        for i in range(12):
+        for i in range(num_prompts):
             # overlap depth cycles 1..3 blocks so prefixes are repeatedly
             # re-matched, re-evicted and recomputed at different depths
             shared = (i % 3) + 1
-            prompts.append(self._probe(shared, tail_index=SEG_STRESS_TAIL + i, tail_len=44 + (i % 4) * 64))
+            prompts.append(
+                torch.cat(
+                    [self._seg(b) for b in range(shared)]
+                    + [self._seg(SEG_STRESS_UNIQUE + i), self._seg(SEG_STRESS_TAIL, 44)]
+                )
+            )
 
         evicted_blocks = []
 
@@ -1090,8 +1102,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             actions=actions,
             chunked=True,
             on_engine=instrument,
-            # far too small to hold 12 prompts of up to four blocks each
-            buffer_size_gb=0.02,
+            # roughly 15 blocks, against the 23 distinct blocks these prompts
+            # register, so the pool turns over several times during the run
+            buffer_size_gb=0.01,
         )
 
-        assert sum(evicted_blocks) > 0, "the cache never evicted anything; raise the prompt count"
+        assert sum(evicted_blocks) > 0, (
+            "the cache never evicted anything -- the prompts fit in the pool. "
+            "Only complete blocks are registered, so raise the number of prompts "
+            "or the unique full blocks per prompt rather than the tail length."
+        )

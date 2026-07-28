@@ -1458,6 +1458,265 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
 
     @torch.inference_mode()
+    def test_paused_request_recurrent_state_matches_uncontended(self):
+        """The Mamba recurrent state itself survives pause and resume intact.
+
+        Token comparisons cannot reach this. A corrupted recurrent state may take
+        many steps to move an argmax, and once one token flips the two runs feed
+        different inputs, so everything after that legitimately differs and
+        neither tokens nor state can be compared any further.
+
+        So the token sequence is pinned to a golden one. A clean run -- prefix
+        caching off, no chunked prefill, a pool big enough that nothing ever
+        waits -- generates and records what the model actually produces at each
+        sequence position. The runs under test then replay those tokens instead
+        of sampling, so every run feeds identical inputs at identical positions
+        however its batch was composed.
+
+        What is compared is the conv and SSM state tensors themselves, sampled at
+        matching positions against the clean run. Being continuous they admit a
+        tolerance where an argmax does not: benign bf16 reassociation moves them
+        slightly, while a stale slot, a zeroed state, or a state carried from the
+        wrong request moves them enormously.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        num_requests, generate = 8, 400
+        prompts = [self._seg(i, BLOCK_SIZE + 37 + 19 * i) for i in range(num_requests)]
+        assert all(len(p) % BLOCK_SIZE != 0 for p in prompts)
+        peak_blocks = max(-(-(len(p) + generate) // BLOCK_SIZE) for p in prompts)
+        sample_every = 32  # snapshot on positions every run is guaranteed to hit
+
+        def row_keys(ctx):
+            """(request id, sequence position) for each row the sampler returns."""
+            lo, hi = ctx.paused_request_count, ctx.total_request_count
+            return list(
+                zip(
+                    ctx.request_ids[lo:hi].tolist(),
+                    ctx.request_kv_length_offsets[lo:hi].tolist(),
+                )
+            )
+
+        def run(pool_blocks, stats, enable_pc, golden=None):
+            """Run the batch; record the golden token stream, or replay one."""
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=enable_pc,
+                buffer_size_gb=self._calibrate_buffer_gb(
+                    model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
+                ),
+                max_requests=num_requests,
+                request_rounder=4,
+            )
+            self._instrument_resume(engine, stats)
+            ctx = engine.context
+            recorded, misses = {}, 0
+            original_sample = engine.controller.sample_from_logits
+
+            def patched_sample(*args, **kwargs):
+                nonlocal misses
+                sampled = original_sample(*args, **kwargs)
+                keys = row_keys(ctx)
+                if sampled.numel() != len(keys):
+                    # not the one-row-per-active-request shape this assumes
+                    return sampled
+                if golden is None:
+                    for row, key in enumerate(keys):
+                        recorded[key] = int(sampled[row].item())
+                    return sampled
+                replay = sampled.clone()
+                for row, key in enumerate(keys):
+                    if key in golden:
+                        replay[row] = golden[key]
+                    else:
+                        misses += 1
+                return replay
+
+            engine.controller.sample_from_logits = patched_sample
+
+            for i, prompt in enumerate(prompts):
+                engine._add_request(
+                    self._make_request(i, prompt, enable_pc=enable_pc, num_tokens=generate)
+                )
+
+            snapshots, steps = {}, 0
+            while engine.has_unfinished_requests():
+                steps += 1
+                assert steps < 20000, "engine stopped making progress"
+                engine.step_modern()
+
+                # Record the live state of every active request whose position is
+                # on the sampling grid. Positions, not step numbers: a contended
+                # run reaches a given position later.
+                lo, hi = ctx.paused_request_count, ctx.total_request_count
+                if hi <= lo:
+                    continue
+                wanted = [
+                    (r, p, m)
+                    for (r, p), m in zip(
+                        row_keys(ctx),
+                        ctx.mamba_metadata.request_to_mamba_state_idx[lo:hi].tolist(),
+                    )
+                    if p % sample_every == 0 and m >= 0
+                ]
+                if not wanted:
+                    continue
+                idx = torch.tensor(
+                    [m for _, _, m in wanted], dtype=torch.long, device=ctx.mamba_ssm_states.device
+                )
+                ssm = ctx.mamba_ssm_states[:, idx].float().cpu()
+                conv = ctx.mamba_conv_states[:, idx].float().cpu()
+                for col, (req_id, pos, _) in enumerate(wanted):
+                    snapshots[(req_id, pos)] = (ssm[:, col].clone(), conv[:, col].clone())
+            return snapshots, recorded, misses
+
+        # Golden: no prefix caching, no chunked prefill, nothing ever waits.
+        clean_stats = {}
+        clean_snaps, golden, _ = run(
+            num_requests * peak_blocks + 4, clean_stats, enable_pc=False
+        )
+        assert golden, "the clean run recorded no tokens to replay"
+        assert clean_stats.get("resume_left_paused", 0) == 0, "the clean run was not uncontended"
+
+        tight_stats = {}
+        tight_snaps, _, misses = run(
+            2 * peak_blocks + 1, tight_stats, enable_pc=True, golden=golden
+        )
+        assert misses == 0, (
+            f"{misses} sampled rows had no golden token, so the contended run did "
+            f"not reproduce the clean run's sequence positions"
+        )
+        self._assert_paused_under_scarcity(tight_stats)
+
+        shared = sorted(set(clean_snaps) & set(tight_snaps))
+        assert len(shared) >= num_requests, (
+            f"only {len(shared)} matching (request, position) snapshots across the "
+            f"two runs; not enough to compare"
+        )
+        nonzero = 0
+        for key in shared:
+            ssm_clean, conv_clean = clean_snaps[key]
+            ssm_tight, conv_tight = tight_snaps[key]
+            if ssm_clean.abs().sum() > 0:
+                nonzero += 1
+            for name, a, b in (("ssm", ssm_clean, ssm_tight), ("conv", conv_clean, conv_tight)):
+                assert torch.allclose(a, b, rtol=2e-2, atol=2e-2), (
+                    f"request {key[0]} at position {key[1]}: {name} state diverged "
+                    f"from the clean run (max abs diff {(a - b).abs().max().item():.4g}, "
+                    f"reference max {a.abs().max().item():.4g})"
+                )
+        assert nonzero >= len(shared) // 2, (
+            "most sampled states were all-zero, so the comparison would pass even "
+            "if the state were never restored"
+        )
+
+    @torch.inference_mode()
+    def test_decode_heavy_pause_stress(self):
+        """Long, uneven generations contending for a pool far too small for them.
+
+        The other pause cases give every request the same prompt length and the
+        same amount to generate, so they all cross their boundaries on the same
+        step. Here both vary, so crossings are staggered across the run and
+        requests are paused and resumed at unrelated points while the pool is
+        continuously oversubscribed. Prompts share leading blocks, so the prefix
+        cache is live at the same time.
+
+        Generated tokens beyond the first are not compared: batch composition
+        alone perturbs output at these decode lengths (see
+        test_decode_crossing_many_block_boundaries).
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        num_requests = 16
+        prompts, generates = [], []
+        for i in range(num_requests):
+            # Shared leading block plus a tail that never lands on a boundary, so
+            # crossings fall at a different offset for each request.
+            tail = 37 + 23 * (i % 7)
+            prompts.append(torch.cat([self._seg(i % 4), self._seg(8 + i, tail)]))
+            # Long enough that even the shortest generation clears the next
+            # boundary, and uneven so requests cross 1-3 times at staggered points.
+            generates.append(400 + 60 * (i % 7))
+        assert all(len(p) % BLOCK_SIZE != 0 for p in prompts)
+
+        crossings = [
+            len(
+                [
+                    b
+                    for b in range(BLOCK_SIZE, len(prompts[i]) + generates[i] + 1, BLOCK_SIZE)
+                    if len(prompts[i]) < b <= len(prompts[i]) + generates[i]
+                ]
+            )
+            for i in range(num_requests)
+        ]
+        assert all(c >= 1 for c in crossings), f"every request must cross a boundary: {crossings}"
+        peak_blocks = max(
+            -(-(len(prompts[i]) + generates[i]) // BLOCK_SIZE) for i in range(num_requests)
+        )
+
+        def run(pool_blocks, stats):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=True,
+                buffer_size_gb=self._calibrate_buffer_gb(
+                    model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
+                ),
+                max_requests=num_requests,
+                request_rounder=4,
+            )
+            self._instrument_resume(engine, stats)
+            for i, prompt in enumerate(prompts):
+                engine._add_request(
+                    self._make_request(i, prompt, enable_pc=True, num_tokens=generates[i])
+                )
+            outputs, steps = {}, 0
+            while engine.has_unfinished_requests():
+                steps += 1
+                assert steps < 20000, (
+                    f"engine stopped making progress after {len(outputs)} of "
+                    f"{num_requests} requests finished"
+                )
+                for record in engine.step_modern()["finished_request_records"]:
+                    merged = record.merge()
+                    outputs[merged.request_id] = list(merged.generated_tokens)
+            return outputs
+
+        roomy_stats, tight_stats = {}, {}
+        roomy_out = run(num_requests * peak_blocks + 4, roomy_stats)
+        tight_out = run(2 * peak_blocks + 1, tight_stats)
+
+        for label, outputs in (("roomy", roomy_out), ("tight", tight_out)):
+            assert sorted(outputs) == list(range(num_requests)), f"{label}: {sorted(outputs)}"
+            for i in range(num_requests):
+                assert len(outputs[i]) == generates[i], (
+                    f"{label} request {i} produced {len(outputs[i])} tokens, "
+                    f"expected {generates[i]}"
+                )
+
+        # Every request's prefill ran the same way whether or not it later waited.
+        for i in range(num_requests):
+            assert tight_out[i][0] == roomy_out[i][0], (
+                f"request {i} produced a different first token under contention "
+                f"({tight_out[i][0]}) than without it ({roomy_out[i][0]})"
+            )
+
+        expected_marks = sum(crossings)
+        for label, stats in (("roomy", roomy_stats), ("tight", tight_stats)):
+            marks = stats.get("pause_marks", 0)
+            assert marks >= expected_marks, (
+                f"{label} run: expected at least {expected_marks} pause marks "
+                f"(one per crossing across {num_requests} requests), saw {marks}"
+            )
+        assert roomy_stats.get("resume_left_paused", 0) == 0, "the roomy pool was not roomy"
+        self._assert_paused_under_scarcity(tight_stats)
+
+    @torch.inference_mode()
     def test_pause_mid_decode_output_equivalence(self):
         """A request paused mid-decode generates the same tokens as one that never waits.
 
@@ -1773,4 +2032,10 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             assert (
                 len(tokens) == generate
             ), f"request {req_id} produced {len(tokens)} tokens, expected {generate}"
+            # The prefill-produced token cannot depend on whether the request
+            # later had to wait for a block.
+            assert tokens[0] == roomy_first[req_id], (
+                f"request {req_id} produced a different first token under "
+                f"contention ({tokens[0]}) than without it ({roomy_first[req_id]})"
+            )
         self._assert_paused_under_eviction(stats)

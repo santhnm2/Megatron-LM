@@ -1401,9 +1401,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             # ids here before resumption trims them, so this is an exact count of
             # requests that just needed another block.
             if newly_paused_request_ids is not None:
-                stats["pause_marks"] = stats.get("pause_marks", 0) + int(
-                    newly_paused_request_ids.numel()
-                )
+                marked = newly_paused_request_ids.tolist()
+                stats["pause_marks"] = stats.get("pause_marks", 0) + len(marked)
+                per_request = stats.setdefault("pause_marks_by_request", {})
+                for request_id in marked:
+                    per_request[request_id] = per_request.get(request_id, 0) + 1
             if paused > 0:
                 stats["resume_with_paused"] = stats.get("resume_with_paused", 0) + 1
                 stats["max_paused"] = max(stats.get("max_paused", 0), paused)
@@ -1712,12 +1714,21 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 f"({tight_out[i][0]}) than without it ({roomy_out[i][0]})"
             )
 
-        expected_marks = sum(crossings)
+        # Every request must be pause-marked once per boundary it crosses, and
+        # most of these cross more than once. Checked per request rather than in
+        # aggregate: a total can be met by one request crossing many times while
+        # another never crosses at all.
         for label, stats in (("roomy", roomy_stats), ("tight", tight_stats)):
-            marks = stats.get("pause_marks", 0)
-            assert marks >= expected_marks, (
-                f"{label} run: expected at least {expected_marks} pause marks "
-                f"(one per crossing across {num_requests} requests), saw {marks}"
+            by_request = stats.get("pause_marks_by_request", {})
+            observed = [by_request.get(i, 0) for i in range(num_requests)]
+            detail = f"predicted {crossings}, observed {observed}"
+            assert all(m >= 1 for m in observed), (
+                f"{label} run: some request never crossed a block boundary; {detail}"
+            )
+            repeat_crossers = sum(1 for m in observed if m > 1)
+            assert repeat_crossers >= num_requests // 2, (
+                f"{label} run: only {repeat_crossers} requests crossed more than "
+                f"once, so this is not exercising repeated pause/resume; {detail}"
             )
         assert roomy_stats.get("resume_left_paused", 0) == 0, "the roomy pool was not roomy"
         self._assert_paused_under_scarcity(tight_stats)

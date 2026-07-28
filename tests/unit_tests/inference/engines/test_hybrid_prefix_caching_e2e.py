@@ -1401,7 +1401,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             # ids here before resumption trims them, so this is an exact count of
             # requests that just needed another block.
             if newly_paused_request_ids is not None:
-                marked = newly_paused_request_ids.tolist()
+                # nonzero() on a 1-D mask yields a [k, 1] index tensor, so the
+                # ids arrive as a column vector rather than a flat list.
+                marked = newly_paused_request_ids.reshape(-1).tolist()
                 stats["pause_marks"] = stats.get("pause_marks", 0) + len(marked)
                 per_request = stats.setdefault("pause_marks_by_request", {})
                 for request_id in marked:

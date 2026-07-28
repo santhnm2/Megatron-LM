@@ -1150,6 +1150,117 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         offsets = msa._intermediate_offsets_cpu[0, :count].tolist()
         assert offsets == [bs]
 
+    def _setup_sparse_mamba_cache(self, bs=64):
+        """Cache a 3-block-plus-remainder prompt with Mamba state on blocks 0 and 2.
+
+        Returns (ctx, block_ids, slots, prompt_len). Block 1's boundary is
+        deliberately left without Mamba state, so the only restorable boundaries
+        are at token ``bs`` and token ``3 * bs``.
+        """
+        ctx = self._mctx(
+            mamba_config=self._mamba_config(mamba_chunk_size=bs),
+            block_size_tokens=bs,
+            max_sequence_length=512,
+        )
+        prompt_len = bs * 3 + 1
+
+        ctx.add_request(self._req(ctx, self._prompt(prompt_len)))
+        block_ids = self._block_ids(ctx, 0, 3)
+
+        slots = self._mamba_allocate_and_register(ctx, [block_ids[0], block_ids[2]])
+        msa = ctx.mamba_slot_allocator
+        assert msa.has_state(block_ids[0])
+        assert not msa.has_state(block_ids[1])
+        assert msa.has_state(block_ids[2])
+
+        return ctx, block_ids, slots, prompt_len
+
+    @pytest.mark.internal
+    def test_prefix_skip_targets_a_boundary_with_cached_mamba_state(self):
+        # Skipped prefill tokens are never fed to the SSM, so a hybrid request can
+        # only skip up to a block boundary whose Mamba state is cached: the
+        # recurrence has to resume from a stored snapshot at exactly that
+        # boundary. Whatever skip length add_request settles on, the block it
+        # queues a restore from must hold state.
+        #
+        # A chunk covering the whole prompt leaves a single computed token after
+        # skipping to the deepest cached boundary (3 * bs out of 3 * bs + 1),
+        # which exercises the path that shortens the skip.
+        bs = 64
+        ctx, block_ids, _, prompt_len = self._setup_sparse_mamba_cache(bs)
+        msa = ctx.mamba_slot_allocator
+
+        req2 = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        (_, _, _, _, prefix_skip, _) = ctx._compute_prefix_match(req2, prompt_len)
+        assert prefix_skip > 0
+
+        ctx.add_request(req2)
+
+        assert len(ctx._pending_mamba_restores) == 1
+        _, restore_block_id, _ = ctx._pending_mamba_restores[0]
+        # The restore must come from the block whose right edge is the skip
+        # boundary, and that block must actually hold state.
+        assert restore_block_id == block_ids[prefix_skip // bs - 1]
+        assert msa.has_state(restore_block_id)
+
+    @pytest.mark.internal
+    def test_skipped_prefill_does_not_start_from_zeroed_mamba_state(self):
+        # A request that skips prefill tokens must have its live Mamba state
+        # populated from the cached snapshot covering those tokens. Zeroing the
+        # state while the corresponding tokens were never computed silently
+        # produces wrong results, so a non-zero skip and a successful restore
+        # have to happen together.
+        bs = 64
+        ctx, _, slots, prompt_len = self._setup_sparse_mamba_cache(bs)
+        msa = ctx.mamba_slot_allocator
+
+        # Give the cached slots a recognizable non-zero pattern.
+        for slot in slots:
+            msa.ssm_states[:, slot].fill_(2.0)
+            msa.conv_states[:, slot].fill_(3.0)
+
+        req2 = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        (_, _, _, _, prefix_skip, _) = ctx._compute_prefix_match(req2, prompt_len)
+        assert prefix_skip > 0
+
+        ctx.add_request(req2)
+        ctx._execute_pending_mamba_ops()
+
+        mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
+        assert ctx.mamba_ssm_states[:, mamba_idx].abs().sum().item() > 0
+        assert ctx.mamba_conv_states[:, mamba_idx].abs().sum().item() > 0
+
+    @pytest.mark.internal
+    def test_continuation_chunk_does_not_skip_prefill(self):
+        # Mamba state is restored only on a request's first prefill chunk; a
+        # later chunk resumes from the live state the previous chunk left behind,
+        # which sits at the token count already prefilled. Skipping tokens in a
+        # continuation chunk would advance the KV offset past tokens the SSM
+        # never consumed, so a continuation chunk must compute every token it
+        # covers even when those tokens are present in the KV cache.
+        bs = 64
+        ctx = self._mctx(
+            mamba_config=self._mamba_config(mamba_chunk_size=bs),
+            block_size_tokens=bs,
+            max_sequence_length=512,
+        )
+        prompt_len = bs * 3
+
+        ctx.add_request(self._req(ctx, self._prompt(prompt_len)))
+
+        # Same prompt, resuming after one block's worth of tokens has already
+        # been prefilled by an earlier chunk.
+        req2 = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        req2.finished_chunk_token_count = bs
+        cont_chunk = prompt_len - bs
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, cont_chunk)
+
+        # The blocks this chunk covers are cached, but there is no restore point
+        # for a continuation chunk, so none of its tokens may be skipped.
+        assert len(matched) == 2
+        assert prefix_skip == 0
+        assert eff_chunk == cont_chunk
+
 
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 

@@ -1458,6 +1458,85 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
 
     @torch.inference_mode()
+    def test_diagnose_pause_divergence(self):
+        """Diagnostic: locate where a contended run diverges, and why.
+
+        Run with ``-s``. Prints, per request, the first generated-token index at
+        which runs disagree, for two comparisons:
+
+          roomy vs tight  -- differs by pausing AND by batch composition
+          roomy vs split  -- differs by batch composition ALONE (no pausing)
+
+        If the split control diverges too, composition alone moves the output and
+        the tight comparison cannot be read as evidence about pause/resume. If
+        the split control matches exactly while tight diverges at the index of a
+        block crossing, the resume path is the suspect.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        num_requests, prompt_len, generate = 6, 200, 400
+        prompts = [self._seg(i, prompt_len) for i in range(num_requests)]
+        total_blocks = -(-(prompt_len + generate) // BLOCK_SIZE)
+        crossing_idxs = [
+            b - prompt_len
+            for b in range(BLOCK_SIZE, prompt_len + generate + 1, BLOCK_SIZE)
+            if prompt_len < b <= prompt_len + generate
+        ]
+
+        def run(pool_blocks, admit):
+            stats = {}
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=True,
+                buffer_size_gb=self._calibrate_buffer_gb(
+                    model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
+                ),
+                max_requests=num_requests,
+                request_rounder=4,
+            )
+            self._instrument_resume(engine, stats)
+            outputs = {}
+            for start in range(0, num_requests, admit):
+                for i in range(start, min(start + admit, num_requests)):
+                    engine._add_request(
+                        self._make_request(i, prompts[i], enable_pc=True, num_tokens=generate)
+                    )
+                while engine.has_unfinished_requests():
+                    result = engine.step_modern()
+                    for record in result["finished_request_records"]:
+                        merged = record.merge()
+                        outputs[merged.request_id] = list(merged.generated_tokens)
+            return outputs, stats
+
+        roomy_pool, tight_pool = num_requests * total_blocks + 4, 2 * total_blocks + 1
+        roomy, roomy_stats = run(roomy_pool, num_requests)
+        tight, tight_stats = run(tight_pool, num_requests)
+        split, split_stats = run(roomy_pool, 3)
+
+        def first_diff(a, b):
+            for i, (x, y) in enumerate(zip(a, b)):
+                if x != y:
+                    return i
+            return None
+
+        print(f"\n=== crossings at generated-token indices {crossing_idxs} ===")
+        for label, stats in (("roomy", roomy_stats), ("tight", tight_stats), ("split", split_stats)):
+            print(
+                f"{label:6s} marks={stats.get('pause_marks', 0)} "
+                f"left_paused={stats.get('resume_left_paused', 0)} "
+                f"needing_evict={stats.get('resume_needing_eviction', 0)}"
+            )
+        for req_id in sorted(roomy):
+            print(
+                f"req {req_id}: roomy-vs-tight first diff at "
+                f"{first_diff(roomy[req_id], tight[req_id])}, "
+                f"roomy-vs-split first diff at {first_diff(roomy[req_id], split[req_id])}"
+            )
+
+    @torch.inference_mode()
     def test_decode_crossing_many_block_boundaries(self):
         """Generating past a block's worth pauses a request repeatedly, without changing its output.
 

@@ -976,6 +976,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         on_engine=None,
         generate=EVICTION_TOKENS_TO_GENERATE,
         admit=1,
+        reference_admit=1,
         stats=None,
         **engine_overrides,
     ):
@@ -995,7 +996,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
 
-        reference, _, _ = self._run(model, mamba_config, prompts, False, generate=generate)
+        reference, _, _ = self._run(
+            model, mamba_config, prompts, False, generate=generate, admit=reference_admit
+        )
         cached, requests, engine = self._run(
             model,
             mamba_config,
@@ -1333,16 +1336,30 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 # to come from evicting a cached one.
                 if alloc.free_count == 0 and int(alloc.get_evictable_block_count()) > 0:
                     stats["resume_needing_eviction"] = stats.get("resume_needing_eviction", 0) + 1
-            return original(active_request_count, newly_paused_request_ids)
+            result = original(active_request_count, newly_paused_request_ids)
+            if ctx.paused_request_count > 0:
+                # resumption could not take every paused request this step: one
+                # of them wanted a block no amount of reclaiming could supply
+                stats["resume_left_paused"] = stats.get("resume_left_paused", 0) + 1
+                stats["max_left_paused"] = max(
+                    stats.get("max_left_paused", 0), ctx.paused_request_count
+                )
+            return result
 
         ctx.resume_paused_requests = wrapped
 
     def _assert_paused(self, stats):
-        """Fail unless requests were paused and resumed against a dry free pool."""
+        """Fail unless requests were actually paused and resumed."""
         assert stats.get("resume_with_paused", 0) > 0, (
             "the resume path never ran with a paused request. Prompts must fill "
-            "their last block for a request to be pause-marked."
+            "their last block, and requests must outlive the step that fills it: "
+            "finished requests are released before pause-marking runs, so a "
+            "request generating a single token is gone before it can be paused."
         )
+
+    def _assert_paused_under_eviction(self, stats):
+        """Fail unless resumption had to reclaim a cached block to proceed."""
+        self._assert_paused(stats)
         assert stats.get("resume_needing_eviction", 0) > 0, (
             "requests resumed, but the free pool always had a spare block, so "
             "resumption never depended on reclaiming a cached one. Lower "
@@ -1365,7 +1382,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         prefill state and a correct resume determine, which is the property
         pausing puts at risk.
         """
-        num_requests = 6
+        num_requests = 8
         prompts = [self._seg(i) for i in range(num_requests)]
         assert all(len(p) == BLOCK_SIZE for p in prompts), "prompts must be exactly one block"
 
@@ -1373,15 +1390,21 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         _, engine = self._assert_equivalent(
             prompts,
             chunked=chunked,
-            generate=1,
+            # Three tokens: the first is produced by prefill, the request is
+            # pause-marked at the block boundary during the update that follows,
+            # and the rest are produced after it resumes. Comparing only the
+            # first token would say nothing about the resume, since pausing
+            # happens after it is sampled.
+            generate=3,
             admit=num_requests,
+            reference_admit=num_requests,
             stats=stats,
             # a handful of blocks, against the two per request this batch needs
             buffer_size_gb=0.004,
-            max_requests=4,
+            max_requests=num_requests,
             request_rounder=4,
         )
-        self._assert_paused(stats)
+        self._assert_paused_under_eviction(stats)
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
@@ -1394,22 +1417,23 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         which requests can resume and when, so the resume accounting is exercised
         against a pool that is part shared, part reclaimable.
         """
-        pairs = [self._seg(i) for i in range(3)]
-        prompts = [pairs[i // 2] for i in range(6)]
+        pairs = [self._seg(i) for i in range(4)]
+        prompts = [pairs[i // 2] for i in range(8)]
         assert all(len(p) == BLOCK_SIZE for p in prompts)
 
         stats = {}
         _, engine = self._assert_equivalent(
             prompts,
             chunked=chunked,
-            generate=1,
+            generate=3,
             admit=len(prompts),
+            reference_admit=len(prompts),
             stats=stats,
             buffer_size_gb=0.004,
-            max_requests=4,
+            max_requests=len(prompts),
             request_rounder=4,
         )
-        self._assert_paused(stats)
+        self._assert_paused_under_eviction(stats)
         # the duplicated prompts really did share a block rather than each
         # allocating their own
         assert len(self._kv_map(engine)) <= len(pairs)
@@ -1438,7 +1462,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
 
-        num_requests, generate = 6, 4
+        num_requests, generate = 8, 4
         prompts = [self._seg(i) for i in range(num_requests)]
         assert all(len(p) == BLOCK_SIZE for p in prompts), "prompts must be exactly one block"
 
@@ -1447,9 +1471,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             mamba_config,
             enable_prefix_caching=True,
             # only a handful of blocks, against the two per request this batch
-            # needs at once
-            buffer_size_gb=0.004,
-            max_requests=4,
+            # needs at once, so resumption has to reclaim cached blocks
+            buffer_size_gb=0.003,
+            max_requests=8,
             request_rounder=4,
         )
         stats = {}
@@ -1477,4 +1501,4 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             assert (
                 len(tokens) == generate
             ), f"request {req_id} produced {len(tokens)} tokens, expected {generate}"
-        self._assert_paused(stats)
+        self._assert_paused_under_eviction(stats)

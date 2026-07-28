@@ -803,7 +803,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         key = tuple(sorted(engine_kwargs.items()))
         if key not in cls._mamba_fit:
             samples = []
-            for probe_gb in (0.5, 1.0):
+            # Probe budgets are kept small and the engines released immediately.
+            # A probe allocates its full Mamba cache for real, and leaving a
+            # GB-scale one resident perturbs the CUDA allocator for every test
+            # that follows -- enough to move which cuBLAS algorithm a later
+            # matmul picks, and with it the bf16 numerics that the token-equality
+            # cases downstream depend on.
+            for probe_gb in (0.1, 0.2):
                 probe = self._build_engine(
                     model,
                     mamba_config,
@@ -812,6 +818,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                     **engine_kwargs,
                 )
                 samples.append((probe_gb, probe.context.mamba_slot_allocator.max_slots))
+                del probe
+            torch.cuda.empty_cache()
             (gb_lo, slots_lo), (gb_hi, slots_hi) = samples
             assert slots_hi > slots_lo, "probe engines did not scale with the Mamba budget"
             gb_per_slot = (gb_hi - gb_lo) / (slots_hi - slots_lo)
@@ -1773,6 +1781,154 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             "buffer_size_gb or raise the request count."
         )
 
+    # ------------------------------------------------- golden token replay
+
+    @staticmethod
+    def _row_keys(ctx):
+        """(request id, sequence position) for each row the sampler returns."""
+        lo, hi = ctx.paused_request_count, ctx.total_request_count
+        return list(
+            zip(ctx.request_ids[lo:hi].tolist(), ctx.request_kv_length_offsets[lo:hi].tolist())
+        )
+
+    @classmethod
+    def _pin_token_stream(cls, engine, golden=None):
+        """Pin what each request is fed, so runs differing only in scheduling agree.
+
+        Sampling here is an argmax over a randomly initialised bf16 model, so
+        near-ties are common, and a tie broken the other way is indistinguishable
+        from a real divergence. Batch composition alone moves the logits enough to
+        flip one -- which makes any assertion of exact token equality across two
+        runs with different pool sizes a coin toss, not a property of the code.
+
+        Recording the token produced at each (request id, sequence position) in a
+        reference run and replaying it into a later run removes that entirely:
+        both runs then feed identical inputs at identical positions however their
+        batches were composed, so whatever still differs between them is the
+        thing under test rather than a tie-break.
+
+        With ``golden`` None the run records; otherwise it replays ``golden``.
+        Returns ``(recorded, stats)``; ``stats["misses"]`` counts sampled rows
+        that had no golden entry, which means the runs did not visit the same
+        sequence positions and nothing downstream is comparable.
+        """
+        ctx = engine.context
+        controller = engine.controller
+        original_sample = controller._dynamic_step_sample_logits
+        recorded, stats = {}, {"misses": 0}
+
+        def patched_sample():
+            # The dynamic path writes one token per active request into
+            # _sampled_tokens_cuda, in the same order _row_keys enumerates.
+            original_sample()
+            keys = cls._row_keys(ctx)
+            n = len(keys)
+            if n == 0:
+                return
+            buffer = controller._sampled_tokens_cuda
+            if golden is None:
+                for row, token in enumerate(buffer[:n].tolist()):
+                    recorded[keys[row]] = token
+                return
+            replay = buffer[:n].tolist()
+            for row, key in enumerate(keys):
+                if key in golden:
+                    replay[row] = golden[key]
+                else:
+                    stats["misses"] += 1
+            buffer[:n].copy_(torch.tensor(replay, dtype=buffer.dtype, device=buffer.device))
+
+        controller._dynamic_step_sample_logits = patched_sample
+        return recorded, stats
+
+    @classmethod
+    def _snapshot_mamba_states(cls, engine, snapshots, sample_every):
+        """Record live conv/SSM state for active requests on the sampling grid.
+
+        Keyed by sequence position rather than step number: a contended run
+        reaches a given position later, so step numbers do not line up between
+        runs but positions do.
+        """
+        ctx = engine.context
+        lo, hi = ctx.paused_request_count, ctx.total_request_count
+        if hi <= lo:
+            return
+        wanted = [
+            (r, p, m)
+            for (r, p), m in zip(
+                cls._row_keys(ctx),
+                ctx.mamba_metadata.request_to_mamba_state_idx[lo:hi].tolist(),
+            )
+            if p % sample_every == 0 and m >= 0
+        ]
+        if not wanted:
+            return
+        idx = torch.tensor(
+            [m for _, _, m in wanted], dtype=torch.long, device=ctx.mamba_ssm_states.device
+        )
+        ssm = ctx.mamba_ssm_states[:, idx].float().cpu()
+        conv = ctx.mamba_conv_states[:, idx].float().cpu()
+        for col, (req_id, pos, _) in enumerate(wanted):
+            snapshots[(req_id, pos)] = (ssm[:, col].clone(), conv[:, col].clone())
+
+    @staticmethod
+    def _assert_states_match(reference_snaps, other_snaps, min_shared, rtol=2e-2, atol=2e-2):
+        """Require two runs' recurrent states to agree wherever both sampled them.
+
+        The state tensors are continuous, so they admit a tolerance where an
+        argmax does not: benign bf16 reassociation moves them slightly, while a
+        stale slot, a zeroed state, or a state carried from the wrong request
+        moves them enormously.
+        """
+        shared = sorted(set(reference_snaps) & set(other_snaps))
+        assert len(shared) >= min_shared, (
+            f"only {len(shared)} matching (request, position) snapshots across "
+            f"the two runs; not enough to compare"
+        )
+        for key in shared:
+            ssm_ref, conv_ref = reference_snaps[key]
+            ssm_other, conv_other = other_snaps[key]
+            for name, a, b in (("ssm", ssm_ref, ssm_other), ("conv", conv_ref, conv_other)):
+                assert torch.allclose(a, b, rtol=rtol, atol=atol), (
+                    f"request {key[0]} at position {key[1]}: {name} state diverged "
+                    f"from the reference run (max abs diff "
+                    f"{(a - b).abs().max().item():.4g}, reference max "
+                    f"{a.abs().max().item():.4g})"
+                )
+
+        # The comparison above is only worth anything if the tolerance can tell
+        # two states apart at all. A fixed magnitude threshold cannot establish
+        # that -- it presumes a scale for these tensors. So establish it
+        # directly: compare *different* requests at the same position, which are
+        # genuinely different recurrent states. allclose must reject those. If it
+        # accepts them, the states are near-zero or the tolerance swamps their
+        # scale, and the equality check above would pass even if the state were
+        # never restored.
+        by_position: dict = {}
+        for req_id, pos in shared:
+            by_position.setdefault(pos, []).append(req_id)
+        indistinguishable, comparisons = [], 0
+        for pos, req_ids in by_position.items():
+            for a_id, b_id in zip(req_ids, req_ids[1:]):
+                comparisons += 1
+                ssm_a, conv_a = reference_snaps[(a_id, pos)]
+                ssm_b, conv_b = reference_snaps[(b_id, pos)]
+                if torch.allclose(ssm_a, ssm_b, rtol=rtol, atol=atol) and torch.allclose(
+                    conv_a, conv_b, rtol=rtol, atol=atol
+                ):
+                    indistinguishable.append((pos, a_id, b_id))
+        assert comparisons > 0, (
+            "no two requests were sampled at the same position, so the "
+            "tolerance's discriminating power could not be established"
+        )
+        assert not indistinguishable, (
+            f"{len(indistinguishable)} of {comparisons} pairs of *different* "
+            f"requests compared equal at rtol={rtol} atol={atol} (e.g. "
+            f"{indistinguishable[0]}), so the equality assertions above prove "
+            f"nothing: the states are too small for this tolerance to resolve"
+        )
+        return shared
+
     @torch.inference_mode()
     def test_paused_request_recurrent_state_matches_uncontended(self):
         """The Mamba recurrent state itself survives pause and resume intact.
@@ -1805,16 +1961,6 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         peak_blocks = max(-(-(len(p) + generate) // BLOCK_SIZE) for p in prompts)
         sample_every = 32  # snapshot on positions every run is guaranteed to hit
 
-        def row_keys(ctx):
-            """(request id, sequence position) for each row the sampler returns."""
-            lo, hi = ctx.paused_request_count, ctx.total_request_count
-            return list(
-                zip(
-                    ctx.request_ids[lo:hi].tolist(),
-                    ctx.request_kv_length_offsets[lo:hi].tolist(),
-                )
-            )
-
         def run(pool_blocks, stats, enable_pc, golden=None):
             """Run the batch; record the golden token stream, or replay one."""
             engine = self._build_engine(
@@ -1828,36 +1974,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 request_rounder=4,
             )
             self._instrument_resume(engine, stats)
-            ctx = engine.context
-            recorded, misses = {}, 0
-            controller = engine.controller
-            original_sample = controller._dynamic_step_sample_logits
-
-            def patched_sample():
-                # The dynamic path writes one token per active request into
-                # _sampled_tokens_cuda, in the same order row_keys enumerates.
-                nonlocal misses
-                original_sample()
-                keys = row_keys(ctx)
-                n = len(keys)
-                if n == 0:
-                    return
-                buffer = controller._sampled_tokens_cuda
-                if golden is None:
-                    for row, token in enumerate(buffer[:n].tolist()):
-                        recorded[keys[row]] = token
-                    return
-                replay = buffer[:n].tolist()
-                for row, key in enumerate(keys):
-                    if key in golden:
-                        replay[row] = golden[key]
-                    else:
-                        misses += 1
-                buffer[:n].copy_(
-                    torch.tensor(replay, dtype=buffer.dtype, device=buffer.device)
-                )
-
-            controller._dynamic_step_sample_logits = patched_sample
+            recorded, pin_stats = self._pin_token_stream(engine, golden=golden)
 
             for i, prompt in enumerate(prompts):
                 engine._add_request(
@@ -1869,31 +1986,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 steps += 1
                 assert steps < 20000, "engine stopped making progress"
                 engine.step_modern()
-
-                # Record the live state of every active request whose position is
-                # on the sampling grid. Positions, not step numbers: a contended
-                # run reaches a given position later.
-                lo, hi = ctx.paused_request_count, ctx.total_request_count
-                if hi <= lo:
-                    continue
-                wanted = [
-                    (r, p, m)
-                    for (r, p), m in zip(
-                        row_keys(ctx),
-                        ctx.mamba_metadata.request_to_mamba_state_idx[lo:hi].tolist(),
-                    )
-                    if p % sample_every == 0 and m >= 0
-                ]
-                if not wanted:
-                    continue
-                idx = torch.tensor(
-                    [m for _, _, m in wanted], dtype=torch.long, device=ctx.mamba_ssm_states.device
-                )
-                ssm = ctx.mamba_ssm_states[:, idx].float().cpu()
-                conv = ctx.mamba_conv_states[:, idx].float().cpu()
-                for col, (req_id, pos, _) in enumerate(wanted):
-                    snapshots[(req_id, pos)] = (ssm[:, col].clone(), conv[:, col].clone())
-            return snapshots, recorded, misses
+                self._snapshot_mamba_states(engine, snapshots, sample_every)
+            return snapshots, recorded, pin_stats["misses"]
 
         # Golden: no prefix caching, no chunked prefill, nothing ever waits.
         clean_stats = {}
@@ -1913,53 +2007,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
         self._assert_paused_under_scarcity(tight_stats)
 
-        shared = sorted(set(clean_snaps) & set(tight_snaps))
-        assert len(shared) >= num_requests, (
-            f"only {len(shared)} matching (request, position) snapshots across the "
-            f"two runs; not enough to compare"
-        )
-        rtol = atol = 2e-2
-        for key in shared:
-            ssm_clean, conv_clean = clean_snaps[key]
-            ssm_tight, conv_tight = tight_snaps[key]
-            for name, a, b in (("ssm", ssm_clean, ssm_tight), ("conv", conv_clean, conv_tight)):
-                assert torch.allclose(a, b, rtol=rtol, atol=atol), (
-                    f"request {key[0]} at position {key[1]}: {name} state diverged "
-                    f"from the clean run (max abs diff {(a - b).abs().max().item():.4g}, "
-                    f"reference max {a.abs().max().item():.4g})"
-                )
-
-        # The comparison above is only worth anything if the tolerance can tell two
-        # states apart at all. A fixed magnitude threshold cannot establish that --
-        # it presumes a scale for these tensors. So establish it directly: compare
-        # *different* requests at the same position, which are genuinely different
-        # recurrent states (the prompts are disjoint token ranges). allclose must
-        # reject those. If it accepts them, then the states are near-zero or the
-        # tolerance swamps their scale, and the equality check above would pass
-        # even if the state were never restored.
-        by_position: dict = {}
-        for req_id, pos in shared:
-            by_position.setdefault(pos, []).append(req_id)
-        indistinguishable, comparisons = [], 0
-        for pos, req_ids in by_position.items():
-            for a_id, b_id in zip(req_ids, req_ids[1:]):
-                comparisons += 1
-                ssm_a, conv_a = clean_snaps[(a_id, pos)]
-                ssm_b, conv_b = clean_snaps[(b_id, pos)]
-                if torch.allclose(ssm_a, ssm_b, rtol=rtol, atol=atol) and torch.allclose(
-                    conv_a, conv_b, rtol=rtol, atol=atol
-                ):
-                    indistinguishable.append((pos, a_id, b_id))
-        assert comparisons > 0, (
-            "no two requests were sampled at the same position, so the tolerance's "
-            "discriminating power could not be established"
-        )
-        assert not indistinguishable, (
-            f"{len(indistinguishable)} of {comparisons} pairs of *different* "
-            f"requests compared equal at rtol={rtol} atol={atol} (e.g. "
-            f"{indistinguishable[0]}), so the equality assertions above prove "
-            f"nothing: the states are too small for this tolerance to resolve"
-        )
+        self._assert_states_match(clean_snaps, tight_snaps, min_shared=num_requests)
 
     @torch.inference_mode()
     def test_decode_heavy_pause_stress(self):
@@ -1972,9 +2020,20 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         continuously oversubscribed. Prompts share leading blocks, so the prefix
         cache is live at the same time.
 
-        Generated tokens beyond the first are not compared: batch composition
-        alone perturbs output at these decode lengths (see
-        test_decode_crossing_many_block_boundaries).
+        Tokens are not compared between the two runs at all -- not even the first
+        one. Sampling is an argmax over a randomly initialised bf16 model, and the
+        pool size changes both how many requests prefill together and which
+        prefix-cache hits land, which moves the logits enough to flip a near-tie.
+        That made an exact first-token comparison intermittently fail on a
+        tie-break rather than on anything the pause path did.
+
+        So the token stream is pinned instead: the roomy run records what it
+        produces at each sequence position and the tight run replays it, which
+        keeps both runs on the same trajectory however their batches were
+        composed. What is then compared is the recurrent state itself, at every
+        sampled position rather than at one token -- a strictly stronger claim
+        than the token equality it replaces, and one that admits a tolerance
+        where an argmax cannot.
         """
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
@@ -2006,8 +2065,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         peak_blocks = max(
             -(-(len(prompts[i]) + generates[i]) // BLOCK_SIZE) for i in range(num_requests)
         )
+        sample_every = 32  # snapshot on positions every run is guaranteed to hit
 
-        def run(pool_blocks, stats):
+        def run(pool_blocks, stats, golden=None):
             engine = self._build_engine(
                 model,
                 mamba_config,
@@ -2019,11 +2079,12 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 request_rounder=4,
             )
             self._instrument_resume(engine, stats)
+            recorded, pin_stats = self._pin_token_stream(engine, golden=golden)
             for i, prompt in enumerate(prompts):
                 engine._add_request(
                     self._make_request(i, prompt, enable_pc=True, num_tokens=generates[i])
                 )
-            outputs, steps = {}, 0
+            outputs, snapshots, steps = {}, {}, 0
             while engine.has_unfinished_requests():
                 steps += 1
                 assert steps < 20000, (
@@ -2033,11 +2094,17 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 for record in engine.step_modern()["finished_request_records"]:
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
-            return outputs
+                self._snapshot_mamba_states(engine, snapshots, sample_every)
+            return outputs, snapshots, recorded, pin_stats["misses"]
 
         roomy_stats, tight_stats = {}, {}
-        roomy_out = run(num_requests * peak_blocks + 4, roomy_stats)
-        tight_out = run(2 * peak_blocks + 1, tight_stats)
+        roomy_out, roomy_snaps, golden, _ = run(num_requests * peak_blocks + 4, roomy_stats)
+        assert golden, "the roomy run recorded no tokens to replay"
+        tight_out, tight_snaps, _, misses = run(2 * peak_blocks + 1, tight_stats, golden=golden)
+        assert misses == 0, (
+            f"{misses} sampled rows had no golden token, so the contended run did "
+            f"not reproduce the roomy run's sequence positions"
+        )
 
         for label, outputs in (("roomy", roomy_out), ("tight", tight_out)):
             assert sorted(outputs) == list(range(num_requests)), f"{label}: {sorted(outputs)}"
@@ -2047,12 +2114,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                     f"expected {generates[i]}"
                 )
 
-        # Every request's prefill ran the same way whether or not it later waited.
-        for i in range(num_requests):
-            assert tight_out[i][0] == roomy_out[i][0], (
-                f"request {i} produced a different first token under contention "
-                f"({tight_out[i][0]}) than without it ({roomy_out[i][0]})"
-            )
+        # Every request's recurrent state tracked the uncontended run's, at every
+        # sampled position -- so nothing was lost or crossed over across the
+        # pauses and resumes in between. Comparing the states rather than the
+        # tokens is what makes this stable: the token stream is pinned by the
+        # replay above, so an equality check on it would now be vacuous, while
+        # the states still carry the evidence.
+        self._assert_states_match(roomy_snaps, tight_snaps, min_shared=num_requests)
 
         # Every request must be pause-marked once per boundary it crosses, and
         # most of these cross more than once. Checked per request rather than in

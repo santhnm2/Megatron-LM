@@ -1425,6 +1425,22 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             "request generating a single token is gone before it can be paused."
         )
 
+    def _assert_paused_under_scarcity(self, stats):
+        """Fail unless resumption ran out of blocks and had to leave requests waiting.
+
+        Distinct from :meth:`_assert_paused_under_eviction`: that one wants
+        capacity to exist but only behind an eviction, which requires registered
+        cached blocks to reclaim. A workload whose prompts never fill a block
+        registers nothing, so its contention shows up as requests that simply
+        cannot be resumed yet.
+        """
+        self._assert_paused(stats)
+        assert stats.get("resume_left_paused", 0) > 0, (
+            "every paused request was resumed immediately, so the pool never "
+            "actually ran out of blocks. Lower the pool size or raise the "
+            "request count."
+        )
+
     def _assert_paused_under_eviction(self, stats):
         """Fail unless resumption had to reclaim a cached block to proceed."""
         self._assert_paused(stats)
@@ -1516,12 +1532,16 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         tight_stats = {}
         tight_out, tight_pauses = run(2 * total_blocks + 1, tight_stats)
 
-        # The two runs differ in the intended way and only in that way.
-        assert roomy_stats.get("resume_needing_eviction", 0) == 0, (
-            "the roomy pool was not roomy: resumption had to reclaim a cached "
-            "block, so it is not a contention-free control"
+        # The two runs differ in the intended way and only in that way. These
+        # prompts are shorter than a block, so no complete block is ever
+        # registered and there is nothing cached to reclaim; contention here is
+        # requests waiting on a pool with no free block at all, which is what
+        # resume_left_paused records.
+        assert roomy_stats.get("resume_left_paused", 0) == 0, (
+            "the roomy pool was not roomy: a request had to wait for a block, so "
+            "it is not a contention-free control"
         )
-        self._assert_paused_under_eviction(tight_stats)
+        self._assert_paused_under_scarcity(tight_stats)
 
         # Each request crosses every boundary in its span, and a crossing is what
         # pause-marks it, so neither run can have paused fewer times than that.

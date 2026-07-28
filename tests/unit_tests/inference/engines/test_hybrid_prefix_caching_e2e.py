@@ -624,7 +624,10 @@ class TestMambaPrefixCachingE2E(_HybridPCHelpers):
         assert (
             h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
+        # One block holds E's cached prefix and one is unused. total_avail counts
+        # the cached block too, since LRU can reclaim it.
+        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
+        assert alloc.free_count == 1 and alloc.total_avail == 2
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
@@ -939,8 +942,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
         if on_engine is not None:
             on_engine(engine)
-        ctx = engine.context
-        alloc = ctx.kv_block_allocator
+        if stats is not None:
+            self._instrument_resume(engine, stats)
         outputs, requests = {}, []
         for start in range(0, len(prompts), admit):
             group = range(start, min(start + admit, len(prompts)))
@@ -956,14 +959,6 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                     f"{len(prompts)} requests finished"
                 )
                 result = engine.step_modern()
-                if stats is not None:
-                    stats["max_paused"] = max(stats.get("max_paused", 0), ctx.paused_request_count)
-                    if (
-                        enable_pc
-                        and alloc.total_avail == 0
-                        and int(alloc.get_evictable_block_count()) > 0
-                    ):
-                        stats["starved_with_evictable"] = True
                 for record in result["finished_request_records"]:
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
@@ -1315,15 +1310,43 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         # and the forced block evictions found something to take each time
         assert kv_evicted, "the periodic KV eviction never had a block to evict"
 
+    @staticmethod
+    def _instrument_resume(engine, stats):
+        """Record what the resume path saw each time it ran.
+
+        A request that fills its last block is pause-marked unconditionally and,
+        when capacity allows, resumed inside the same ``update_requests`` call.
+        A paused count sampled after a step therefore usually reads zero even
+        though requests were paused and resumed during it. Wrapping the resume
+        entry point observes that transient state instead.
+        """
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
+        original = ctx.resume_paused_requests
+
+        def wrapped(active_request_count, newly_paused_request_ids):
+            paused = ctx.paused_request_count
+            if paused > 0:
+                stats["resume_with_paused"] = stats.get("resume_with_paused", 0) + 1
+                stats["max_paused"] = max(stats.get("max_paused", 0), paused)
+                # The free pool is empty, so any block a request resumes into has
+                # to come from evicting a cached one.
+                if alloc.free_count == 0 and int(alloc.get_evictable_block_count()) > 0:
+                    stats["resume_needing_eviction"] = stats.get("resume_needing_eviction", 0) + 1
+            return original(active_request_count, newly_paused_request_ids)
+
+        ctx.resume_paused_requests = wrapped
+
     def _assert_paused(self, stats):
-        """Fail unless the run actually paused a request and ran the pool dry."""
-        assert stats.get("max_paused", 0) > 0, (
-            "no request was ever paused, so the resume path was never entered. "
-            "Lower buffer_size_gb or raise the request count."
+        """Fail unless requests were paused and resumed against a dry free pool."""
+        assert stats.get("resume_with_paused", 0) > 0, (
+            "the resume path never ran with a paused request. Prompts must fill "
+            "their last block for a request to be pause-marked."
         )
-        assert stats.get("starved_with_evictable"), (
-            "the free pool never emptied while cached blocks remained, so resume "
-            "never had to reclaim capacity that only eviction could supply."
+        assert stats.get("resume_needing_eviction", 0) > 0, (
+            "requests resumed, but the free pool always had a spare block, so "
+            "resumption never depended on reclaiming a cached one. Lower "
+            "buffer_size_gb or raise the request count."
         )
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
@@ -1429,13 +1452,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             max_requests=4,
             request_rounder=4,
         )
-        ctx = engine.context
-        alloc = ctx.kv_block_allocator
+        stats = {}
+        self._instrument_resume(engine, stats)
 
         for i, prompt in enumerate(prompts):
             engine._add_request(self._make_request(i, prompt, enable_pc=True, num_tokens=generate))
 
-        finished, stats, steps = {}, {}, 0
+        finished, steps = {}, 0
         while engine.has_unfinished_requests():
             steps += 1
             assert steps < 500, (
@@ -1443,10 +1466,6 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 f"{num_requests} requests finished"
             )
             result = engine.step_modern()
-            stats["max_paused"] = max(stats.get("max_paused", 0), ctx.paused_request_count)
-            # the free pool is empty but cached blocks could still be reclaimed
-            if alloc.total_avail == 0 and int(alloc.get_evictable_block_count()) > 0:
-                stats["starved_with_evictable"] = True
             for record in result["finished_request_records"]:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)

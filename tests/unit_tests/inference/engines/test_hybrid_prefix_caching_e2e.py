@@ -746,6 +746,38 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
 
     # ------------------------------------------------------------------ prompts
 
+    _blocks_per_gb = None
+
+    def _calibrate_buffer_gb(self, model, mamba_config, num_blocks, probe_gb=0.01):
+        """Return the buffer size that yields ``num_blocks`` KV blocks.
+
+        Bytes per block depend on the model shape and on context overhead, so a
+        pool size picked as a GB figure is a guess that silently drifts when
+        either changes. Measure it once against a probe engine and solve for the
+        block count the test actually wants.
+        """
+        cls = type(self)
+        if cls._blocks_per_gb is None:
+            probe = self._build_engine(
+                model, mamba_config, enable_prefix_caching=True, buffer_size_gb=probe_gb
+            )
+            cls._blocks_per_gb = probe.context.kv_block_allocator.total_count / probe_gb
+        return num_blocks / cls._blocks_per_gb
+
+    def _pause_prompts(self, chunked, count):
+        """Block-aligned prompts sized so the chunked variant genuinely chunks.
+
+        A prompt shorter than the per-step token budget is never split, and a
+        one-block prompt sits under the 300-token budget the chunked runs use, so
+        it would take the same single-chunk path while merely lowering how many
+        requests are in flight. Two blocks against that budget cut into two
+        block-aligned chunks instead.
+        """
+        blocks = 2 if chunked else 1
+        return [
+            torch.cat([self._seg(i * blocks + b) for b in range(blocks)]) for i in range(count)
+        ]
+
     @staticmethod
     def _seg(index, length=BLOCK_SIZE):
         """A block-sized (or shorter) run of token ids unique to ``index``."""
@@ -978,6 +1010,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         admit=1,
         reference_admit=1,
         stats=None,
+        buffer_blocks=None,
         **engine_overrides,
     ):
         """Require the caching run to reproduce an uncached single-pass reference.
@@ -995,6 +1028,10 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
+        if buffer_blocks is not None:
+            engine_overrides["buffer_size_gb"] = self._calibrate_buffer_gb(
+                model, mamba_config, buffer_blocks
+            )
 
         reference, _, _ = self._run(
             model, mamba_config, prompts, False, generate=generate, admit=reference_admit
@@ -1012,7 +1049,15 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             **{**self._engine_kwargs(chunked), **engine_overrides},
         )
 
-        assert sorted(reference) == sorted(cached) == list(range(len(prompts)))
+        expected_ids = list(range(len(prompts)))
+        assert sorted(reference) == expected_ids, (
+            f"the reference run finished {sorted(reference)}, expected {expected_ids}"
+        )
+        assert sorted(cached) == expected_ids, (
+            f"the caching run finished {sorted(cached)}, expected {expected_ids}. "
+            f"Requests that never fit are dropped by the scheduler rather than "
+            f"raising, so an empty list means the pool is too small to run them."
+        )
         for req_id in reference:
             assert reference[req_id] == cached[req_id], (
                 f"request {req_id}: uncached reference produced {reference[req_id]}, "
@@ -1382,9 +1427,15 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         prefill state and a correct resume determine, which is the property
         pausing puts at risk.
         """
-        num_requests = 8
-        prompts = [self._seg(i) for i in range(num_requests)]
-        assert all(len(p) == BLOCK_SIZE for p in prompts), "prompts must be exactly one block"
+        num_requests = 16
+        prompts = self._pause_prompts(chunked, num_requests)
+        assert all(len(p) % BLOCK_SIZE == 0 for p in prompts), "prompts must be block-aligned"
+
+        # Each request holds its prompt blocks plus one more for the tokens it
+        # generates. Sizing the pool to roughly two requests' worth means the
+        # rest have to wait on blocks that only eviction can release.
+        blocks_per_request = len(prompts[0]) // BLOCK_SIZE + 1
+        pool_blocks = 2 * blocks_per_request + 1
 
         stats = {}
         _, engine = self._assert_equivalent(
@@ -1399,15 +1450,12 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             admit=num_requests,
             reference_admit=num_requests,
             stats=stats,
-            # A handful of blocks, against the two per request this batch needs.
-            # Chunked prefill spends most of its per-step token budget on one
-            # prompt, so fewer requests are in flight at once and the pool has to
-            # be tighter to starve the free pool at the same points.
-            buffer_size_gb=0.0025 if chunked else 0.004,
+            buffer_blocks=pool_blocks,
             max_requests=num_requests,
             request_rounder=4,
         )
         self._assert_paused_under_eviction(stats)
+        assert engine.context.kv_block_allocator.total_count <= pool_blocks + 1
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
@@ -1420,9 +1468,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         which requests can resume and when, so the resume accounting is exercised
         against a pool that is part shared, part reclaimable.
         """
-        pairs = [self._seg(i) for i in range(4)]
-        prompts = [pairs[i // 2] for i in range(8)]
-        assert all(len(p) == BLOCK_SIZE for p in prompts)
+        pairs = self._pause_prompts(chunked, 8)
+        prompts = [pairs[i // 2] for i in range(16)]
+        assert all(len(p) % BLOCK_SIZE == 0 for p in prompts)
+        blocks_per_request = len(prompts[0]) // BLOCK_SIZE + 1
+        pool_blocks = 2 * blocks_per_request + 1
 
         stats = {}
         _, engine = self._assert_equivalent(
@@ -1432,7 +1482,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             admit=len(prompts),
             reference_admit=len(prompts),
             stats=stats,
-            buffer_size_gb=0.0025 if chunked else 0.004,
+            buffer_blocks=pool_blocks,
             max_requests=len(prompts),
             request_rounder=4,
         )
@@ -1465,18 +1515,20 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
 
-        num_requests, generate = 8, 4
+        num_requests, generate = 16, 4
         prompts = [self._seg(i) for i in range(num_requests)]
         assert all(len(p) == BLOCK_SIZE for p in prompts), "prompts must be exactly one block"
 
+        # Two blocks per request (prompt plus one for what it generates); a pool
+        # of roughly two requests' worth forces the rest to resume into blocks
+        # that only eviction can free.
+        pool_blocks = 5
         engine = self._build_engine(
             model,
             mamba_config,
             enable_prefix_caching=True,
-            # only a handful of blocks, against the two per request this batch
-            # needs at once, so resumption has to reclaim cached blocks
-            buffer_size_gb=0.003,
-            max_requests=8,
+            buffer_size_gb=self._calibrate_buffer_gb(model, mamba_config, pool_blocks),
+            max_requests=num_requests,
             request_rounder=4,
         )
         stats = {}

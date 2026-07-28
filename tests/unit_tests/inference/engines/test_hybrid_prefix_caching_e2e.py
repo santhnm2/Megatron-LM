@@ -1397,6 +1397,12 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
 
         def wrapped(active_request_count, newly_paused_request_ids):
             paused = ctx.paused_request_count
+            # update_requests pause-marks boundary-crossing requests before
+            # calling this, so the rise over what was left paused last time is
+            # how many requests just crossed a block boundary.
+            stats["pause_marks"] = stats.get("pause_marks", 0) + max(
+                0, paused - stats.get("_left_after_resume", 0)
+            )
             if paused > 0:
                 stats["resume_with_paused"] = stats.get("resume_with_paused", 0) + 1
                 stats["max_paused"] = max(stats.get("max_paused", 0), paused)
@@ -1405,6 +1411,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 if alloc.free_count == 0 and int(alloc.get_evictable_block_count()) > 0:
                     stats["resume_needing_eviction"] = stats.get("resume_needing_eviction", 0) + 1
             result = original(active_request_count, newly_paused_request_ids)
+            stats["_left_after_resume"] = ctx.paused_request_count
             if ctx.paused_request_count > 0:
                 # resumption could not take every paused request this step: one
                 # of them wanted a block no amount of reclaiming could supply
@@ -1504,7 +1511,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 engine._add_request(
                     self._make_request(i, prompt, enable_pc=True, num_tokens=generate)
                 )
-            outputs, pause_events, steps = {}, 0, 0
+            outputs, steps = {}, 0
             while engine.has_unfinished_requests():
                 steps += 1
                 assert steps < 20000, (
@@ -1512,9 +1519,6 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                     f"{num_requests} requests finished"
                 )
                 result = engine.step_modern()
-                newly_paused = result.get("newly_paused_request_ids")
-                if newly_paused is not None:
-                    pause_events += int(newly_paused.numel())
                 for record in result["finished_request_records"]:
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
@@ -1523,14 +1527,14 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 assert (
                     len(tokens) == generate
                 ), f"request {req_id} produced {len(tokens)} tokens, expected {generate}"
-            return outputs, pause_events
+            return outputs
 
         # Roomy: every request fits at once, so nothing ever waits on a block.
         roomy_stats = {}
-        roomy_out, roomy_pauses = run(num_requests * total_blocks + 4, roomy_stats)
+        roomy_out = run(num_requests * total_blocks + 4, roomy_stats)
         # Tight: room for about two requests, so the rest contend.
         tight_stats = {}
-        tight_out, tight_pauses = run(2 * total_blocks + 1, tight_stats)
+        tight_out = run(2 * total_blocks + 1, tight_stats)
 
         # The two runs differ in the intended way and only in that way. These
         # prompts are shorter than a block, so no complete block is ever
@@ -1544,12 +1548,16 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         self._assert_paused_under_scarcity(tight_stats)
 
         # Each request crosses every boundary in its span, and a crossing is what
-        # pause-marks it, so neither run can have paused fewer times than that.
+        # pause-marks it, so neither run can have marked fewer than that. Counting
+        # marks rather than the ids returned by a step matters: resumption removes
+        # the requests it takes, so a step only reports the ones still waiting,
+        # which is zero whenever the pool has room.
         expected = num_requests * len(crossings)
-        for label, pauses in (("roomy", roomy_pauses), ("tight", tight_pauses)):
-            assert pauses >= expected, (
-                f"{label} run: expected at least {expected} pause events "
-                f"({num_requests} requests x {len(crossings)} crossings), saw {pauses}"
+        for label, run_stats in (("roomy", roomy_stats), ("tight", tight_stats)):
+            marks = run_stats.get("pause_marks", 0)
+            assert marks >= expected, (
+                f"{label} run: expected at least {expected} pause marks "
+                f"({num_requests} requests x {len(crossings)} crossings), saw {marks}"
             )
 
         for req_id in roomy_out:

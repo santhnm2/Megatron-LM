@@ -714,8 +714,12 @@ class TestMambaPrefixCachingE2E(_HybridPCHelpers):
         )
 
 
-EVICTION_BASE_TOKEN = 20000
 EVICTION_TOKENS_TO_GENERATE = 8
+# Segment indices carve the vocabulary into disjoint block-sized token ranges:
+# 0-2 are the shared prefix blocks, and the rest are per-prompt tails.
+SEG_SEED_TAIL = 3  # 3 seed prompts -> indices 3, 4, 5
+SEG_PROBE_TAIL = 6  # probe prompts -> indices 6, 7
+SEG_STRESS_TAIL = 8  # stress prompts -> indices 8..19
 
 
 @pytest.mark.internal
@@ -741,7 +745,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     @staticmethod
     def _seg(index, length=BLOCK_SIZE):
         """A block-sized (or shorter) run of token ids unique to ``index``."""
-        start = EVICTION_BASE_TOKEN + index * BLOCK_SIZE
+        start = index * BLOCK_SIZE
+        assert start + length <= VOCAB_SIZE, (
+            f"segment {index} (+{length} tokens) runs past the vocabulary; "
+            f"prompt tokens must be valid embedding indices"
+        )
         return torch.arange(
             start, start + length, dtype=torch.int64, device=torch.cuda.current_device()
         )
@@ -756,9 +764,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         """
         seg0, seg1, seg2 = self._seg(0), self._seg(1), self._seg(2)
         return [
-            torch.cat([seg0, self._seg(10, 44)]),  # 300 tokens -> boundary at block 0
-            torch.cat([seg0, seg1, self._seg(11, 44)]),  # 556 tokens -> boundary at block 1
-            torch.cat([seg0, seg1, seg2, self._seg(12, 44)]),  # 812 tokens -> boundary at block 2
+            torch.cat([seg0, self._seg(SEG_SEED_TAIL, 44)]),  # 300 tokens -> boundary at block 0
+            torch.cat([seg0, seg1, self._seg(SEG_SEED_TAIL + 1, 44)]),  # 556 tokens -> boundary at block 1
+            torch.cat(
+                [seg0, seg1, seg2, self._seg(SEG_SEED_TAIL + 2, 44)]
+            ),  # 812 tokens -> boundary at block 2
         ]
 
     def _probe(self, num_shared_blocks, tail_index, tail_len=44):
@@ -910,7 +920,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     @torch.inference_mode()
     def test_single_block_match(self, chunked):
         """A request sharing one leading block with a cached prompt, nothing evicted."""
-        prompts = self._seed_prompts() + [self._probe(1, tail_index=20)]
+        prompts = self._seed_prompts() + [self._probe(1, tail_index=SEG_PROBE_TAIL)]
         requests, engine = self._assert_equivalent(prompts, chunked=chunked)
 
         if not chunked:
@@ -925,7 +935,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         Evicting a KV block also drops the Mamba snapshot anchored to it, while
         snapshots on the blocks that survive are left in place.
         """
-        prompts = self._seed_prompts() + [self._probe(3, tail_index=20)]
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
         seeds = 3
 
         def check_cascade(engine, requests):
@@ -945,7 +955,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         the SSM from a shallower boundary -- or recompute from the start if no
         snapshot survives below its match.
         """
-        prompts = self._seed_prompts() + [self._probe(3, tail_index=20)]
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
 
         def check_kv_survives(engine, requests):
             assert len(self._kv_map(engine)) >= len(self._mamba_map(engine))
@@ -957,7 +967,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     @torch.inference_mode()
     def test_kv_block_and_mamba_snapshot_evicted(self, chunked):
         """Both a KV block and an unrelated Mamba snapshot are evicted."""
-        prompts = self._seed_prompts() + [self._probe(3, tail_index=20)]
+        prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
         actions = {2: self._chain(self._evict_mamba(1), self._evict_kv(1))}
         self._assert_equivalent(prompts, actions=actions, chunked=chunked)
 
@@ -966,8 +976,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     def test_kv_block_evicted_then_recomputed(self, chunked):
         """An evicted KV block is recomputed by one request and matched by the next."""
         prompts = self._seed_prompts() + [
-            self._probe(3, tail_index=20),  # recomputes what was evicted
-            self._probe(3, tail_index=21),  # matches the recomputed blocks
+            self._probe(3, tail_index=SEG_PROBE_TAIL),  # recomputes what was evicted
+            self._probe(3, tail_index=SEG_PROBE_TAIL + 1),  # matches the recomputed blocks
         ]
         actions = {2: self._evict_kv(1)}
         requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
@@ -981,8 +991,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     def test_mamba_snapshot_evicted_then_recomputed(self, chunked):
         """An evicted Mamba snapshot is re-extracted by one request and used by the next."""
         prompts = self._seed_prompts() + [
-            self._probe(3, tail_index=20),  # re-extracts a snapshot on its divergence boundary
-            self._probe(3, tail_index=21),  # resumes from the re-extracted snapshot
+            self._probe(3, tail_index=SEG_PROBE_TAIL),  # re-extracts a snapshot on its divergence boundary
+            self._probe(3, tail_index=SEG_PROBE_TAIL + 1),  # resumes from the re-extracted snapshot
         ]
         actions = {2: self._evict_mamba(1)}
         requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
@@ -1002,7 +1012,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         seeds = self._seed_prompts()
         # 3 shared blocks + 1 token: skipping to the block-2 boundary would leave
         # a single token for this chunk, so the skip has to give that block back.
-        probe = self._probe(3, tail_index=20, tail_len=1)
+        probe = self._probe(3, tail_index=SEG_PROBE_TAIL, tail_len=1)
         assert len(probe) == 3 * BLOCK_SIZE + 1
 
         # Drop the snapshot at block index 1 -- the boundary the skip falls back
@@ -1031,7 +1041,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             # overlap depth cycles 1..3 blocks so prefixes are repeatedly
             # re-matched, re-evicted and recomputed at different depths
             shared = (i % 3) + 1
-            prompts.append(self._probe(shared, tail_index=30 + i, tail_len=44 + (i % 4) * 64))
+            prompts.append(self._probe(shared, tail_index=SEG_STRESS_TAIL + i, tail_len=44 + (i % 4) * 64))
 
         evicted_blocks = []
 

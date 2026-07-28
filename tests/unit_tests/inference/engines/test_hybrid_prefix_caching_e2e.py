@@ -1458,83 +1458,49 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         )
 
     @torch.inference_mode()
-    def test_diagnose_pause_divergence(self):
-        """Diagnostic: locate where a contended run diverges, and why.
+    def test_pause_mid_decode_output_equivalence(self):
+        """A request paused mid-decode generates the same tokens as one that never waits.
 
-        Run with ``-s``. Prints, per request, the first generated-token index at
-        which runs disagree, for two comparisons:
+        The other pause equivalence tests use block-aligned prompts, so the only
+        crossing is the one at the prefill boundary. Here the prompt stops six
+        tokens short of a block, putting the crossing -- and therefore the pause
+        and resume -- in the middle of generation, with tokens compared on both
+        sides of it.
 
-          roomy vs tight  -- differs by pausing AND by batch composition
-          roomy vs split  -- differs by batch composition ALONE (no pausing)
-
-        If the split control diverges too, composition alone moves the output and
-        the tight comparison cannot be read as evidence about pause/resume. If
-        the split control matches exactly while tight diverges at the index of a
-        block crossing, the resume path is the suspect.
+        Generation is kept short on purpose. Pausing changes which requests share
+        a step, and at longer decode lengths batch composition alone perturbs the
+        output of this bf16 model regardless of pausing; a few tokens past the
+        crossing is enough to catch state that was not carried across a resume,
+        while staying well short of where that drift appears.
         """
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
 
-        num_requests, prompt_len, generate = 6, 200, 400
+        num_requests, prompt_len, generate = 8, BLOCK_SIZE - 6, 10
         prompts = [self._seg(i, prompt_len) for i in range(num_requests)]
+        assert prompt_len % BLOCK_SIZE != 0
+        crossing_idx = BLOCK_SIZE - prompt_len
+        assert 0 < crossing_idx < generate, "the crossing must land inside the generation"
+
         total_blocks = -(-(prompt_len + generate) // BLOCK_SIZE)
-        crossing_idxs = [
-            b - prompt_len
-            for b in range(BLOCK_SIZE, prompt_len + generate + 1, BLOCK_SIZE)
-            if prompt_len < b <= prompt_len + generate
-        ]
-
-        def run(pool_blocks, admit):
-            stats = {}
-            engine = self._build_engine(
-                model,
-                mamba_config,
-                enable_prefix_caching=True,
-                buffer_size_gb=self._calibrate_buffer_gb(
-                    model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
-                ),
-                max_requests=num_requests,
-                request_rounder=4,
-            )
-            self._instrument_resume(engine, stats)
-            outputs = {}
-            for start in range(0, num_requests, admit):
-                for i in range(start, min(start + admit, num_requests)):
-                    engine._add_request(
-                        self._make_request(i, prompts[i], enable_pc=True, num_tokens=generate)
-                    )
-                while engine.has_unfinished_requests():
-                    result = engine.step_modern()
-                    for record in result["finished_request_records"]:
-                        merged = record.merge()
-                        outputs[merged.request_id] = list(merged.generated_tokens)
-            return outputs, stats
-
-        roomy_pool, tight_pool = num_requests * total_blocks + 4, 2 * total_blocks + 1
-        roomy, roomy_stats = run(roomy_pool, num_requests)
-        tight, tight_stats = run(tight_pool, num_requests)
-        split, split_stats = run(roomy_pool, 3)
-
-        def first_diff(a, b):
-            for i, (x, y) in enumerate(zip(a, b)):
-                if x != y:
-                    return i
-            return None
-
-        print(f"\n=== crossings at generated-token indices {crossing_idxs} ===")
-        for label, stats in (("roomy", roomy_stats), ("tight", tight_stats), ("split", split_stats)):
-            print(
-                f"{label:6s} marks={stats.get('pause_marks', 0)} "
-                f"left_paused={stats.get('resume_left_paused', 0)} "
-                f"needing_evict={stats.get('resume_needing_eviction', 0)}"
-            )
-        for req_id in sorted(roomy):
-            print(
-                f"req {req_id}: roomy-vs-tight first diff at "
-                f"{first_diff(roomy[req_id], tight[req_id])}, "
-                f"roomy-vs-split first diff at {first_diff(roomy[req_id], split[req_id])}"
-            )
+        stats = {}
+        _, engine = self._assert_equivalent(
+            prompts,
+            generate=generate,
+            admit=num_requests,
+            reference_admit=num_requests,
+            stats=stats,
+            buffer_blocks=2 * total_blocks + 1,
+            max_requests=num_requests,
+            request_rounder=4,
+        )
+        # every request crossed the boundary mid-generation
+        assert stats.get("pause_marks", 0) >= num_requests, (
+            f"expected at least {num_requests} pause marks, one per request, "
+            f"saw {stats.get('pause_marks', 0)}"
+        )
+        self._assert_paused(stats)
 
     @torch.inference_mode()
     def test_decode_crossing_many_block_boundaries(self):
@@ -1547,14 +1513,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         the crossings land in the middle of decode and recur, and each request is
         paused and resumed several times while others draw on the same pool.
 
-        Correctness is checked by running the same batch twice against pools of
-        different sizes. A roomy pool resumes every request immediately; a tight
-        one makes them wait on blocks that only eviction can release. Prompts,
-        batching and generation length are identical, so pausing under contention
-        is the only difference between the runs and any divergence in the output
-        is attributable to it. That is a tighter control than the uncached
-        single-pass reference used elsewhere, which would also differ in how the
-        prefill itself was computed.
+        The run is checked on progress, accounting and determinism: every
+        request completes its full generation, every boundary crossing is
+        accounted for, resumption genuinely runs out of blocks, and the whole
+        contended run reproduces itself exactly. See the comment at the end for
+        why generated tokens are not compared against an uncontended run.
         """
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
@@ -1611,9 +1574,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         # Roomy: every request fits at once, so nothing ever waits on a block.
         roomy_stats = {}
         roomy_out = run(num_requests * total_blocks + 4, roomy_stats)
-        # Tight: room for about two requests, so the rest contend.
+        # Tight: room for about two requests, so the rest contend. Run it twice:
+        # the contended path must be deterministic.
         tight_stats = {}
         tight_out = run(2 * total_blocks + 1, tight_stats)
+        tight_again = run(2 * total_blocks + 1, {})
 
         # The two runs differ in the intended way and only in that way. These
         # prompts are shorter than a block, so no complete block is ever
@@ -1639,12 +1604,24 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 f"({num_requests} requests x {len(crossings)} crossings), saw {marks}"
             )
 
-        for req_id in roomy_out:
-            assert roomy_out[req_id] == tight_out[req_id], (
-                f"request {req_id} generated different tokens when it had to wait "
-                f"for blocks: uncontended {roomy_out[req_id][:8]}... vs "
-                f"contended {tight_out[req_id][:8]}..."
+        # The contended run reproduces itself exactly.
+        for req_id in tight_out:
+            assert tight_out[req_id] == tight_again[req_id], (
+                f"request {req_id} generated different tokens on a repeat of the "
+                f"same contended run, so the pause/resume path is not deterministic"
             )
+
+        # Tokens are NOT compared against the roomy run. Pausing changes which
+        # requests share a step, and batch composition alone moves the output at
+        # this decode length: a control that varied composition without any
+        # pausing (six requests admitted as two groups of three, roomy pool)
+        # diverged from the all-at-once roomy run at generated-token indices
+        # 49-267, unrelated to the crossings at 56 and 312. Equality across
+        # differing composition is therefore not a property this model has, and
+        # asserting it here would be testing bf16 kernel behaviour rather than
+        # the resume path. Output correctness under pausing is covered instead by
+        # test_pause_mid_decode_output_equivalence, which stays short enough that
+        # composition drift has not yet appeared.
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()

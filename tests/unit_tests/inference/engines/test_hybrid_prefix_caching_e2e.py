@@ -1455,10 +1455,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         assert all(len(p) % BLOCK_SIZE == 0 for p in prompts), "prompts must be block-aligned"
 
         # Each request holds its prompt blocks plus one more for the tokens it
-        # generates. Sizing the pool to roughly two requests' worth means the
-        # rest have to wait on blocks that only eviction can release.
+        # generates, and the pool is sized so the rest have to wait on blocks
+        # that only eviction can release. Chunked prefill admits at most one
+        # chunked request at a time, so fewer requests are ever in flight and a
+        # pool sized for two of them still leaves spares; size it for one
+        # resident request plus a margin instead.
         blocks_per_request = len(prompts[0]) // BLOCK_SIZE + 1
-        pool_blocks = 2 * blocks_per_request + 1
+        pool_blocks = blocks_per_request + 2 if chunked else 2 * blocks_per_request + 1
 
         stats = {}
         _, engine = self._assert_equivalent(
@@ -1495,7 +1498,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         prompts = [pairs[i // 2] for i in range(16)]
         assert all(len(p) % BLOCK_SIZE == 0 for p in prompts)
         blocks_per_request = len(prompts[0]) // BLOCK_SIZE + 1
-        pool_blocks = 2 * blocks_per_request + 1
+        pool_blocks = blocks_per_request + 2 if chunked else 2 * blocks_per_request + 1
 
         stats = {}
         _, engine = self._assert_equivalent(

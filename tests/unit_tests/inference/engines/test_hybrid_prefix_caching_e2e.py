@@ -1066,25 +1066,41 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     def test_kv_block_and_mamba_snapshot_evicted(self, chunked):
         """Both a KV block and an unrelated Mamba snapshot are evicted."""
         prompts = self._seed_prompts() + [self._probe(3, tail_index=SEG_PROBE_TAIL)]
-        mamba_evicted, kv_evicted = [], []
+        kv_evicted = []
 
         def check_both(engine, requests):
-            assert len(mamba_evicted) == 1 and len(kv_evicted) == 1
-            # the snapshot-only eviction left its KV block behind
-            assert mamba_evicted[0] not in self._mamba_map(engine)
-            assert mamba_evicted[0] in self._kv_map(engine)
-            # the block eviction removed the block from both caches
-            assert kv_evicted[0] not in self._kv_map(engine)
-            assert kv_evicted[0] not in self._mamba_map(engine)
+            seed_hashes = requests[2].precomputed_block_hashes
+            # block 2 is the chain's only leaf, so the block eviction took it,
+            # and its snapshot went with it
+            assert kv_evicted == [seed_hashes[2]], f"expected block 2 evicted, got {kv_evicted}"
+            assert seed_hashes[2] not in self._kv_map(engine)
+            assert seed_hashes[2] not in self._mamba_map(engine)
+            # block 1 lost only its snapshot; the block itself is still cached
+            assert seed_hashes[1] in self._kv_map(engine)
+            assert seed_hashes[1] not in self._mamba_map(engine)
+            # block 0 is untouched in both caches
+            assert seed_hashes[0] in self._kv_map(engine)
+            assert seed_hashes[0] in self._mamba_map(engine)
 
         actions = {
             2: self._chain(
-                self._evict_mamba(1, log=mamba_evicted),
+                # Target block 1 rather than taking the LRU snapshot: the block
+                # eviction below removes the leaf (block 2), and evicting that
+                # same block's snapshot first would collapse the two cases into
+                # one instead of leaving a block that is cached without state.
+                self._evict_mamba_for_hash(
+                    lambda requests: requests[2].precomputed_block_hashes[1]
+                ),
                 self._evict_kv(1, log=kv_evicted),
                 check_both,
             )
         }
-        self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+        requests, engine = self._assert_equivalent(prompts, actions=actions, chunked=chunked)
+
+        if not chunked:
+            # only blocks 0-1 survive in KV, and only block 0 has state, so the
+            # probe resumes from the first boundary
+            assert requests[-1]._mamba_num_matched_blocks == 1
 
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()

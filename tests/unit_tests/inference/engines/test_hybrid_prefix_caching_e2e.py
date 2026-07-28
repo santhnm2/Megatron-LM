@@ -1434,6 +1434,111 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             "buffer_size_gb or raise the request count."
         )
 
+    @torch.inference_mode()
+    def test_decode_crossing_many_block_boundaries(self):
+        """Generating past a block's worth pauses a request repeatedly, without changing its output.
+
+        Every other pause case here crosses exactly one block boundary, the one
+        immediately after prefill, because the prompts are block-aligned. That is
+        a single special case. Here the prompts are deliberately *not*
+        block-aligned and each request generates well over a block's worth, so
+        the crossings land in the middle of decode and recur, and each request is
+        paused and resumed several times while others draw on the same pool.
+
+        Correctness is checked by running the same batch twice against pools of
+        different sizes. A roomy pool resumes every request immediately; a tight
+        one makes them wait on blocks that only eviction can release. Prompts,
+        batching and generation length are identical, so pausing under contention
+        is the only difference between the runs and any divergence in the output
+        is attributable to it. That is a tighter control than the uncached
+        single-pass reference used elsewhere, which would also differ in how the
+        prefill itself was computed.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        num_requests, prompt_len, generate = 6, 200, 400
+        assert prompt_len % BLOCK_SIZE != 0, "prompts must not end on a block boundary"
+        prompts = [self._seg(i, prompt_len) for i in range(num_requests)]
+
+        # Boundaries strictly inside (prompt_len, prompt_len + generate) are the
+        # ones a request crosses while decoding.
+        crossings = [
+            b
+            for b in range(BLOCK_SIZE, prompt_len + generate + 1, BLOCK_SIZE)
+            if prompt_len < b <= prompt_len + generate
+        ]
+        assert len(crossings) >= 2, f"expected repeated mid-decode crossings, got {crossings}"
+        total_blocks = -(-(prompt_len + generate) // BLOCK_SIZE)
+
+        def run(pool_blocks, stats):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=True,
+                buffer_size_gb=self._calibrate_buffer_gb(
+                    model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
+                ),
+                max_requests=num_requests,
+                request_rounder=4,
+            )
+            self._instrument_resume(engine, stats)
+            for i, prompt in enumerate(prompts):
+                engine._add_request(
+                    self._make_request(i, prompt, enable_pc=True, num_tokens=generate)
+                )
+            outputs, pause_events, steps = {}, 0, 0
+            while engine.has_unfinished_requests():
+                steps += 1
+                assert steps < 20000, (
+                    f"engine stopped making progress after {len(outputs)} of "
+                    f"{num_requests} requests finished"
+                )
+                result = engine.step_modern()
+                newly_paused = result.get("newly_paused_request_ids")
+                if newly_paused is not None:
+                    pause_events += int(newly_paused.numel())
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    outputs[merged.request_id] = list(merged.generated_tokens)
+            assert sorted(outputs) == list(range(num_requests))
+            for req_id, tokens in outputs.items():
+                assert (
+                    len(tokens) == generate
+                ), f"request {req_id} produced {len(tokens)} tokens, expected {generate}"
+            return outputs, pause_events
+
+        # Roomy: every request fits at once, so nothing ever waits on a block.
+        roomy_stats = {}
+        roomy_out, roomy_pauses = run(num_requests * total_blocks + 4, roomy_stats)
+        # Tight: room for about two requests, so the rest contend.
+        tight_stats = {}
+        tight_out, tight_pauses = run(2 * total_blocks + 1, tight_stats)
+
+        # The two runs differ in the intended way and only in that way.
+        assert roomy_stats.get("resume_needing_eviction", 0) == 0, (
+            "the roomy pool was not roomy: resumption had to reclaim a cached "
+            "block, so it is not a contention-free control"
+        )
+        self._assert_paused_under_eviction(tight_stats)
+
+        # Each request crosses every boundary in its span, and a crossing is what
+        # pause-marks it, so neither run can have paused fewer times than that.
+        expected = num_requests * len(crossings)
+        for label, pauses in (("roomy", roomy_pauses), ("tight", tight_pauses)):
+            assert pauses >= expected, (
+                f"{label} run: expected at least {expected} pause events "
+                f"({num_requests} requests x {len(crossings)} crossings), saw {pauses}"
+            )
+
+        for req_id in roomy_out:
+            assert roomy_out[req_id] == tight_out[req_id], (
+                f"request {req_id} generated different tokens when it had to wait "
+                f"for blocks: uncontended {roomy_out[req_id][:8]}... vs "
+                f"contended {tight_out[req_id][:8]}..."
+            )
+
     @pytest.mark.parametrize("chunked", [False, True], ids=["single_chunk", "chunked_prefill"])
     @torch.inference_mode()
     def test_paused_requests(self, chunked):

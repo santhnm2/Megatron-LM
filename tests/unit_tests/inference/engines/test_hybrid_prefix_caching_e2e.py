@@ -1043,6 +1043,15 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             )
 
     @staticmethod
+    def _orphaned_slot_blocks(engine):
+        """Blocks holding a Mamba slot that no cached hash names."""
+        msa = engine.context.mamba_slot_allocator
+        alloc = engine.context.kv_block_allocator
+        mapped = torch.nonzero(msa.block_to_slot[: alloc.total_count] >= 0, as_tuple=True)[0]
+        named = set(msa.hash_to_block_id.values())
+        return [int(b) for b in mapped.tolist() if int(b) not in named]
+
+    @staticmethod
     def _assert_no_orphaned_slots(engine, requests=None):
         """Every occupied Mamba slot must be reachable through the hash index.
 
@@ -1060,11 +1069,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         hash of its own -- ``block_hashes[bid] == -1`` makes
         ``register_block_hashes_batch`` skip it, since it keeps only ``h > 0``.
         """
-        msa = engine.context.mamba_slot_allocator
-        alloc = engine.context.kv_block_allocator
-        mapped = torch.nonzero(msa.block_to_slot[: alloc.total_count] >= 0, as_tuple=True)[0]
-        named = set(msa.hash_to_block_id.values())
-        orphaned = [int(b) for b in mapped.tolist() if int(b) not in named]
+        orphaned = TestHybridPrefixCachingEvictionEquivalence._orphaned_slot_blocks(engine)
         assert not orphaned, (
             f"{len(orphaned)} Mamba slots are held by blocks that no cached hash "
             f"names (blocks {orphaned[:8]}), so nothing can restore from them and "
@@ -1135,6 +1140,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         generate=EVICTION_TOKENS_TO_GENERATE,
         admit=1,
         stats=None,
+        token_stream=None,
+        snapshots=None,
+        sample_every=16,
         **engine_kwargs,
     ):
         """Issue the prompts in groups of ``admit``, draining each group before the next.
@@ -1147,6 +1155,13 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         once that prompt's group has finished. Actions run only when prefix
         caching is on, since they manipulate cache state that does not otherwise
         exist. ``stats`` collects observations about what the engine had to do.
+
+        ``token_stream``, when given, is a dict driving the golden token replay:
+        its ``"golden"`` entry (possibly None, meaning record) is passed to
+        :meth:`_pin_token_stream`, and the recorded stream and miss count are
+        written back under ``"recorded"`` and ``"stats"``. ``snapshots``, when
+        given, is a dict that collects recurrent state on the ``sample_every``
+        position grid.
         """
         engine = self._build_engine(
             model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
@@ -1155,6 +1170,12 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             on_engine(engine)
         if stats is not None:
             self._instrument_resume(engine, stats)
+        if token_stream is not None:
+            recorded, pin_stats = self._pin_token_stream(
+                engine, golden=token_stream.get("golden")
+            )
+            token_stream["recorded"] = recorded
+            token_stream["stats"] = pin_stats
         outputs, requests = {}, []
         for start in range(0, len(prompts), admit):
             group = range(start, min(start + admit, len(prompts)))
@@ -1173,6 +1194,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 for record in result["finished_request_records"]:
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
+                if snapshots is not None:
+                    self._snapshot_mamba_states(engine, snapshots, sample_every)
             if enable_pc and actions:
                 for i in group:
                     if i in actions:
@@ -1191,6 +1214,8 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         stats=None,
         buffer_blocks=None,
         mamba_slots=None,
+        compare="tokens",
+        sample_every=16,
         **engine_overrides,
     ):
         """Require the caching run to reproduce an uncached single-pass reference.
@@ -1204,7 +1229,24 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         single-pass answer is both stabler and a stronger claim: whatever the
         cache skipped, restored or evicted, and however the prompt was chunked,
         the tokens must match a plain uncached forward.
+
+        ``compare`` selects what "reproduce" means:
+
+        ``"tokens"``
+            Exact equality of the generated tokens. Right when the two runs do
+            the same work, but it rests on an argmax over a randomly initialised
+            bf16 model, so a near-tie broken the other way reads as a failure.
+
+        ``"state"``
+            Pin the token stream to the reference and compare the recurrent state
+            instead. Necessary once the two runs prefill differently enough to
+            move the logits -- chunked cuts, differing cache hits -- where token
+            equality becomes a coin toss. Strictly more sensitive despite the
+            tolerance: it checks whole conv and SSM tensors at every sampled
+            position rather than one argmax, and :meth:`_assert_states_match`
+            proves the tolerance can tell two states apart before trusting it.
         """
+        assert compare in ("tokens", "state"), compare
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
@@ -1228,9 +1270,23 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 model, mamba_config, mamba_slots, **probe_kwargs
             )
 
+        state_mode = compare == "state"
+        ref_stream = {"golden": None} if state_mode else None
+        ref_snaps = {} if state_mode else None
         reference, _, _ = self._run(
-            model, mamba_config, prompts, False, generate=generate, admit=reference_admit
+            model,
+            mamba_config,
+            prompts,
+            False,
+            generate=generate,
+            admit=reference_admit,
+            token_stream=ref_stream,
+            snapshots=ref_snaps,
+            sample_every=sample_every,
         )
+
+        cached_stream = {"golden": ref_stream["recorded"]} if state_mode else None
+        cached_snaps = {} if state_mode else None
         cached, requests, engine = self._run(
             model,
             mamba_config,
@@ -1241,6 +1297,9 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             generate=generate,
             admit=admit,
             stats=stats,
+            token_stream=cached_stream,
+            snapshots=cached_snaps,
+            sample_every=sample_every,
             **{**self._engine_kwargs(chunked), **engine_overrides},
         )
 
@@ -1253,11 +1312,23 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             f"Requests that never fit are dropped by the scheduler rather than "
             f"raising, so an empty list means the pool is too small to run them."
         )
-        for req_id in reference:
-            assert reference[req_id] == cached[req_id], (
-                f"request {req_id}: uncached reference produced {reference[req_id]}, "
-                f"caching enabled produced {cached[req_id]}"
+
+        if state_mode:
+            assert ref_stream["recorded"], "the reference run recorded no tokens to replay"
+            misses = cached_stream["stats"]["misses"]
+            assert misses == 0, (
+                f"{misses} sampled rows had no golden token, so the caching run "
+                f"did not reproduce the reference run's sequence positions"
             )
+            # Tokens are deliberately not compared: the replay above pins them, so
+            # equality would be true by construction. The states carry the evidence.
+            self._assert_states_match(ref_snaps, cached_snaps, min_shared=len(prompts))
+        else:
+            for req_id in reference:
+                assert reference[req_id] == cached[req_id], (
+                    f"request {req_id}: uncached reference produced {reference[req_id]}, "
+                    f"caching enabled produced {cached[req_id]}"
+                )
         return requests, engine
 
     # ---------------------------------------------------------------- the cases
@@ -1574,16 +1645,22 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         losing Mamba snapshots, so the run covers a long sequence of cache states
         rather than one constructed one.
 
-        Each request generates a single token, which is the one the prefill state
-        produces directly and so is the token that a mishandled skip or restore
-        corrupts. Later tokens are not compared here: with chunked prefill on, a
-        prompt that gets no cache hit is still split into chunks the uncached
-        single-pass reference does not use, and the SSM scan is not bitwise
-        invariant to where it is split. That difference is present with caching
-        disabled entirely, so comparing decode steps across the two would be
-        measuring chunking, not the cache. The structured cases above keep the
-        full-sequence comparison, where caching makes the two runs do the same
-        work and the tokens match exactly.
+        Compared on recurrent state, not tokens. With chunked prefill on, a prompt
+        that gets no cache hit is still split into chunks the uncached single-pass
+        reference does not use, and the SSM scan is not bitwise invariant to where
+        it is split -- a difference present with caching disabled entirely. This
+        case used to sidestep that by generating a single token and comparing only
+        that one, on the grounds that prefill determines it directly. It does, but
+        it is still an argmax over a randomly initialised bf16 model, and a
+        near-tie broken the other way by the chunking difference alone is
+        indistinguishable from a real corruption; that made this case
+        intermittently fail on a tie rather than on anything the cache did.
+
+        So the token stream is pinned to the reference and the conv and SSM state
+        compared instead. That is strictly more sensitive than the single token it
+        replaces -- whole state tensors at every sampled position, with
+        _assert_states_match first proving the tolerance can tell two different
+        requests' states apart -- while being immune to tie-breaks.
         """
         # Each prompt is 1-4 whole blocks drawn from a pool of segments, then a
         # partial tail every prompt shares. Only complete blocks are registered,
@@ -1597,6 +1674,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         num_prompts = 64
         segment_pool = SEG_STRESS_POOL
         block_lists, prompts = [], []
+        seen_block_lists = set()
         for i in range(num_prompts):
             depth = 1 + (i % 4)
             if block_lists and rng.random() < 0.6:
@@ -1607,6 +1685,17 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             while len(blocks) < depth:
                 blocks.append(rng.randrange(segment_pool))
             blocks = blocks[:depth]
+            # Overlapping, but never identical. Two prompts with the same block
+            # list are the same sequence, so their recurrent states coincide at
+            # every position -- which would trip the check inside
+            # _assert_states_match that different requests must be
+            # distinguishable at the tolerance being used. Sharing a *prefix* is
+            # fine: the reference run is unchunked, so only positions at or past
+            # each prompt's end are ever sampled, and by then the prompts have
+            # diverged.
+            while tuple(blocks) in seen_block_lists:
+                blocks = blocks[:-1] + [rng.randrange(segment_pool)]
+            seen_block_lists.add(tuple(blocks))
             block_lists.append(blocks)
             prompts.append(
                 torch.cat(
@@ -1656,12 +1745,19 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 else self._assert_mamba_slot_invariants
             )
 
+        # Every request must reach at least one sampled position. States are
+        # sampled where the position is a multiple of sample_every, and a request
+        # occupies positions [prompt_len, prompt_len + generate), so generating a
+        # full grid stride guarantees exactly that however long its prompt is.
+        sample_every = 16
         _, engine = self._assert_equivalent(
             prompts,
             actions=actions,
             chunked=True,
             on_engine=instrument,
-            generate=1,
+            generate=sample_every,
+            compare="state",
+            sample_every=sample_every,
             # roughly 15 blocks, far fewer than these prompts register, so the
             # pool turns over many times across the run
             buffer_size_gb=0.01,
@@ -2313,28 +2409,38 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         self._assert_states_match(roomy_snaps, tight_snaps, min_shared=num_requests)
         self._assert_mamba_slot_invariants(engine)
 
-        # --- Characterisation of a known bug, NOT of intended behaviour. ---
-        # DynamicInferenceRequestRecord.checkpoint() rebuilds the request without
-        # block_size_tokens or enable_prefix_caching, so __post_init__ skips hash
-        # computation and every prefix-caching branch downstream (which all guard
-        # on `req.precomputed_block_hashes`) turns itself off for the rest of that
-        # request's life. It therefore re-prefills its now-longer prompt in full,
-        # cannot match the blocks its own earlier incarnation registered and left
-        # cached at ref-zero, and registers nothing for anyone else.
-        #
-        # When checkpoint() is fixed to carry those two fields, this assertion
-        # flips: assert record[-1].precomputed_block_hashes, and the orphaned-slot
-        # check below should hold rather than being the thing that documents the
-        # leak.
+        # A checkpointed request keeps its prefix-caching settings. Regression
+        # guard: checkpoint() previously rebuilt the request without
+        # block_size_tokens or enable_prefix_caching, so __post_init__ skipped
+        # hash computation, and since nothing reassigns those fields afterwards
+        # the request stayed unhashed for the rest of its life. Every
+        # prefix-caching branch downstream guards on `precomputed_block_hashes`,
+        # so caching silently switched itself off for any request that was ever
+        # preempted -- the one request that most needs it, since its prompt has
+        # just grown and the blocks covering its leading tokens are still cached.
         for rid in preempted:
             readmitted = tight_records[rid][-1]
-            assert readmitted.precomputed_block_hashes == [], (
-                f"request {rid} kept its block hashes across a checkpoint -- if "
-                f"checkpoint() was fixed to carry block_size_tokens and "
-                f"enable_prefix_caching, invert this assertion and enable the "
-                f"orphaned-slot check below"
+            assert readmitted.enable_prefix_caching is True, (
+                f"request {rid} lost enable_prefix_caching across a checkpoint"
             )
-            assert readmitted.enable_prefix_caching is False
+            assert readmitted.precomputed_block_hashes, (
+                f"request {rid} came back from a checkpoint with no block hashes, "
+                f"so it cannot match the blocks its own earlier incarnation "
+                f"registered and will re-prefill its whole (now longer) prompt"
+            )
+
+        # No Mamba slot is left unreachable. This is the downstream consequence of
+        # the same bug and the reason it is worth a dedicated check: an unhashed
+        # request still runs compute_and_store_offsets, so its blocks reached
+        # commit_intermediate_states with block_hashes[bid] == -1;
+        # allocate_slots_batch took a slot for each while
+        # register_block_hashes_batch dropped them (it keeps only h > 0), leaving
+        # slots nothing could restore from and nothing could free until their
+        # blocks fell to ref-zero. Not corruption -- restores are hash-gated, so
+        # an orphan is unreachable rather than stale -- but it consumes durable
+        # capacity, and under a Mamba budget small enough for the slot pool to
+        # bind it is what turns _evict_lru_slots_batch into "No evictable Mamba
+        # cache slots available".
         self._assert_no_orphaned_slots(engine)
 
     @torch.inference_mode()

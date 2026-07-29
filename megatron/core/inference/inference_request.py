@@ -696,12 +696,27 @@ class DynamicInferenceRequestRecord:
         )
 
         # New request.
+        #
+        # Carry the prefix-caching settings across the checkpoint. Without them
+        # __post_init__ skips hash computation, and since nothing reassigns these
+        # fields after construction, the request stays without block hashes for
+        # the rest of its life -- every prefix-caching branch downstream guards on
+        # `precomputed_block_hashes`, so caching silently turns itself off for any
+        # request that is ever preempted or suspended. That is exactly backwards:
+        # the new prompt is the old prompt plus everything generated so far, so it
+        # is longer than what was already prefilled, and the blocks covering its
+        # leading tokens are still cached (a preempted request's blocks are
+        # released to ref-zero, not deregistered) and ready to be matched.
+        # Recomputing them also leaves the recomputed blocks unregistered, so the
+        # loss compounds for every other request too.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            block_size_tokens=old_request.block_size_tokens,
+            enable_prefix_caching=old_request.enable_prefix_caching,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.

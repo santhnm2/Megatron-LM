@@ -1315,11 +1315,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
 
         if state_mode:
             assert ref_stream["recorded"], "the reference run recorded no tokens to replay"
-            misses = cached_stream["stats"]["misses"]
-            assert misses == 0, (
-                f"{misses} sampled rows had no golden token, so the caching run "
-                f"did not reproduce the reference run's sequence positions"
-            )
+            self._assert_golden_covered(ref_stream["recorded"], cached_stream["stats"])
             # Tokens are deliberately not compared: the replay above pins them, so
             # equality would be true by construction. The states carry the evidence.
             self._assert_states_match(ref_snaps, cached_snaps, min_shared=len(prompts))
@@ -1953,14 +1949,22 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         thing under test rather than a tie-break.
 
         With ``golden`` None the run records; otherwise it replays ``golden``.
-        Returns ``(recorded, stats)``; ``stats["misses"]`` counts sampled rows
-        that had no golden entry, which means the runs did not visit the same
-        sequence positions and nothing downstream is comparable.
+        Returns ``(recorded, stats)``. ``stats["replayed"]`` is the set of golden
+        keys actually used, which is what callers should check: a run must cover
+        every position the reference visited.
+
+        ``stats["misses"]`` counts sampled rows with no golden entry, which is
+        *not* on its own a problem. Under chunked prefill an intermediate chunk
+        still emits a sampler row, keyed short of ``prompt_len`` because the
+        request has consumed only part of its prompt; the token there is
+        discarded, and an unchunked reference never visits that position. Extra
+        rows are therefore expected whenever the two runs chunk differently --
+        missing ones are not.
         """
         ctx = engine.context
         controller = engine.controller
         original_sample = controller._dynamic_step_sample_logits
-        recorded, stats = {}, {"misses": 0}
+        recorded, stats = {}, {"misses": 0, "replayed": set()}
 
         def patched_sample():
             # The dynamic path writes one token per active request into
@@ -1979,12 +1983,23 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             for row, key in enumerate(keys):
                 if key in golden:
                     replay[row] = golden[key]
+                    stats["replayed"].add(key)
                 else:
                     stats["misses"] += 1
             buffer[:n].copy_(torch.tensor(replay, dtype=buffer.dtype, device=buffer.device))
 
         controller._dynamic_step_sample_logits = patched_sample
         return recorded, stats
+
+    @staticmethod
+    def _assert_golden_covered(golden, stats):
+        """Every position the reference visited must have been replayed."""
+        uncovered = sorted(set(golden) - stats["replayed"])
+        assert not uncovered, (
+            f"{len(uncovered)} of {len(golden)} reference positions were never "
+            f"replayed (e.g. {uncovered[:4]}), so the two runs did not follow the "
+            f"same trajectory and the state comparison is not like-for-like"
+        )
 
     @classmethod
     def _snapshot_mamba_states(cls, engine, snapshots, sample_every):
@@ -2132,7 +2147,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 assert steps < 20000, "engine stopped making progress"
                 engine.step_modern()
                 self._snapshot_mamba_states(engine, snapshots, sample_every)
-            return snapshots, recorded, pin_stats["misses"]
+            return snapshots, recorded, pin_stats
 
         # Golden: no prefix caching, no chunked prefill, nothing ever waits.
         clean_stats = {}
@@ -2143,13 +2158,10 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         assert clean_stats.get("resume_left_paused", 0) == 0, "the clean run was not uncontended"
 
         tight_stats = {}
-        tight_snaps, _, misses = run(
+        tight_snaps, _, pin_stats = run(
             2 * peak_blocks + 1, tight_stats, enable_pc=True, golden=golden
         )
-        assert misses == 0, (
-            f"{misses} sampled rows had no golden token, so the contended run did "
-            f"not reproduce the clean run's sequence positions"
-        )
+        self._assert_golden_covered(golden, pin_stats)
         self._assert_paused_under_scarcity(tight_stats)
 
         self._assert_states_match(clean_snaps, tight_snaps, min_shared=num_requests)
@@ -2240,16 +2252,15 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
                 self._snapshot_mamba_states(engine, snapshots, sample_every)
-            return outputs, snapshots, recorded, pin_stats["misses"]
+            return outputs, snapshots, recorded, pin_stats
 
         roomy_stats, tight_stats = {}, {}
         roomy_out, roomy_snaps, golden, _ = run(num_requests * peak_blocks + 4, roomy_stats)
         assert golden, "the roomy run recorded no tokens to replay"
-        tight_out, tight_snaps, _, misses = run(2 * peak_blocks + 1, tight_stats, golden=golden)
-        assert misses == 0, (
-            f"{misses} sampled rows had no golden token, so the contended run did "
-            f"not reproduce the roomy run's sequence positions"
+        tight_out, tight_snaps, _, pin_stats = run(
+            2 * peak_blocks + 1, tight_stats, golden=golden
         )
+        self._assert_golden_covered(golden, pin_stats)
 
         for label, outputs in (("roomy", roomy_out), ("tight", tight_out)):
             assert sorted(outputs) == list(range(num_requests)), f"{label}: {sorted(outputs)}"
@@ -2355,20 +2366,17 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                     outputs[merged.request_id] = list(merged.generated_tokens)
                     records[merged.request_id] = record
                 self._snapshot_mamba_states(engine, snapshots, sample_every)
-            return outputs, records, snapshots, recorded, pin_stats["misses"], engine
+            return outputs, records, snapshots, recorded, pin_stats, engine
 
         roomy_stats, tight_stats = {}, {}
         roomy_out, _, roomy_snaps, golden, _, roomy_engine = run(
             num_requests * peak_blocks + 4, roomy_stats
         )
         assert golden, "the roomy run recorded no tokens to replay"
-        tight_out, tight_records, tight_snaps, _, misses, engine = run(
+        tight_out, tight_records, tight_snaps, _, pin_stats, engine = run(
             2 * peak_blocks + 1, tight_stats, golden=golden
         )
-        assert misses == 0, (
-            f"{misses} sampled rows had no golden token, so the contended run did "
-            f"not reproduce the roomy run's sequence positions"
-        )
+        self._assert_golden_covered(golden, pin_stats)
 
         # The runs differ in the intended way and only in that way: preemption
         # happened under contention and never without it.

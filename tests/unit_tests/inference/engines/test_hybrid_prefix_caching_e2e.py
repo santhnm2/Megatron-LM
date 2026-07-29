@@ -1043,6 +1043,38 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             )
 
     @staticmethod
+    def _assert_no_orphaned_slots(engine, requests=None):
+        """Every occupied Mamba slot must be reachable through the hash index.
+
+        The converse of the ``hash_to_block_id`` check in
+        :meth:`_assert_mamba_slot_invariants`, and deliberately separate from it
+        because it catches a different failure. A slot whose block no cached hash
+        names is not corrupt and not double-booked -- it is simply unreachable:
+        nothing can ever restore from it, and it cannot return to the free pool
+        until its block happens to fall to ref-zero. It is a leak, and under a
+        durable cache small enough for the slot pool to bind, enough of them turn
+        ``_evict_lru_slots_batch`` into ``No evictable Mamba cache slots``.
+
+        Blocks acquire slots in ``commit_intermediate_states``, which allocates
+        and then registers, so an orphan means a block reached commit with no
+        hash of its own -- ``block_hashes[bid] == -1`` makes
+        ``register_block_hashes_batch`` skip it, since it keeps only ``h > 0``.
+        """
+        msa = engine.context.mamba_slot_allocator
+        alloc = engine.context.kv_block_allocator
+        mapped = torch.nonzero(msa.block_to_slot[: alloc.total_count] >= 0, as_tuple=True)[0]
+        named = set(msa.hash_to_block_id.values())
+        orphaned = [int(b) for b in mapped.tolist() if int(b) not in named]
+        assert not orphaned, (
+            f"{len(orphaned)} Mamba slots are held by blocks that no cached hash "
+            f"names (blocks {orphaned[:8]}), so nothing can restore from them and "
+            f"they cannot be freed until their blocks fall to ref-zero. A block "
+            f"reaches commit unhashed when its request has no "
+            f"precomputed_block_hashes, which is what a checkpointed (preempted) "
+            f"request looks like"
+        )
+
+    @staticmethod
     def _assert_resumed_from_block(req, num_blocks):
         """Require the request's prefill to have resumed at a specific boundary.
 
@@ -2157,6 +2189,151 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             )
         assert roomy_stats.get("resume_left_paused", 0) == 0, "the roomy pool was not roomy"
         self._assert_paused_under_scarcity(tight_stats)
+
+    @torch.inference_mode()
+    def test_preempted_requests_rerun_correctly(self):
+        """Requests evicted from the context entirely, then re-admitted from scratch.
+
+        Distinct from every pause case above. Pausing keeps a request resident:
+        its blocks and its Mamba slot stay assigned and it resumes where it left
+        off. Preemption throws it out -- ``evict_overflow_paused_requests``
+        releases its KV blocks, frees its Mamba slot, and hands its id back to the
+        engine, which checkpoints it (prompt becomes prompt + everything generated
+        so far, with the generation budget reduced to match) and re-queues it at
+        the front of the waiting list. It then re-prefills a *longer* prompt from
+        a zeroed recurrent state through the ordinary scheduling path, with
+        nothing marking it as a returning request.
+
+        That round trip is what this covers: it must land on the same trajectory
+        as a run where it never happened. Tokens are pinned to the uncontended
+        run and the recurrent state compared, for the same reason as
+        test_decode_heavy_pause_stress -- the pool size moves batch composition
+        and cache hits, so an argmax comparison would be a tie-break coin toss.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        # Prompts must be at least a whole block so their blocks are registered
+        # and the Mamba snapshot cache is live while preemption happens; sharing
+        # leading blocks keeps the prefix cache in play throughout.
+        num_requests, generate = 8, 400
+        prompts = [
+            torch.cat([self._seg(i % 2), self._seg(8 + i, 37 + 19 * i)])
+            for i in range(num_requests)
+        ]
+        assert all(len(p) > BLOCK_SIZE for p in prompts)
+        assert all(len(p) % BLOCK_SIZE != 0 for p in prompts)
+        peak_blocks = max(-(-(len(p) + generate) // BLOCK_SIZE) for p in prompts)
+        sample_every = 32
+
+        def run(pool_blocks, stats, golden=None):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=True,
+                buffer_size_gb=self._calibrate_buffer_gb(
+                    model, mamba_config, pool_blocks, max_requests=num_requests, request_rounder=4
+                ),
+                max_requests=num_requests,
+                request_rounder=4,
+            )
+            self._instrument_resume(engine, stats)
+            recorded, pin_stats = self._pin_token_stream(engine, golden=golden)
+            for i, prompt in enumerate(prompts):
+                engine._add_request(
+                    self._make_request(i, prompt, enable_pc=True, num_tokens=generate)
+                )
+            outputs, snapshots, steps = {}, {}, 0
+            while engine.has_unfinished_requests():
+                steps += 1
+                assert steps < 20000, (
+                    f"engine stopped making progress after {len(outputs)} of "
+                    f"{num_requests} requests finished"
+                )
+                for record in engine.step_modern()["finished_request_records"]:
+                    merged = record.merge()
+                    outputs[merged.request_id] = list(merged.generated_tokens)
+                self._snapshot_mamba_states(engine, snapshots, sample_every)
+            return outputs, snapshots, recorded, pin_stats["misses"], engine
+
+        roomy_stats, tight_stats = {}, {}
+        roomy_out, roomy_snaps, golden, _, roomy_engine = run(
+            num_requests * peak_blocks + 4, roomy_stats
+        )
+        assert golden, "the roomy run recorded no tokens to replay"
+        tight_out, tight_snaps, _, misses, engine = run(
+            2 * peak_blocks + 1, tight_stats, golden=golden
+        )
+        assert misses == 0, (
+            f"{misses} sampled rows had no golden token, so the contended run did "
+            f"not reproduce the roomy run's sequence positions"
+        )
+
+        # The runs differ in the intended way and only in that way: preemption
+        # happened under contention and never without it.
+        assert roomy_engine.evicted_request_count == 0, (
+            f"the roomy pool preempted {roomy_engine.evicted_request_count} "
+            f"requests, so it is not a preemption-free control"
+        )
+        assert engine.evicted_request_count > 0, (
+            "no request was ever evicted from the context, so this is testing "
+            "pausing rather than preemption. evict_overflow_paused_requests only "
+            "fires when paused requests cannot all resume -- lower the pool size."
+        )
+
+        for label, outputs in (("roomy", roomy_out), ("tight", tight_out)):
+            assert sorted(outputs) == list(range(num_requests)), f"{label}: {sorted(outputs)}"
+            for i in range(num_requests):
+                assert len(outputs[i]) == generate, (
+                    f"{label} request {i} produced {len(outputs[i])} tokens, "
+                    f"expected {generate}. A preempted request resumes with its "
+                    f"generation budget reduced by what it had already produced, "
+                    f"so a short count means that accounting is wrong"
+                )
+
+        # Requests really were checkpointed, not merely re-queued: a checkpointed
+        # request gets a fresh entry in its record, carrying prompt + generations.
+        preempted = [
+            rid
+            for rid in range(num_requests)
+            if len(engine.requests[rid].record.requests) > 1
+        ]
+        assert preempted, "no request record shows a checkpoint, so none was preempted"
+        for rid in preempted:
+            record = engine.requests[rid].record
+            assert len(record[-1].prompt_tokens) > len(prompts[rid]), (
+                f"request {rid} was checkpointed but its prompt did not grow, so "
+                f"the generated tokens were not carried across the preemption"
+            )
+
+        # Crossing preemption did not disturb the recurrent state.
+        self._assert_states_match(roomy_snaps, tight_snaps, min_shared=num_requests)
+        self._assert_mamba_slot_invariants(engine)
+
+        # --- Characterisation of a known bug, NOT of intended behaviour. ---
+        # DynamicInferenceRequestRecord.checkpoint() rebuilds the request without
+        # block_size_tokens or enable_prefix_caching, so __post_init__ skips hash
+        # computation and every prefix-caching branch downstream (which all guard
+        # on `req.precomputed_block_hashes`) turns itself off for the rest of that
+        # request's life. It therefore re-prefills its now-longer prompt in full,
+        # cannot match the blocks its own earlier incarnation registered and left
+        # cached at ref-zero, and registers nothing for anyone else.
+        #
+        # When checkpoint() is fixed to carry those two fields, this assertion
+        # flips: assert record[-1].precomputed_block_hashes, and the orphaned-slot
+        # check below should hold rather than being the thing that documents the
+        # leak.
+        for rid in preempted:
+            readmitted = engine.requests[rid].record[-1]
+            assert readmitted.precomputed_block_hashes == [], (
+                f"request {rid} kept its block hashes across a checkpoint -- if "
+                f"checkpoint() was fixed to carry block_size_tokens and "
+                f"enable_prefix_caching, invert this assertion and enable the "
+                f"orphaned-slot check below"
+            )
+            assert readmitted.enable_prefix_caching is False
+        self._assert_no_orphaned_slots(engine)
 
     @torch.inference_mode()
     def test_pause_mid_decode_output_equivalence(self):

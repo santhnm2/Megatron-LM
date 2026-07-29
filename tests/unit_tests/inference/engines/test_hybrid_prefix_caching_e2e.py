@@ -2244,7 +2244,10 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 engine._add_request(
                     self._make_request(i, prompt, enable_pc=True, num_tokens=generate)
                 )
-            outputs, snapshots, steps = {}, {}, 0
+            # The engine pops a request out of engine.requests the moment it
+            # finishes, so the records have to be captured here rather than read
+            # off the engine afterwards.
+            outputs, records, snapshots, steps = {}, {}, {}, 0
             while engine.has_unfinished_requests():
                 steps += 1
                 assert steps < 20000, (
@@ -2254,15 +2257,16 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
                 for record in engine.step_modern()["finished_request_records"]:
                     merged = record.merge()
                     outputs[merged.request_id] = list(merged.generated_tokens)
+                    records[merged.request_id] = record
                 self._snapshot_mamba_states(engine, snapshots, sample_every)
-            return outputs, snapshots, recorded, pin_stats["misses"], engine
+            return outputs, records, snapshots, recorded, pin_stats["misses"], engine
 
         roomy_stats, tight_stats = {}, {}
-        roomy_out, roomy_snaps, golden, _, roomy_engine = run(
+        roomy_out, _, roomy_snaps, golden, _, roomy_engine = run(
             num_requests * peak_blocks + 4, roomy_stats
         )
         assert golden, "the roomy run recorded no tokens to replay"
-        tight_out, tight_snaps, _, misses, engine = run(
+        tight_out, tight_records, tight_snaps, _, misses, engine = run(
             2 * peak_blocks + 1, tight_stats, golden=golden
         )
         assert misses == 0, (
@@ -2295,13 +2299,11 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         # Requests really were checkpointed, not merely re-queued: a checkpointed
         # request gets a fresh entry in its record, carrying prompt + generations.
         preempted = [
-            rid
-            for rid in range(num_requests)
-            if len(engine.requests[rid].record.requests) > 1
+            rid for rid in range(num_requests) if len(tight_records[rid].requests) > 1
         ]
         assert preempted, "no request record shows a checkpoint, so none was preempted"
         for rid in preempted:
-            record = engine.requests[rid].record
+            record = tight_records[rid]
             assert len(record[-1].prompt_tokens) > len(prompts[rid]), (
                 f"request {rid} was checkpointed but its prompt did not grow, so "
                 f"the generated tokens were not carried across the preemption"
@@ -2325,7 +2327,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
         # check below should hold rather than being the thing that documents the
         # leak.
         for rid in preempted:
-            readmitted = engine.requests[rid].record[-1]
+            readmitted = tight_records[rid][-1]
             assert readmitted.precomputed_block_hashes == [], (
                 f"request {rid} kept its block hashes across a checkpoint -- if "
                 f"checkpoint() was fixed to carry block_size_tokens and "

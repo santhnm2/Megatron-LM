@@ -1784,12 +1784,29 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
     # ------------------------------------------------- golden token replay
 
     @staticmethod
-    def _row_keys(ctx):
-        """(request id, sequence position) for each row the sampler returns."""
+    def _row_keys(ctx, before_update=False):
+        """(request id, tokens consumed) for each active row.
+
+        The position is the request's total token count *after* the step in
+        progress, which is what makes it comparable across runs that scheduled
+        the request differently. Where that count is read from depends on when:
+        ``update_requests`` advances ``request_kv_length_offsets`` by
+        ``request_query_lengths`` and then resets the query length to 1, so
+        before that the count is offset + query and after it is the offset alone.
+        Pass ``before_update`` at sampling time, which runs before the advance.
+
+        Keying on the offset alone at sampling time is wrong as soon as prefix
+        caching is in play. A request whose prefill skipped a cached prefix
+        starts its chunk at the skip rather than at zero, so the same request at
+        the same point in its sequence gets a different key depending on whether
+        the cache happened to hit -- which is precisely what differs between a
+        roomy run and a contended one.
+        """
         lo, hi = ctx.paused_request_count, ctx.total_request_count
-        return list(
-            zip(ctx.request_ids[lo:hi].tolist(), ctx.request_kv_length_offsets[lo:hi].tolist())
-        )
+        positions = ctx.request_kv_length_offsets[lo:hi]
+        if before_update:
+            positions = positions + ctx.request_query_lengths[lo:hi]
+        return list(zip(ctx.request_ids[lo:hi].tolist(), positions.tolist()))
 
     @classmethod
     def _pin_token_stream(cls, engine, golden=None):
@@ -1821,7 +1838,7 @@ class TestHybridPrefixCachingEvictionEquivalence(_HybridPCHelpers):
             # The dynamic path writes one token per active request into
             # _sampled_tokens_cuda, in the same order _row_keys enumerates.
             original_sample()
-            keys = cls._row_keys(ctx)
+            keys = cls._row_keys(ctx, before_update=True)
             n = len(keys)
             if n == 0:
                 return

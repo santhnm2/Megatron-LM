@@ -98,6 +98,20 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     assert a.block_routing == {}
 
 
+def test_reset_under_inference_mode_preserves_mutable_block_bag():
+    allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
+    original_block_bag = allocator.block_bag
+
+    with torch.inference_mode():
+        allocator.reset()
+
+    blocks = allocator.allocate_memory_blocks(1)
+    allocator.release_memory_blocks(blocks)
+
+    assert allocator.block_bag is original_block_bag
+    assert allocator.pool_avail == 7
+
+
 @pytest.mark.parametrize(
     "scope,paused,total,counts,expected_active,expected_paused",
     [

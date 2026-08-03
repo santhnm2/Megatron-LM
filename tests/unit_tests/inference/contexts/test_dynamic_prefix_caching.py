@@ -851,7 +851,10 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         """Same two requests, admitted through the scheduler instead: the
         request that would compute a hash already in flight never gets in, so
         registration never sees a duplicate and the map stays one-to-one."""
-        ctx = self._ctx(rounder=16, max_tokens=48, enable_chunked_prefill=True)
+        # max_tokens caps the per-step chunk at 1.5 blocks so A's first chunk ends
+        # mid-block; max_requests must not exceed it (block-table/CUDA-graph
+        # consistency check in DynamicInferenceContext).
+        ctx = self._ctx(rounder=16, max_tokens=48, max_requests=4, enable_chunked_prefill=True)
         bs = ctx.block_size_tokens
         alloc = ctx.kv_block_allocator
         engine = self._engine(ctx, enable_chunked_prefill=True)

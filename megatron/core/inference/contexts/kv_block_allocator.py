@@ -308,6 +308,11 @@ class KVBlockAllocator:
         overwrite its recorded parent while leaving the previous parent's child
         count raised, so that case is rejected rather than absorbed.
 
+        Offering a hash that a *different* block already owns is rejected too.
+        The scheduler is responsible for keeping hashes unique across blocks (see
+        ``pending_block_hashes``), and this method asserts that rather than
+        picking a winner.
+
         This method never touches reference counts. New blocks are pinned at
         ``ref_count == 1`` by ``allocate_memory_blocks``, and additional owners
         of an already registered block are pinned by the caller that matched it.
@@ -342,6 +347,22 @@ class KVBlockAllocator:
         assert not conflicting, "block re-registered under a different hash: " + ", ".join(
             f"block {block_ids[i]} holds {int(current_hashes[i])}, given {block_hashes[i]}"
             for i in conflicting
+        )
+        # A hash is owned by exactly one block. The map is the only way a block is
+        # found again, so a second block under the same hash leaves one of the two
+        # unreachable and lets whichever is deregistered first pop the other's
+        # entry. `claimed` also catches duplicates within this batch, which the
+        # map does not yet reflect.
+        claimed: Dict[int, int] = {}
+        duplicates = []
+        for i, (h, b) in enumerate(zip(block_hashes, block_ids)):
+            owner = self.kv_hash_to_block_id.get(h, claimed.get(h))
+            if owner is not None and owner != b:
+                duplicates.append((i, owner))
+            claimed.setdefault(h, b)
+        assert not duplicates, "hash already registered to a different block: " + ", ".join(
+            f"hash {block_hashes[i]} held by block {owner}, given block {block_ids[i]}"
+            for i, owner in duplicates
         )
         if already_registered.any():
             # Batch positions of the entries that still need registering. Every

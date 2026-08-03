@@ -623,6 +623,52 @@ def test_register_rejects_hash_change_on_a_registered_block():
     assert a.block_child_count[0].item() == 1
 
 
+def test_register_rejects_a_hash_another_block_already_owns():
+    """Two blocks under one hash leaves one of them unreachable (the map is the
+    only lookup path) and lets whichever is deregistered first pop the other's
+    entry. Registration rejects the second block rather than picking a winner,
+    and leaves the incumbent's state untouched."""
+    a = _lru_allocator()
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
+
+    with pytest.raises(AssertionError, match="hash already registered to a different block"):
+        a.register_kv_block_hashes(block_ids=[5], block_hashes=[20], parent_hashes=[10])
+
+    # Nothing moved: the incumbent still owns hash 20 and the chain is intact.
+    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
+    assert a.block_hashes[5].item() == -1
+    assert a.block_child_count[0].item() == 1
+    _assert_prefix_invariant(a)
+
+    # A batch that mixes a valid entry with a duplicate is rejected whole, so the
+    # valid entry is not half-applied.
+    with pytest.raises(AssertionError, match="hash already registered to a different block"):
+        a.register_kv_block_hashes(block_ids=[5, 6], block_hashes=[30, 20], parent_hashes=[20, 10])
+    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
+    assert a.block_hashes[5].item() == -1
+
+    # Once the incumbent is evicted the hash is free to be registered again.
+    assert a.evict_lru_blocks(1) is True
+    a.pool_avail -= 1
+    a.register_kv_block_hashes(block_ids=[5], block_hashes=[20], parent_hashes=[10])
+    assert a.kv_hash_to_block_id == {10: 0, 20: 5}
+    _assert_prefix_invariant(a)
+
+
+def test_register_rejects_the_same_hash_twice_within_one_batch():
+    """A hash repeated across two blocks of one batch is not yet in the map when
+    the batch is validated, so it needs its own check -- otherwise the second
+    block silently overwrites the first block's entry."""
+    a = _lru_allocator()
+
+    with pytest.raises(AssertionError, match="hash already registered to a different block"):
+        a.register_kv_block_hashes(
+            block_ids=[0, 1, 2], block_hashes=[10, 10, 20], parent_hashes=[0, 0, 10]
+        )
+    assert a.kv_hash_to_block_id == {}
+    assert a.block_hashes[torch.tensor([0, 1, 2])].tolist() == [-1, -1, -1]
+
+
 def test_evict_lru_asserts_on_cyclic_parent_graph():
     """The parent graph is assumed acyclic (a forest). A hash collision producing
     a cycle exposes no leaf, so the peel cannot collect enough blocks; this is a

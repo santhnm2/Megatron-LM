@@ -148,6 +148,19 @@ class PrefixCachingTestBase:
         return cached_block_id, cached_hash
 
     @staticmethod
+    def _assert_hash_map_is_one_to_one(alloc):
+        """Every registered block owns its hash outright: the map resolves that
+        hash back to the block, so no two blocks share one."""
+        registered = (alloc.block_hashes != -1).nonzero(as_tuple=True)[0].tolist()
+        for block_id in registered:
+            block_hash = alloc.block_hashes[block_id].item()
+            assert alloc.kv_hash_to_block_id.get(block_hash) == block_id, (
+                f"block {block_id} carries hash {block_hash}, which the map "
+                f"resolves to block {alloc.kv_hash_to_block_id.get(block_hash)}"
+            )
+        assert len(set(alloc.kv_hash_to_block_id.values())) == len(alloc.kv_hash_to_block_id)
+
+    @staticmethod
     def _mamba_allocate_and_register(ctx, bids):
         """Allocate Mamba cache slots and register hashes for a list of block IDs."""
         msa = ctx.mamba_slot_allocator
@@ -783,6 +796,104 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         engine.schedule_chunked_prefill()
         assert ctx.total_request_count == 1
         assert len(engine.waiting_request_ids) == 1 and engine._prefix_coordination_waits == 1
+
+    @pytest.mark.internal
+    def test_chunk_boundary_block_cannot_take_a_hash_another_request_owns(self):
+        """The sequence the scheduler exists to prevent, driven straight through
+        the context.
+
+        A request only prefix-matches block indices past the ones it has already
+        allocated, so the half-filled block it carries across a chunk boundary is
+        registered on the next chunk without ever being matched. If another
+        request completes and registers that same block meanwhile, the carried
+        block arrives at registration holding a hash it does not own -- which the
+        allocator rejects instead of silently mapping two blocks to one hash.
+        """
+        ctx = self._ctx(enable_chunked_prefill=True)
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+        prompt = self._prompt(bs * 3)
+        chunk_len = bs + bs // 2  # stops mid-block, so block 1 is carried over
+
+        # Chunk 1 of A: block 0 is complete and registered, block 1 is half full
+        # and carries no hash yet -- invisible to prefix matching.
+        req_a = self._req(ctx, prompt.clone(), request_id=1)
+        hashes = req_a.precomputed_block_hashes
+        ctx.chunked_prefill_request_id = req_a.request_id
+        ctx.add_request(req_a, prefill_chunk_length=chunk_len)
+        a_blocks = self._block_ids(ctx, 0, 2)
+        assert alloc.kv_hash_to_block_id == {hashes[0]: a_blocks[0]}
+        assert alloc.block_hashes[a_blocks[1]].item() == -1
+
+        # B shares the prompt and prefills it in one shot. It matches block 0, but
+        # computes block 1 itself and registers that hash to its own block.
+        req_b = self._req(ctx, prompt.clone(), request_id=2)
+        ctx.add_request(req_b)
+        b_blocks = self._block_ids(ctx, 1, 3)
+        assert b_blocks[1] != a_blocks[1]
+        assert alloc.kv_hash_to_block_id[hashes[1]] == b_blocks[1]
+        self._assert_hash_map_is_one_to_one(alloc)
+
+        # Hide A for its next chunk, as update_requests does between steps.
+        ctx.update_requests(
+            torch.tensor([1, 1], dtype=torch.int32, device='cpu'),
+            torch.tensor([99, 199], dtype=torch.int32, device='cpu'),
+        )
+
+        # Chunk 2 fills A's carried block and offers hash[1] for it -- B's hash.
+        req_a.remaining_prompt_tokens = req_a.remaining_prompt_tokens[chunk_len:]
+        req_a.finished_chunk_token_count = chunk_len
+        with pytest.raises(AssertionError, match="hash already registered to a different block"):
+            ctx.add_request(req_a, prefill_chunk_length=chunk_len)
+
+    @pytest.mark.internal
+    def test_chunked_prefill_scheduler_keeps_hashes_unique_across_blocks(self):
+        """Same two requests, admitted through the scheduler instead: the
+        request that would compute a hash already in flight never gets in, so
+        registration never sees a duplicate and the map stays one-to-one."""
+        ctx = self._ctx(rounder=16, max_tokens=48, enable_chunked_prefill=True)
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+        engine = self._engine(ctx, enable_chunked_prefill=True)
+        prompt = self._prompt(bs * 4)
+
+        req_a = self._req(ctx, prompt.clone(), request_id=1)
+        req_b = self._req(ctx, prompt.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req_a)
+        self._add_to_waiting(engine, ctx, req_b)
+
+        engine.schedule_chunked_prefill()
+
+        # A is admitted for one chunk that ends mid-block, so it holds a block
+        # with no hash of its own -- the window the duplicate would open in.
+        assert ctx.chunked_prefill_request_id == req_a.request_id
+        assert req_a.finished_chunk_token_count % bs != 0
+        carried_block = ctx.request_to_kv_block_ids[0][
+            req_a.finished_chunk_token_count // bs
+        ].item()
+        assert alloc.block_hashes[carried_block].item() == -1
+        # B, which would compute that same block, is not admitted alongside it.
+        assert ctx.total_request_count == 1
+        assert req_b.request_id in engine.waiting_request_ids
+        self._assert_hash_map_is_one_to_one(alloc)
+
+        # Step A to completion. Registration never trips on a duplicate, and the
+        # map stays one-to-one the whole way through.
+        for _ in range(8):
+            ctx.update_requests(
+                torch.ones(ctx.total_request_count, dtype=torch.int32, device='cpu'),
+                torch.full((ctx.total_request_count,), 99, dtype=torch.int32, device='cpu'),
+            )
+            engine.schedule_chunked_prefill()
+            self._assert_hash_map_is_one_to_one(alloc)
+            if req_b.request_id not in engine.waiting_request_ids:
+                break
+        else:
+            pytest.fail("B was never admitted")
+
+        # B ends up sharing A's cached blocks rather than duplicating them.
+        assert ctx.chunked_prefill_request_id == -1
+        assert req_b.num_cached_tokens > 0
 
 
 class TestMambaPrefixCaching(PrefixCachingTestBase):

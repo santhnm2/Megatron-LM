@@ -6,20 +6,27 @@
 
 Training and the static-batching inference path keep calling the pip
 `flash-linear-attention` kernels, which own the backward pass. Only the
-dynamic-batching decode and prefill steps route here:
+dynamic-batching decode and prefill steps route here, because those are the ones
+that must be CUDA-graph capturable and padding-aware:
 
-* `fused_recurrent_gated_delta_rule_update` -- decode.
-* `chunk_gated_delta_product_varlen` -- prefill.
+* `fused_recurrent` -- decode. Reads and writes the recurrent state in place at
+  slots named by `state_indices`.
+* `chunk` -- prefill. Takes precomputed chunk descriptors (see `metadata`)
+  instead of deriving them with a device-to-host sync, and writes the final
+  state in place.
 
-The fork is forward-only: the backward kernels, the `torch.autograd.Function`
-wrappers and the paths this caller never reaches (fixed-length batching, the
-non-gated delta rule, chunk lengths other than 64, the `gk` / `gv` gates) are
-dropped. What remains is upstream's code, unmodified -- same math, same
-autotune configurations, same host-synchronizing chunk-descriptor derivation.
-Making these kernels CUDA-graph capturable is a separate change on top.
+Both treat `-1` in the slot indices as a padding request: zero output, no state
+access. That is what lets a graph captured at a rounded-up batch shape replay
+correctly for a step with fewer real requests.
 """
 
 from .chunk import chunk_gated_delta_product_varlen
 from .fused_recurrent import fused_recurrent_gated_delta_rule_update
+from .metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
-__all__ = ["chunk_gated_delta_product_varlen", "fused_recurrent_gated_delta_rule_update"]
+__all__ = [
+    "chunk_gated_delta_product_varlen",
+    "fused_recurrent_gated_delta_rule_update",
+    "build_gdp_chunk_descriptors",
+    "max_gdp_chunk_counts",
+]

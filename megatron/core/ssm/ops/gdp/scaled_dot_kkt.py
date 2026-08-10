@@ -6,33 +6,18 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of that source tree.
 
-"""Strictly-lower-triangular `beta * K K^T` per chunk.
+"""Strictly lower-triangular `beta * K K^T` per chunk (the WY `A` matrix).
 
-This is the first half of building the WY representation of the chunk's
-transition matrix; `solve_tril` inverts `I + A` afterwards.
+Forked from `chunk_scaled_dot_kkt_fwd`. Changes: forward-only, varlen-only,
+no autotuning, and caller-supplied `chunk_indices`. See `cumsum.py` for why.
 """
 
 import torch
 
-from .common import HAVE_TRITON, exp, prepare_chunk_indices, tl, triton
+from .common import HAVE_TRITON, exp, tl, triton
 
 
-@triton.heuristics(
-    {
-        'USE_G': lambda args: args['g'] is not None,
-        'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['H', 'K', 'BT', 'IS_VARLEN'],
-)
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
     g,
@@ -45,20 +30,17 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
 ):
-    """Compute one chunk's `beta * K K^T`, masked to below the diagonal."""
+    """Compute the strictly lower-triangular block `A = tril(beta * K K^T, -1)`."""
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
+    i_h = i_bh % H
+    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    T = eos - bos
+
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
 
@@ -76,8 +58,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     if USE_G:
         p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
-        b_g_diff = b_g[:, None] - b_g[None, :]
-        b_A *= exp(b_g_diff)
+        b_A *= exp(b_g[:, None] - b_g[None, :])
     b_A *= b_b[:, None]
 
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
@@ -90,35 +71,19 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
-    g: torch.Tensor | None = None,
-    beta: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    chunk_size: int = 64,
+    g: torch.Tensor | None,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    chunk_size: int,
     output_dtype: torch.dtype = torch.float32,
-    chunk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute `beta * K K^T` per chunk, decayed by `g` and masked below the diagonal.
-
-    Args:
-        k: Keys `[B, T, H, K]`.
-        beta: Betas `[B, T, H]`.
-        g: Within-chunk cumulative log decays `[B, T, H]`, or `None`.
-        cu_seqlens: Sequence boundaries `[N+1]` for variable-length input.
-        chunk_size: Chunk length.
-        output_dtype: Result dtype.
-        chunk_indices: Precomputed chunk descriptors. Derived from `cu_seqlens`
-            when omitted, which synchronizes on the device.
-
-    Returns `[B, T, H, BT]`, the per-chunk lower-triangular block.
-    """
-    assert HAVE_TRITON, "chunk_scaled_dot_kkt_fwd requires Triton"
+    """Returns `beta * K K^T` of shape `[B, T, H, chunk_size]`."""
+    assert HAVE_TRITON, "Triton is required for the forked GDP prefill kernels."
     B, T, H, K = k.shape
-    BT = chunk_size
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
+    A = torch.empty(B, T, H, chunk_size, device=k.device, dtype=output_dtype)
+    grid = (chunk_indices.shape[0], B * H)
+    chunk_scaled_dot_kkt_fwd_kernel[grid](
         k=k,
         g=g,
         beta=beta,
@@ -128,6 +93,10 @@ def chunk_scaled_dot_kkt_fwd(
         T=T,
         H=H,
         K=K,
-        BT=BT,
+        BT=chunk_size,
+        BK=64,
+        USE_G=g is not None,
+        num_warps=4,
+        num_stages=3,
     )
     return A

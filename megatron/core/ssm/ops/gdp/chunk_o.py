@@ -6,48 +6,22 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of that source tree.
 
-"""Intra-chunk output for the Gated Delta Product.
+"""Output pass for the Gated Delta Product prefill.
 
-Combines the inter-chunk state from `chunk_h` with the causal within-chunk
-attention. The queries live on the unexpanded token stream while the keys and
-values live on the Householder-expanded one, so the within-chunk term is
-accumulated over the `num_householder` copies, each strided `H*K` (or `H*V`)
-apart.
+Forked from `chunk_gated_delta_product_fwd_o`. Changes: forward-only,
+varlen-only, no autotuning, caller-supplied `chunk_indices`, and the output is
+zero-initialized instead of upstream's `-inf` fill. The zero fill is the
+padding contract: token slots that belong to no sequence (the rounded-up tail of
+a CUDA-graph batch) are never written by any chunk program, so they must read
+back as zeros rather than `-inf`.
 """
 
 import torch
 
-from .common import (
-    HAVE_TRITON,
-    IS_NVIDIA_HOPPER,
-    check_shared_mem,
-    exp,
-    prepare_chunk_indices,
-    tl,
-    triton,
-)
-
-BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+from .common import HAVE_TRITON, exp, tl, triton
 
 
-@triton.heuristics(
-    {
-        'USE_G': lambda args: args['g'] is not None,
-        'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
-    key=['H', 'K', 'V', 'BT'],
-)
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
     k,
@@ -67,24 +41,17 @@ def chunk_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
 ):
-    """Emit one chunk of output from the chunk-boundary state plus local attention."""
+    """Inter-chunk contribution `q @ h` plus the intra-chunk attention term."""
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_h = i_bh % H
 
-    if IS_VARLEN:
-        i_tg = i_t
-        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-        NT = tl.cdiv(T, BT)
-    else:
-        NT = tl.cdiv(T, BT)
-        i_tg = i_b * NT + i_t
-        bos, eos = i_b * T, i_b * T + T
+    i_tg = i_t
+    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    T = eos - bos
 
     # offset calculation
     q += (bos * H + i_h) * K
@@ -156,60 +123,45 @@ def chunk_gated_delta_product_fwd_o(
     k: torch.Tensor,
     v: torch.Tensor,
     h: torch.Tensor,
-    g: torch.Tensor | None = None,
-    scale: float | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    chunk_size: int = 64,
-    num_householder: int = 1,
-    chunk_indices: torch.Tensor | None = None,
+    g: torch.Tensor | None,
+    scale: float,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    num_householder: int,
+    chunk_size: int,
 ) -> torch.Tensor:
-    """Compute the Gated Delta Product outputs.
-
-    Args:
-        q: Queries `[B, T, H, K]` on the unexpanded token stream.
-        k: Keys `[B, T*M, H, K]` on the Householder-expanded stream.
-        v: Corrected values `[B, T*M, H, V]` from `chunk_h`.
-        h: State at each chunk boundary, from `chunk_h`.
-        g: Within-chunk cumulative log decays `[B, T, H]`, or `None`.
-        scale: Score scale.
-        cu_seqlens: Sequence boundaries `[N+1]` on the unexpanded stream.
-        chunk_size: Chunk length.
-        num_householder: Number of Householder copies `M`.
-        chunk_indices: Precomputed chunk descriptors for the unexpanded stream.
-            Derived from `cu_seqlens` when omitted, which synchronizes on the
-            device.
-
-    Returns the outputs `[B, T, H, V]`.
-    """
-    assert HAVE_TRITON, "chunk_gated_delta_product_fwd_o requires Triton"
+    """Returns the prefill output of shape `[B, T, H, V]`, zero on padding."""
+    assert HAVE_TRITON, "Triton is required for the forked GDP prefill kernels."
+    B, T, H, K = q.shape
+    V = v.shape[-1]
     assert (
         q.shape[1] * num_householder == k.shape[1]
     ), "q.shape[1] * num_householder must be equal to k.shape[1]"
-    B, T, H, K, V = *q.shape, v.shape[-1]
-    BT = chunk_size
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    o = v.new_empty(B, T, H, V).fill_(-float('inf'))
 
-    def grid(meta):
-        return (triton.cdiv(V, meta['BV']), NT, B * H)
-
+    # Zeros, not empty: padded token positions belong to no chunk program.
+    o = v.new_zeros(B, T, H, V)
+    BK, BV = 64, 64
+    grid = (triton.cdiv(V, BV), chunk_indices.shape[0], B * H)
     chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
+        q=q,
+        k=k,
+        v=v,
+        h=h,
+        g=g,
+        o=o,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
         T=T,
         num_householder=num_householder,
         H=H,
         K=K,
         V=V,
-        BT=BT,
+        BT=chunk_size,
+        BK=BK,
+        BV=BV,
+        USE_G=g is not None,
+        num_warps=4,
+        num_stages=2,
     )
     return o

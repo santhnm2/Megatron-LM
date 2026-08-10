@@ -481,6 +481,49 @@ def gpt_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def _inference_optimized_hybrid_stack_spec(spec: Optional[list]) -> Any:
+    """Map a requested hybrid stack spec onto its inference-optimized twin.
+
+    `--transformer-impl inference_optimized` requires the stack to be built
+    from the inference-optimized linear layers, so the requested spec object
+    cannot be used directly. The mixer class is what identifies the variant, so
+    dispatch on that rather than on the spec's name: the name varies across
+    branches and checkpoints (`gdp_stack_spec`, `gated_delta_product_stack_spec`
+    and older pre-merge aliases), while the mixer does not.
+
+    Args:
+        spec: The `[module_path, name]` pair from `--spec`, or None.
+
+    Returns:
+        The matching inference-optimized `ModuleSpec`, or None if the request
+        has no equivalent (including when no spec was requested, in which case
+        the builder's own default applies).
+    """
+    if spec is None:
+        return None
+
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        gated_delta_product_inference_stack_spec,
+    )
+    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+
+    try:
+        requested = import_module(spec)
+    except ImportError as exc:
+        # Previously any spec was ignored outright under inference_optimized, so
+        # an unimportable one was harmless. Keep that tolerance rather than
+        # turning it into a new startup failure.
+        warnings.warn(f"Could not resolve --spec {spec}: {exc}", stacklevel=2)
+        return None
+
+    submodules = getattr(requested, "submodules", None)
+    mamba_layer = getattr(submodules, "mamba_layer", None)
+    mixer = getattr(getattr(mamba_layer, "submodules", None), "mixer", None)
+    if getattr(mixer, "module", None) is GatedDeltaProductMixer:
+        return gated_delta_product_inference_stack_spec
+    return None
+
+
 def hybrid_config_from_args(
     args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
 ) -> Any:
@@ -503,6 +546,22 @@ def hybrid_config_from_args(
         assert (
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
+        # The inference-optimized stack swaps in its own linear layers, so a
+        # user-provided spec cannot be used as given. Map a Gated Delta Product
+        # spec onto its inference-optimized equivalent rather than dropping it:
+        # falling back to the default would silently build Mamba2 mixers and
+        # surface much later as unexpected keys during checkpoint load.
+        inference_spec = _inference_optimized_hybrid_stack_spec(args.spec)
+        if inference_spec is not None:
+            kwargs["hybrid_stack_spec"] = inference_spec
+        elif args.spec is not None:
+            warnings.warn(
+                f"--spec {args.spec} is ignored with "
+                "--transformer-impl inference_optimized, which has no "
+                "inference-optimized equivalent for it; the default hybrid "
+                "inference stack spec will be used instead.",
+                stacklevel=2,
+            )
     elif args.spec is not None:
         kwargs["hybrid_stack_spec"] = import_module(args.spec)
 

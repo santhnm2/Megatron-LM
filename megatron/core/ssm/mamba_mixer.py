@@ -23,12 +23,12 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
 )
+from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
@@ -1257,6 +1257,17 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv_states_shape = (self.conv1d_weight.shape[0], self.d_conv)
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
         return (conv_states_shape, ssm_states_shape)
+
+    @property
+    def ssm_inference_chunk_size(self) -> int:
+        """Chunk length the dynamic-inference prefill kernels actually run at.
+
+        The Mamba2 SSD kernels run at the same chunk size for training and
+        inference, so this is just `chunk_size`. It exists so callers that need
+        a chunk-aligned boundary can ask every SSM mixer the same question --
+        Gated Delta Product answers 64 regardless of its `chunk_size`.
+        """
+        return self.chunk_size
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.

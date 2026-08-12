@@ -273,3 +273,69 @@ def _causal_conv1d_varlen_simple(
 
             result = acc * torch.sigmoid(acc)
             out[start + t] = result.to(out.dtype)
+
+
+def causal_conv1d_varlen_carry_states(
+    x: torch.Tensor, cu_seqlens: torch.Tensor, previous_states: torch.Tensor
+) -> torch.Tensor:
+    """Per-request conv state after appending a slice, carrying prior history.
+
+    `causal_conv1d_varlen_states` derives the new state from the slice alone,
+    right-aligning its last `d_conv` tokens and zero-filling the rest. That is
+    correct only while every slice is at least `d_conv` tokens long. Under
+    chunked prefill it is not: a prompt's final chunk can be as short as two
+    tokens, and zero-filling there silently drops the taps the next decode step
+    needs.
+
+    This carries `previous_states` into the gap instead: state column `k` holds
+    the token at offset `k - d_conv` from the slice start, taken from the slice
+    when that offset is non-negative and from the previous state otherwise. For
+    slices of at least `d_conv` tokens it reduces to the same answer.
+
+    Zero-length (padding) requests reproduce `previous_states` unchanged.
+
+    Every shape here is fixed by the padded request count and `d_conv`, and no
+    value crosses to the host, so this is safe to capture in a CUDA graph.
+
+    Args:
+        x: Packed slice tokens `(total_tokens, conv_dim)`.
+        cu_seqlens: Slice boundaries `(num_requests + 1,)`.
+        previous_states: Incoming per-request states `(num_requests, conv_dim,
+            d_conv)`, in the same request order as `cu_seqlens`.
+
+    Returns:
+        The updated states, `(num_requests, conv_dim, d_conv)`.
+    """
+    num_requests, conv_dim, d_conv = previous_states.shape
+    assert cu_seqlens.shape[0] == num_requests + 1, (
+        f"cu_seqlens describes {cu_seqlens.shape[0] - 1} requests but "
+        f"previous_states has {num_requests}"
+    )
+
+    total_tokens = x.shape[0]
+    if total_tokens == 0:
+        # Nothing to append, so every state is unchanged. Branching on a shape
+        # (not a value) keeps this safe to capture: a graph is captured at a
+        # fixed padded token count.
+        return previous_states.clone()
+
+    starts = cu_seqlens[:-1].to(torch.long)
+    lengths = cu_seqlens[1:].to(torch.long) - starts
+    columns = torch.arange(d_conv, device=x.device, dtype=torch.long)
+
+    # Offset of each state column from the slice start; negative means the token
+    # predates this slice and must come from the previous state.
+    offsets = lengths[:, None] - d_conv + columns[None, :]  # [N, d_conv]
+    from_slice = offsets >= 0
+
+    token_indices = (starts[:, None] + offsets).clamp_(0, total_tokens - 1)
+    slice_taps = x[token_indices].transpose(1, 2)  # [N, conv_dim, d_conv]
+
+    # offsets >= -d_conv always, so this lands in range; the clamp only guards
+    # the entries that `from_slice` discards.
+    previous_columns = (offsets + d_conv).clamp_(0, d_conv - 1)
+    previous_taps = previous_states.gather(
+        2, previous_columns[:, None, :].expand(num_requests, conv_dim, d_conv)
+    )
+
+    return torch.where(from_slice[:, None, :], slice_taps, previous_taps)

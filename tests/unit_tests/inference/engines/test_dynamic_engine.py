@@ -5949,7 +5949,14 @@ class TestChunkedPrefillCudaGraphs:
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        # FP32 recurrent state. Chunked prefill hands a request's recurrence
+        # through the state cache at every chunk boundary, while the baseline
+        # keeps it in the kernel's FP32 accumulator from start to finish. With a
+        # BF16 cache that round trip rounds the boundary value, and the two runs
+        # genuinely diverge -- the same reason batch-invariant mode forces FP32
+        # (see MambaInferenceStateConfig.from_model). Pinning FP32 here makes the
+        # comparison test the state plumbing rather than cache precision.
+        mamba_config = MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
 
         inference_config_kwargs = dict(
             max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,

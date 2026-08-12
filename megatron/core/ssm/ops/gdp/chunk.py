@@ -56,7 +56,8 @@ def chunk_gated_delta_product_varlen(
     state_indices: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-) -> torch.Tensor:
+    return_chunk_states: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Variable-length chunked Gated Delta Product forward pass.
 
     Args:
@@ -77,12 +78,19 @@ def chunk_gated_delta_product_varlen(
         state: `[S, H, K, V]` per-request state cache, updated in place at
             `state_indices`. `None` skips the state write.
         state_indices: `[N]` slot per sequence; `-1` marks a padding request.
-        initial_state: Optional dense `[N, H, K, V]` starting state. Fresh
-            prefills pass `None`; this is the hook prefix caching will use.
+        initial_state: Optional dense `[N, H, K, V]` starting state, used by
+            chunked prefill and prefix caching to resume a request.
         use_qk_l2norm_in_kernel: Whether to L2-normalize `q`/`k` first.
+        return_chunk_states: Also return the per-chunk states the scan passes
+            through, `[NT, H, K, V]`. Row `chunk_offsets[i] + c` is sequence
+            `i`'s state *entering* its chunk `c`, i.e. after its first `64 * c`
+            tokens -- which is the mid-sequence state prefix caching snapshots.
+            Note this differs from the Mamba2 chunk scan, whose raw states are
+            indexed by the chunk they come *out* of.
 
     Returns:
-        Outputs `[1, T, H, V]`, zero at padding token positions.
+        Outputs `[1, T, H, V]`, zero at padding token positions, or
+        `(outputs, chunk_states)` when `return_chunk_states` is set.
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -166,4 +174,7 @@ def chunk_gated_delta_product_varlen(
         num_householder=num_householder,
         chunk_size=CHUNK_SIZE,
     )
+    if return_chunk_states:
+        # h is [1, NT, H, K, V]; the extraction kernels index by chunk row.
+        return o, h.squeeze(0)
     return o

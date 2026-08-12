@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.ssm.ops.gdp.metadata import CHUNK_SIZE as GDP_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -59,19 +60,23 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
-        # compute_and_store_offsets() records extraction offsets on the
-        # model-wide SSM chunk quantum, but MambaMetadata converts those offsets
-        # to chunk indices with the Mamba kernel chunk size. The conversion is
-        # only valid when the quantum is a multiple of it -- which fails for a
-        # model whose only SSM layers are Gated Delta Product (quantum 64, no
-        # Mamba chunking to convert against). GDP prefix caching is not
-        # implemented yet; fail here rather than silently mis-index.
-        assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
-            "Mamba prefix caching requires an SSM chunk alignment that is a multiple of "
-            f"mamba_chunk_size ({context.mamba_chunk_size}); got "
-            f"{context.ssm_chunk_alignment}. Gated Delta Product prefix caching is not "
-            "supported yet."
-        )
+        # compute_and_store_offsets() records extraction offsets on the model-wide
+        # SSM chunk quantum, and each mixer converts those offsets to a row of its
+        # own per-chunk states using its own chunk size. That conversion is exact
+        # only if the quantum is a multiple of every such chunk size, which is why
+        # ssm_chunk_alignment is their LCM. Check it against the mixers the model
+        # actually has: mamba_chunk_size is a meaningless default on a model whose
+        # only SSM layers are Gated Delta Product.
+        if context.has_mamba_layers:
+            assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
+                "SSM chunk alignment must be a multiple of mamba_chunk_size "
+                f"({context.mamba_chunk_size}); got {context.ssm_chunk_alignment}."
+            )
+        if context.gdp_num_householder > 0:
+            assert context.ssm_chunk_alignment % GDP_CHUNK_SIZE == 0, (
+                f"SSM chunk alignment must be a multiple of the GDP chunk size "
+                f"({GDP_CHUNK_SIZE}); got {context.ssm_chunk_alignment}."
+            )
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.pool_size
 

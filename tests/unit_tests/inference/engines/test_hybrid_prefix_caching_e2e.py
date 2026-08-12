@@ -31,6 +31,7 @@ registration, skip counts) and output correctness (generated
 tokens match between pc=off and pc=on).
 """
 
+import math
 import os
 import random
 import types
@@ -116,6 +117,26 @@ def ssm_state_config(model):
     Serving still defaults to the model dtype; this is a test-side choice.
     """
     return MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
+
+
+def buffer_gb_for_kv_blocks(context, num_blocks):
+    """Buffer size that yields exactly `num_blocks` KV blocks for this context.
+
+    Without a `mamba_memory_ratio` the context sizes its block pool as
+    `buffer_bytes // (block_size_bytes + mamba_states_memory_per_request)`, so
+    the block count depends on how large a mixer's recurrent state is. A budget
+    tuned against Mamba2 gives a GDP model, whose state is several times
+    smaller, a correspondingly larger pool. Tests whose scenario depends on an
+    exact pool size therefore have to ask for blocks, not bytes.
+
+    The returned size lands mid-band so floor division cannot tip either way.
+    """
+    mamba_bytes_per_request = (
+        math.prod(context.mamba_conv_states_shape) * context.mamba_conv_states_dtype.itemsize
+        + math.prod(context.mamba_ssm_states_shape) * context.mamba_ssm_states_dtype.itemsize
+    ) * context.num_mamba_layers
+    bytes_per_block = context.block_size_bytes + mamba_bytes_per_request
+    return (bytes_per_block * num_blocks + bytes_per_block // 2) / 1024**3
 
 
 def set_rounder(value):
@@ -664,19 +685,24 @@ class TestMambaPrefixCachingE2E:
     def test_mamba_lru_eviction_e2e(self):
         """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block."""
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
         # Deliberately on the model dtype: this test asserts eviction behaviour,
-        # not token equality, and its 0.05 GB budget is tuned to a slot count that
-        # an FP32 state would halve.
+        # not token equality, and an FP32 state would shrink the pool it is tuned to.
+        mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_eviction_prompts()
 
+        # The scenario below is written against a 3-block pool: E takes two
+        # blocks, leaving exactly one, so F has to evict E's cached block. Ask
+        # for that pool size rather than hardcoding a byte budget, which would
+        # buy a different number of blocks for every mixer.
+        engine_kwargs = dict(
+            enable_prefix_caching=True, prefix_caching_mamba_gb=0.05, request_rounder=1
+        )
+        probe = self._build_engine(model, mamba_config, buffer_size_gb=0.002, **engine_kwargs)
+        buffer_size_gb = buffer_gb_for_kv_blocks(probe.context, 3)
+        del probe
+
         engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            buffer_size_gb=0.002,
-            prefix_caching_mamba_gb=0.05,
-            request_rounder=1,
+            model, mamba_config, buffer_size_gb=buffer_size_gb, **engine_kwargs
         )
         alloc = engine.context.kv_block_allocator
         ctx = engine.context

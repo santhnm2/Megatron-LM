@@ -58,6 +58,12 @@ class MambaInferenceStateConfig:
     chunked prefill splits anywhere, because each step re-chunks from its own
     slice start."""
 
+    has_mamba_layers: bool = True
+    """Whether the model has any Mamba2 layers, as opposed to only other SSM
+    variants. Lets consumers tell whether `mamba_chunk_size` describes a
+    chunking the model actually performs: on a GDP-only model it is an unused
+    default, since GDP carries its own descriptors."""
+
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
@@ -100,6 +106,7 @@ class MambaInferenceStateConfig:
             # collects all three chunk-related facts.
             mamba_chunk_size = None
             gdp_num_householder = 0
+            has_mamba_layers = False
             ssm_chunk_alignment = 1
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type != Symbols.MAMBA or not hasattr(layer, 'mixer'):
@@ -119,6 +126,8 @@ class MambaInferenceStateConfig:
                         f"{gdp_num_householder} and {num_householder}"
                     )
                     gdp_num_householder = num_householder
+                else:
+                    has_mamba_layers = True
                 # A boundary is only clean if it is clean for every mixer, so
                 # the alignment quantum is the LCM over the model's mixers.
                 # Falls back to chunk_size for any mixer predating the property.
@@ -138,6 +147,7 @@ class MambaInferenceStateConfig:
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
                 ssm_chunk_alignment=ssm_chunk_alignment,
+                has_mamba_layers=has_mamba_layers,
                 gdp_num_householder=gdp_num_householder,
             )
         return None

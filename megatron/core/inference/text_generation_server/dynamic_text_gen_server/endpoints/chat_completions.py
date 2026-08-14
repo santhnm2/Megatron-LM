@@ -401,14 +401,30 @@ try:
         message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
     ):
         """Runs CPU-intensive text parsing."""
-        meta = {}
         for parser in parsers_list:
             if parser not in PARSER_MAPPING:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
+        implicit_reasoning_end_markers = (
+            tuple(
+                marker
+                for parser_name in parsers_list
+                for marker in getattr(
+                    PARSER_MAPPING[parser_name], "implicit_reasoning_end_markers", ()
+                )
+            )
+            if tools_requested
+            else ()
+        )
+
+        meta = {}
+        for parser in parsers_list:
             prev_text = message_text
             parsed_text, new_info = PARSER_MAPPING[parser].parse(
-                message_text, tools=tools, chat_template_kwargs=chat_template_kwargs
+                message_text,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                implicit_reasoning_end_markers=implicit_reasoning_end_markers,
             )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
@@ -702,8 +718,11 @@ try:
         # at submit time (above) and drive both the response shape here and whether the
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
+        response_uid = None
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
+            if response_uid is None:
+                response_uid = result["uid"]
 
             text_output = result["generated_text"]
             # The engine always reports prompt_length (for usage), but drops the
@@ -789,12 +808,8 @@ try:
             if return_raw_text:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for
-            # NeMo-RL compatibility.
+            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
-            message["policy_epoch"] = result["policy_epoch"]
-            message["kv_cache_epoch"] = result["kv_cache_epoch"]
-            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -843,7 +858,7 @@ try:
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "id": response_uid,
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",

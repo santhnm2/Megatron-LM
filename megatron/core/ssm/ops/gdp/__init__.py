@@ -4,7 +4,7 @@
 # The modules in this package are forked from the Gated Delta Product kernels
 # in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention), licensed under the MIT
-# license. See the LICENSE file in this directory.
+# license. See the LICENSE file at the repository root.
 
 """Inference-only fork of the Gated Delta Product kernels from
 `flash-linear-attention <https://github.com/fla-org/flash-linear-attention>`_

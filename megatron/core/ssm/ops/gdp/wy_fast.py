@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_rule/wy_fast.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file at the repository root.
 
 """Recompute the WY representation (`w`, `u`) from the inverted `A`.
 

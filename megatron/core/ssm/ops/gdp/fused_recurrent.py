@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_rule/fused_recurrent.py` in flash-linear-attention
 # v0.5.1 (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file at the repository root.
 
 """Fused recurrent Gated Delta Rule step, used by the decode path.
 

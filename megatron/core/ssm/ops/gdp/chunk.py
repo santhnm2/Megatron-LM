@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_product/chunk.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file at the repository root.
 
 """Chunked Gated Delta Product prefill, forked for CUDA-graph-safe inference.
 

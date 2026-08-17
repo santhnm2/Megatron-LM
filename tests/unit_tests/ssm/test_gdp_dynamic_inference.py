@@ -20,23 +20,28 @@ at TP>1, covering dynamic inference under tensor + sequence parallelism; TP>1
 variants skip when the world has too few GPUs.
 
 The second half of the file drops below the model and covers the in-tree kernels
-the dynamic path runs on, and their CUDA-graph behaviour:
+the dynamic path runs on:
 
 1. `ops/gdp/fused_recurrent.py` -- the decode recurrence, against a naive
-   PyTorch reference, including slot-indexed state and `-1` padding slots.
+   PyTorch reference and against the pip FLA kernels, including slot-indexed
+   state and `-1` padding slots.
 2. `ops/gdp/metadata.py` -- the chunk descriptors that stand in for FLA's
    host-synchronizing `prepare_chunk_indices`.
 3. `ops/gdp/chunk.py` -- the chunked prefill, against the pip FLA kernels the
    training path runs on.
-4. `GatedDeltaProductMixer.ssm_decode` replayed from a CUDA graph captured at a
-   padded batch size, against the same call run eagerly.
+
+The two comparisons against pip FLA are the load-bearing ones. Everything that
+tests CUDA graphs end to end is differential -- the same kernels with capture on
+versus off -- so it cannot see a kernel that is wrong the same way in both arms.
+These anchor the in-tree kernels to an external reference; keep them across FLA
+version bumps.
 
 The padding contract is what makes CUDA graphs work: a graph is captured for a
 rounded-up batch shape, and steps with fewer real requests mark the leftover
 rows with `-1` in `batch_indices` (and, for prefill, as zero-length sequences).
 Those rows must produce zero output and must not read or write any state slot.
 
-Whole-model graph capture is covered separately, in
+Graph capture and replay itself is covered end to end, in
 `tests/unit_tests/inference/engines/test_gdp_cuda_graph_e2e.py`.
 """
 
@@ -95,18 +100,6 @@ except ImportError:
 # only the pieces they actually touch.
 HAVE_GDP_DEPS = HAVE_FLA and HAVE_MAMBA_DEPS
 
-try:
-    from megatron.core.extensions.transformer_engine import (
-        TELayerNormColumnParallelLinear,
-        TERowParallelLinear,
-    )
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixerSubmodules
-
-    HAVE_MIXER_DEPS = True
-except ImportError:
-    HAVE_MIXER_DEPS = False
-
 # GDP dynamic inference relies on the same packed-sequence conv1d kernel as the
 # training/prefill path (`causal_conv1d_fn(seq_idx=...)`, added in 1.4.0).
 _PACKING_OK, _PACKING_REASON = check_fla_sequence_packing_support()
@@ -129,13 +122,12 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 @pytest.fixture(scope="module")
 def gdp_kernel_distributed_environment():
-    """Bind every rank to its own GPU before anything allocates or captures.
+    """Bind every rank to its own GPU before anything allocates.
 
     `torch.cuda.set_device()` lives inside `Utils.initialize_distributed()`, so
-    without this each rank of a multi-rank run would allocate on GPU 0 and four
-    processes would capture CUDA graphs on the same device. Module-scoped (not
-    per-method) so the current device never changes mid-process, which would
-    strand earlier allocations and the graph memory pool on another GPU.
+    without this each rank of a multi-rank run would allocate on GPU 0. Module-
+    scoped (not per-method) so the current device never changes mid-process,
+    which would strand earlier allocations on another GPU.
 
     Requested explicitly by the kernel-level classes rather than `autouse`,
     because the model-level classes above manage `Utils` per method and would
@@ -751,30 +743,6 @@ def _gated_delta_rule_ref(q, k, v, g, beta, state, state_indices, use_qk_l2norm,
     return o
 
 
-def _capture(fn, restore):
-    """Warm up, capture `fn` into a CUDA graph, and undo warmup side effects.
-
-    `restore` maps a mutated tensor to the contents it should be reset to; the
-    warmup iterations run the real kernels (and so mutate the state caches),
-    while graph capture itself only records.
-    """
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            fn()
-    torch.cuda.current_stream().wait_stream(stream)
-    for tensor, contents in restore.items():
-        tensor.copy_(contents)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        static_out = fn()
-    for tensor, contents in restore.items():
-        tensor.copy_(contents)
-    return graph, static_out
-
-
 def _to_dev(values, shape):
     """Materialize a flat descriptor list as an int32 CUDA tensor."""
     return torch.tensor(values, device="cuda", dtype=torch.int32).view(*shape)
@@ -927,202 +895,6 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
 
         torch.testing.assert_close(out_fork, out_fla, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(state_fork, state_fla, atol=1e-4, rtol=1e-4)
-
-    def test_cuda_graph_capture_and_replay(self):
-        """Capture once at the padded size, replay with new data and new slots."""
-        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
-        indices = torch.tensor([7, 0, 3, 10, -1, -1], device="cuda", dtype=torch.int32)
-        state_init = state.clone()
-
-        def run():
-            out, _ = fused_recurrent_gated_delta_rule_update(
-                q,
-                k,
-                v,
-                state=state,
-                g=g,
-                beta=beta,
-                state_indices=indices,
-                use_qk_l2norm_in_kernel=True,
-            )
-            return out
-
-        graph, static_out = _capture(run, restore={state: state_init})
-
-        # Replay 1: same inputs as the eager reference.
-        state.copy_(state_init)
-        graph.replay()
-        torch.cuda.synchronize()
-        out_replay, state_replay = static_out.clone(), state.clone()
-
-        state_eager = state_init.clone()
-        out_eager = _gated_delta_rule_ref(q, k, v, g, beta, state_eager, indices, True)
-        torch.testing.assert_close(out_replay, out_eager, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(state_replay, state_eager, atol=1e-4, rtol=1e-4)
-
-        # Replay 2: new token data and a different number of padded rows, written
-        # into the same static buffers. This is what a decode step does.
-        q2, k2, v2, g2, beta2, _ = _random_inputs(**self.SHAPE, seed=7)
-        indices2 = torch.tensor([1, 4, -1, -1, -1, -1], device="cuda", dtype=torch.int32)
-        for dst, src in ((q, q2), (k, k2), (v, v2), (g, g2), (beta, beta2)):
-            dst.copy_(src)
-        indices.copy_(indices2)
-        state.copy_(state_init)
-        graph.replay()
-        torch.cuda.synchronize()
-
-        state_eager2 = state_init.clone()
-        out_eager2 = _gated_delta_rule_ref(q, k, v, g, beta, state_eager2, indices, True)
-        torch.testing.assert_close(static_out, out_eager2, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(state, state_eager2, atol=1e-4, rtol=1e-4)
-
-
-# --------------------------------------------------------------------------- #
-# Mixer-level tests
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.usefixtures("gdp_kernel_distributed_environment")
-@requires_cuda
-@pytest.mark.skipif(not HAVE_MIXER_DEPS, reason="GDP mixer requires transformer_engine")
-@pytest.mark.skipif(not HAVE_MAMBA_DEPS, reason="GDP mixer requires mamba_ssm + einops")
-@pytest.mark.skipif(not HAVE_FLA, reason="GDP mixer requires fla")
-class TestGDPCudaGraphDecode:
-    """`GatedDeltaProductMixer.ssm_decode` under CUDA-graph capture."""
-
-    NUM_SLOTS = 12
-    PADDED_REQUESTS = 6
-    REAL_REQUESTS = 4
-
-    def setup_method(self, method):
-        model_parallel_cuda_manual_seed(123)
-
-    def _build_mixer(self):
-        # Seed here, not just in setup_method: model_parallel_cuda_manual_seed
-        # derives per-rank seeds, so without this every rank builds a different
-        # mixer and the tests compare against different numerics per rank.
-        torch.manual_seed(1234)
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=64,
-            num_attention_heads=4,
-            num_query_groups=4,
-            ffn_hidden_size=128,
-            normalization="RMSNorm",
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            mamba_num_heads=4,
-            mamba_head_dim=16,
-            mamba_num_groups=4,
-            mamba_state_dim=16,
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        mixer = GatedDeltaProductMixer(
-            config=config,
-            submodules=GatedDeltaProductMixerSubmodules(
-                in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
-            ),
-            d_model=config.hidden_size,
-            layer_number=1,
-            pg_collection=pg_collection,
-            name="decoder.layers.0.mixer",
-        )
-        return mixer.cuda().bfloat16(), config
-
-    def _decode_inputs(self, mixer, num_requests, seed=0):
-        """Random decode-step activations plus fresh conv/SSM caches."""
-        torch.manual_seed(seed)
-        proj_dim = mixer.in_proj.weight.shape[0]
-        # `ssm_decode` takes the mixin's batch-first layout: [n, seq_len, proj_dim].
-        zVKQba = torch.randn(num_requests, 1, proj_dim, device="cuda", dtype=torch.bfloat16)
-        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
-        conv_state = torch.randn(self.NUM_SLOTS, *conv_shape, device="cuda", dtype=torch.bfloat16)
-        ssm_state = torch.randn(self.NUM_SLOTS, *ssm_shape, device="cuda", dtype=torch.bfloat16)
-        return zVKQba, conv_state, ssm_state
-
-    def test_padded_decode_matches_unpadded(self):
-        """Padding rows are inert: real rows and caches match a tight batch."""
-        mixer, _ = self._build_mixer()
-        padded, real = self.PADDED_REQUESTS, self.REAL_REQUESTS
-        zVKQba, conv_state, ssm_state = self._decode_inputs(mixer, padded)
-        indices = torch.full((padded,), -1, device="cuda", dtype=torch.int32)
-        indices[:real] = torch.tensor([5, 0, 9, 2], device="cuda", dtype=torch.int32)
-
-        conv_padded, ssm_padded = conv_state.clone(), ssm_state.clone()
-        conv_real, ssm_real = conv_state.clone(), ssm_state.clone()
-
-        with torch.no_grad():
-            y_padded = mixer.ssm_decode(zVKQba, conv_padded, ssm_padded, indices)
-            y_real = mixer.ssm_decode(zVKQba[:real], conv_real, ssm_real, indices[:real])
-
-        assert y_padded.shape == (padded, 1, y_real.shape[-1])
-        assert torch.count_nonzero(y_padded[real:]) == 0, "padded rows must be zeroed"
-        torch.testing.assert_close(y_padded[:real], y_real, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(conv_padded, conv_real, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(ssm_padded, ssm_real, atol=0, rtol=0, equal_nan=True)
-
-    def test_cuda_graph_replay_matches_eager(self):
-        """A graph captured at the padded size replays bit-identically."""
-        mixer, _ = self._build_mixer()
-        padded, real = self.PADDED_REQUESTS, self.REAL_REQUESTS
-        zVKQba, conv_state, ssm_state = self._decode_inputs(mixer, padded)
-        indices = torch.full((padded,), -1, device="cuda", dtype=torch.int32)
-        indices[:real] = torch.tensor([5, 0, 9, 2], device="cuda", dtype=torch.int32)
-
-        conv_init, ssm_init = conv_state.clone(), ssm_state.clone()
-
-        # Eager reference on copies of the caches.
-        conv_eager, ssm_eager = conv_init.clone(), ssm_init.clone()
-        with torch.no_grad():
-            y_eager = mixer.ssm_decode(zVKQba, conv_eager, ssm_eager, indices).clone()
-
-        with torch.no_grad():
-            graph, y_static = _capture(
-                lambda: mixer.ssm_decode(zVKQba, conv_state, ssm_state, indices),
-                restore={conv_state: conv_init, ssm_state: ssm_init},
-            )
-            graph.replay()
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(y_static, y_eager, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(conv_state, conv_eager, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(ssm_state, ssm_eager, atol=0, rtol=0, equal_nan=True)
-
-    def test_cuda_graph_replay_with_new_batch_composition(self):
-        """One captured graph serves decode steps with different real counts."""
-        mixer, _ = self._build_mixer()
-        padded = self.PADDED_REQUESTS
-        zVKQba, conv_state, ssm_state = self._decode_inputs(mixer, padded)
-        indices = torch.full((padded,), -1, device="cuda", dtype=torch.int32)
-        indices[:4] = torch.tensor([5, 0, 9, 2], device="cuda", dtype=torch.int32)
-
-        conv_init, ssm_init = conv_state.clone(), ssm_state.clone()
-        with torch.no_grad():
-            graph, y_static = _capture(
-                lambda: mixer.ssm_decode(zVKQba, conv_state, ssm_state, indices),
-                restore={conv_state: conv_init, ssm_state: ssm_init},
-            )
-
-        # A later step: different activations, different slots, fewer requests.
-        zVKQba_next, _, _ = self._decode_inputs(mixer, padded, seed=13)
-        indices_next = torch.full((padded,), -1, device="cuda", dtype=torch.int32)
-        indices_next[:2] = torch.tensor([3, 11], device="cuda", dtype=torch.int32)
-
-        conv_eager, ssm_eager = conv_init.clone(), ssm_init.clone()
-        with torch.no_grad():
-            y_eager = mixer.ssm_decode(zVKQba_next, conv_eager, ssm_eager, indices_next).clone()
-
-        zVKQba.copy_(zVKQba_next)
-        indices.copy_(indices_next)
-        conv_state.copy_(conv_init)
-        ssm_state.copy_(ssm_init)
-        graph.replay()
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(y_static, y_eager, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(conv_state, conv_eager, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(ssm_state, ssm_eager, atol=0, rtol=0, equal_nan=True)
-        assert torch.count_nonzero(y_static[:, 2:]) == 0, "padded rows must be zeroed"
 
 
 # --------------------------------------------------------------------------- #
@@ -1345,52 +1117,3 @@ class TestChunkGatedDeltaProductVarlen:
         torch.testing.assert_close(
             state_padded[untouched], state[untouched], atol=0, rtol=0, equal_nan=True
         )
-
-    def test_cuda_graph_replay_matches_eager(self):
-        """Capture at the padded shape, then replay with a different real batch."""
-        padded_lens = [96, 33, 0, 0]
-        padded_tokens = 192
-        q, k, v, g, beta, state, desc = _prefill_inputs(
-            padded_lens, padded_tokens=padded_tokens, **self.SHAPE
-        )
-        M = self.SHAPE["num_householder"]
-        slots = torch.tensor([5, 1, -1, -1], device="cuda", dtype=torch.int32)
-        state_init = state.clone()
-
-        def run():
-            out, _ = chunk_gated_delta_product_varlen(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
-                num_householder=M,
-                state=state,
-                state_indices=slots,
-                use_qk_l2norm_in_kernel=True,
-                **desc,
-            )
-            return out
-
-        state_eager = state_init.clone()
-        with torch.no_grad():
-            o_eager, _ = chunk_gated_delta_product_varlen(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
-                num_householder=M,
-                state=state_eager,
-                state_indices=slots,
-                use_qk_l2norm_in_kernel=True,
-                **desc,
-            ).clone()
-
-            graph, o_static = _capture(run, restore={state: state_init})
-            state.copy_(state_init)
-            graph.replay()
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(o_static, o_eager, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(state, state_eager, atol=0, rtol=0, equal_nan=True)

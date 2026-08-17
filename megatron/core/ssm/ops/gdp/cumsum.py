@@ -6,119 +6,64 @@
 #
 # Licensed under the MIT license; see the LICENSE file in this directory.
 
-"""Within-chunk cumulative sum of the scalar log decays.
+"""Within-chunk cumulative sum of the scalar (per-head) log decays.
 
 Only the scalar, non-reversed, variable-length path is provided -- the one the
-Gated Delta Product prefill calls.
+Gated Delta Product prefill calls. Two further changes make it CUDA-graph
+capturable: there is no autotuning (a fixed launch config, because autotuning
+benchmarks on first call and must not happen inside a capture), and
+`chunk_indices` is required from the caller rather than derived from
+`cu_seqlens` -- deriving it costs a device-to-host sync and yields a
+data-dependent size, both of which are fatal to graph capture.
 """
 
 import torch
 
-from .common import HAVE_TRITON, prepare_chunk_indices, tl, triton
+from .common import HAVE_TRITON, tl, triton
 
 
-@triton.heuristics(
-    {
-        'HAS_SCALE': lambda args: args['scale'] is not None,
-        'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    }
-)
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
-)
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_kernel(
-    s,
-    o,
-    scale,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    s, o, scale, cu_seqlens, chunk_indices, T, H: tl.constexpr, BT: tl.constexpr
 ):
-    """Cumulative sum within each chunk of a `[B, T, H]` scalar sequence."""
+    """Cumulative sum of `s` within each chunk, scaled by `scale`, written to `o`."""
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
+    i_h = i_bh % H
+    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    T = eos - bos
 
-    if HEAD_FIRST:
-        p_s = tl.make_block_ptr(s + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
-        p_o = tl.make_block_ptr(o + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    else:
-        p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    # [BT]
+    p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
-    b_o = tl.cumsum(b_s, axis=0)
-    if REVERSE:
-        b_z = tl.sum(b_s, axis=0)
-        b_o = -b_o + b_z[None] + b_s
-    if HAS_SCALE:
-        b_o *= scale
+    b_o = tl.cumsum(b_s, axis=0) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
 def chunk_local_cumsum(
     g: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
     chunk_size: int,
-    reverse: bool = False,
-    scale: float = None,
-    cu_seqlens: torch.Tensor | None = None,
-    head_first: bool = False,
-    output_dtype: torch.dtype | None = torch.float,
-    chunk_indices: torch.Tensor | None = None,
+    scale: float = 1.0,
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Cumulative sum of `g` within each chunk of length `chunk_size`.
-
-    Args:
-        g: Scalar sequence `[B, T, H]` (or `[B, H, T]` when `head_first`).
-        chunk_size: Chunk length; must be a power of two.
-        reverse: Accumulate from the end of each chunk instead of the start.
-        scale: Optional scale applied to the result.
-        cu_seqlens: Sequence boundaries `[N+1]` for variable-length input.
-        head_first: Whether `g` is laid out head-major.
-        output_dtype: Result dtype; `None` keeps `g`'s dtype.
-        chunk_indices: Precomputed chunk descriptors. Derived from `cu_seqlens`
-            when omitted, which synchronizes on the device.
-
-    Returns the cumulative sums, shaped like `g`.
-    """
-    assert HAVE_TRITON, "chunk_local_cumsum requires Triton"
-    if head_first:
-        B, H, T = g.shape
-    else:
-        B, T, H = g.shape
-    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be a power of 2"
-    BT = chunk_size
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    chunk_local_cumsum_scalar_kernel[(NT, B * H)](
-        s=g_org,
-        o=g,
+    """Chunk-local cumulative sum of `g` of shape `[B, T, H]`, scaled by `scale`."""
+    assert HAVE_TRITON, "Triton is required for the forked GDP prefill kernels."
+    B, T, H = g.shape
+    out = torch.empty_like(g, dtype=output_dtype)
+    grid = (chunk_indices.shape[0], B * H)
+    chunk_local_cumsum_scalar_kernel[grid](
+        s=g,
+        o=out,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
-        B=B,
         H=H,
-        BT=BT,
-        HEAD_FIRST=head_first,
-        REVERSE=reverse,
+        BT=chunk_size,
+        num_warps=2,
     )
-    return g
+    return out

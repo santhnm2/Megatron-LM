@@ -8,6 +8,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
+from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
 
 class MambaMetadata:
@@ -22,6 +23,7 @@ class MambaMetadata:
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
         decode_indices_dtype: torch.dtype = torch.int64,
+        gdp_num_householder: int = 0,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -38,6 +40,15 @@ class MambaMetadata:
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
             decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
+            gdp_num_householder (int): Number of Householder copies of the Gated
+                Delta Product layers, or 0 if the model has none. When non-zero,
+                the GDP chunk descriptors are allocated and maintained alongside
+                the Mamba ones. They are kept separate rather than derived from
+                the Mamba chunk metadata: the forked GDP kernels chunk at a fixed
+                64 tokens (independent of `mamba_chunk_size`), index chunks as
+                `(sequence, chunk-within-sequence)` pairs rather than by token
+                boundary, and additionally need a chunking of the Householder-
+                expanded stream, which no Mamba2 buffer describes.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
@@ -96,6 +107,22 @@ class MambaMetadata:
         self._seq_idx_for_varlen_buffer = torch.zeros(
             self.max_chunks, dtype=torch.int32, device=self.device
         )
+
+        # Gated Delta Product chunk descriptors (see the constructor docstring).
+        self.gdp_num_householder = gdp_num_householder
+        if gdp_num_householder > 0:
+            self.max_gdp_chunks, self.max_gdp_chunks_dp = max_gdp_chunk_counts(
+                max_tokens, max_requests, gdp_num_householder
+            )
+            self._gdp_chunk_indices_buffer = torch.zeros(
+                (self.max_gdp_chunks, 2), dtype=torch.int32, device=self.device
+            )
+            self._gdp_chunk_indices_dp_buffer = torch.zeros(
+                (self.max_gdp_chunks_dp, 2), dtype=torch.int32, device=self.device
+            )
+            self._gdp_chunk_offsets_buffer = torch.zeros(
+                max_requests + 1, dtype=torch.int32, device=self.device
+            )
 
         # Conv1d per-token metadata (request ID and request start position)
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
@@ -175,6 +202,11 @@ class MambaMetadata:
         self.seq_idx_for_varlen = None
         self.conv_seq_idx = None
         self.conv_seq_start = None
+
+        # Gated Delta Product chunk descriptor views
+        self.gdp_chunk_indices = None
+        self.gdp_chunk_indices_dp = None
+        self.gdp_chunk_offsets = None
 
         # Python-side precomputed values
         self.real_prefill_token_count = 0
@@ -331,6 +363,11 @@ class MambaMetadata:
                 torch.tensor(last_chunk_idx_list, dtype=torch.int32)
             )
             self.last_chunk_indices = self._last_chunk_indices_buffer[:padded_prefill_count]
+
+            if self.gdp_num_householder > 0:
+                self._fill_gdp_chunk_descriptors(
+                    cu_seqlens_all, padded_prefill_count, padded_token_count
+                )
 
             self._seq_idx_for_varlen_buffer[:padded_max_chunks].copy_(
                 torch.tensor(chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32)
@@ -517,6 +554,38 @@ class MambaMetadata:
             self._intermediate_real_count_buffer.fill_(0)
             self.intermediate_real_count = self._intermediate_real_count_buffer
 
+    def _fill_gdp_chunk_descriptors(
+        self, cu_seqlens_all: list, padded_prefill_count: int, padded_token_count: int
+    ) -> None:
+        """Build the GDP chunk descriptors and publish them as device views.
+
+        Runs on the host, outside any CUDA graph, and copies into persistent
+        buffers whose addresses a captured graph can bake in. The descriptor
+        lengths depend only on the padded batch shape, so a replayed graph sees
+        the same grid sizes it was captured with.
+
+        TODO(ksanthanam): fold these three small H2D copies into the coalesced
+        bookkeeping transfer in DynamicInferenceContext, as the Mamba chunk
+        metadata already does.
+        """
+        chunk_indices, chunk_indices_dp, chunk_offsets, num_chunks, num_chunks_dp = (
+            build_gdp_chunk_descriptors(
+                cu_seqlens_all, padded_prefill_count, self.gdp_num_householder, padded_token_count
+            )
+        )
+        self._gdp_chunk_indices_buffer[:num_chunks].copy_(
+            torch.tensor(chunk_indices, dtype=torch.int32).view(num_chunks, 2)
+        )
+        self._gdp_chunk_indices_dp_buffer[:num_chunks_dp].copy_(
+            torch.tensor(chunk_indices_dp, dtype=torch.int32).view(num_chunks_dp, 2)
+        )
+        self._gdp_chunk_offsets_buffer[: padded_prefill_count + 1].copy_(
+            torch.tensor(chunk_offsets, dtype=torch.int32)
+        )
+        self.gdp_chunk_indices = self._gdp_chunk_indices_buffer[:num_chunks]
+        self.gdp_chunk_indices_dp = self._gdp_chunk_indices_dp_buffer[:num_chunks_dp]
+        self.gdp_chunk_offsets = self._gdp_chunk_offsets_buffer[: padded_prefill_count + 1]
+
     def compute_cpu_metadata(
         self,
         active_mamba_indices: torch.Tensor,
@@ -651,6 +720,8 @@ class MambaMetadata:
                 chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32
             )
             result["padded_max_chunks"] = padded_max_chunks
+            if self.gdp_num_householder > 0:
+                result["gdp_cu_seqlens_all"] = cu_seqlens_all
 
             # Conv1d per-token metadata (CPU repeat_interleave).
             conv_seq_idx_view = bufs['conv_seq_idx']
@@ -719,6 +790,11 @@ class MambaMetadata:
             self.seq_idx_for_varlen = v.mamba_seq_idx_for_varlen[:padded_max_chunks]
             self.conv_seq_idx = v.mamba_conv_seq_idx[:padded_token_count]
             self.conv_seq_start = v.mamba_conv_seq_start[:padded_token_count]
+
+            if self.gdp_num_householder > 0:
+                self._fill_gdp_chunk_descriptors(
+                    d["gdp_cu_seqlens_all"], padded_prefill_count, padded_token_count
+                )
 
             # Intermediate metadata reads from the just-transferred cu_seqlens
             # to compute chunk indices & absolute positions for state extraction.

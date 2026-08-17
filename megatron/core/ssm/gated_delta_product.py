@@ -691,7 +691,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # state and no scatter of the final state. Padding slots (-1) produce
         # zero output and leave the cache untouched. `batch_indices=None` maps
         # batch position `i` to slot `i`, which is the static-batching layout.
-        core_attn_out = fused_recurrent_gated_delta_rule_update(
+        # `ssm_state` is updated in place, so the returned final state is that
+        # same tensor and is discarded here.
+        core_attn_out, _ = fused_recurrent_gated_delta_rule_update(
             query,
             key,
             value,
@@ -723,12 +725,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         requests start from a zero recurrent state (no prefix caching in the MVP);
         the resulting final conv/SSM states are written back into the caches.
 
-        This runs entirely on the forked kernels: precomputed chunk descriptors
-        and per-token conv metadata replace the host synchronization and
-        data-dependent shapes of the pip FLA / causal_conv1d entry points, so the
-        whole step is CUDA-graph capturable. Padding requests are zero-length
-        sequences with a `-1` state slot; they produce zero output and touch no
-        state."""
+        The whole step is CUDA-graph capturable: it runs on the in-tree kernels,
+        which take precomputed chunk descriptors and per-token conv metadata and
+        so need neither a host synchronization nor a data-dependent shape.
+        Padding requests are zero-length sequences with a `-1` state slot; they
+        produce zero output and touch no state."""
         assert (
             not context.is_chunked_prefill_enabled()
         ), "GDP dynamic inference does not support chunked prefill yet."
@@ -803,7 +804,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # Forked chunk kernels: the final per-request state is written straight
         # into the cache at `batch_indices` (skipping -1 padding slots), so no
         # scatter is needed afterwards.
-        core_attn_out = chunk_gated_delta_product_varlen(
+        core_attn_out, _ = chunk_gated_delta_product_varlen(
             query,
             key,
             value,

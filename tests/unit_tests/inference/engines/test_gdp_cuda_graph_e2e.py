@@ -2,8 +2,8 @@
 
 """End-to-end CUDA graph test for a Gated Delta Product hybrid model.
 
-The kernel-level tests in `tests/unit_tests/ssm/test_gdp_cuda_graph.py` cover
-the forked kernels in isolation. This one drives a real GDP model through
+The kernel-level tests in `tests/unit_tests/ssm/test_gdp_dynamic_inference.py`
+cover the in-tree kernels in isolation. This one drives a real GDP model through
 `DynamicInferenceEngine` so the parts those tests cannot reach are exercised:
 the GDP chunk descriptors built by `MambaMetadata` each step, their plumbing
 through `MambaInferenceStateConfig.gdp_num_householder`, and graph capture of

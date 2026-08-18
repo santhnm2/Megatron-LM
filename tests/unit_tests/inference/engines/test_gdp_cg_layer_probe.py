@@ -86,8 +86,13 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
 
             try:
                 enable_batch_invariant_mode(backend="triton")
-            except (RuntimeError, ValueError) as exc:
+            except (RuntimeError, ValueError, ImportError) as exc:
                 pytest.skip(f"batch-invariant mode unavailable: {exc}")
+        print(
+            f"\n########## GEMM mode: "
+            f"{'BATCH-INVARIANT (triton)' if batch_invariant else 'default (cuBLAS/TE)'} "
+            f"##########"
+        )
         try:
             self._compare_arms()
         finally:

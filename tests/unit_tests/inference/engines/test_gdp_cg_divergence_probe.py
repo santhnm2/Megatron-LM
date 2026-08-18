@@ -58,28 +58,50 @@ class TestGDPDivergenceProbe(TestGDPCudaGraphE2E):
     def test_cuda_graphs_do_not_change_generated_tokens(self, *args, **kwargs):
         """Neutralised so the probe runs on its own."""
 
+    @pytest.mark.parametrize("stagger", [False, True], ids=["uniform", "mixed_steps"])
     @torch.inference_mode()
-    def test_locate_first_divergence(self):
+    def test_locate_first_divergence(self, stagger):
         model = self._create_model()
         prompts = self._create_prompts()
 
-        arms = {}
+        arms, pending = {}, {}
         for label, ngraphs in (("eager", None), ("graph", NUM_CUDA_GRAPHS)):
             engine = self._build_engine(model, num_cuda_graphs=ngraphs)
-            for i, prompt in enumerate(prompts):
+            initial = prompts[:2] if stagger else prompts
+            for i, prompt in enumerate(initial):
                 engine._add_request(self._make_request(i, prompt))
             arms[label] = engine
+            # Each arm reaches decode on its own step, so it owns its own
+            # trigger state; the e2e test's `_run` does the same per engine.
+            pending[label] = list(enumerate(prompts))[2:] if stagger else []
 
         tokens = {"eager": {}, "graph": {}}
         first_bad_token_step = None
         first_bad_state_step = None
 
         step = 0
-        while any(e.has_unfinished_requests() for e in arms.values()):
+        while any(e.has_unfinished_requests() for e in arms.values()) or any(pending.values()):
             step += 1
             pre_slots, post = {}, {}
             for label, engine in arms.items():
+                # Same release rule as the e2e test: add the held-back requests
+                # once this arm's previous step was decode-only.
+                dims = getattr(engine.context, "batch_dimensions", None)
+                if (
+                    pending[label]
+                    and dims is not None
+                    and dims.prefill_req_count == 0
+                    and dims.decode_req_count > 0
+                ):
+                    for i, prompt in pending[label]:
+                        engine._add_request(self._make_request(i, prompt))
+                    pending[label] = []
+
                 pre_slots[label] = _request_to_slot(engine)
+                if not engine.has_unfinished_requests():
+                    # This arm has drained; the other may still be running.
+                    post[label] = None
+                    continue
                 result = engine.step_modern()
                 tokens[label].update(_tokens(engine, result))
                 ctx = engine.context
@@ -91,13 +113,17 @@ class TestGDPDivergenceProbe(TestGDPCudaGraphE2E):
                     ssm=ctx.mamba_ssm_states,
                 )
 
-            print(
-                f"\n=== step {step} ===\n"
-                f"  eager: dims={post['eager']['dims']} padded={post['eager']['padded']} "
-                f"graphed={post['eager']['graphed']}\n"
-                f"  graph: dims={post['graph']['dims']} padded={post['graph']['padded']} "
-                f"graphed={post['graph']['graphed']}"
-            )
+            print(f"\n=== step {step} ===")
+            for label in ("eager", "graph"):
+                if post[label] is None:
+                    print(f"  {label}: drained")
+                else:
+                    print(
+                        f"  {label}: dims={post[label]['dims']} "
+                        f"padded={post[label]['padded']} graphed={post[label]['graphed']}"
+                    )
+            if post["eager"] is None or post["graph"] is None:
+                continue
 
             shared = sorted(set(tokens["eager"]) & set(tokens["graph"]))
             for rid in shared:
@@ -135,6 +161,18 @@ class TestGDPDivergenceProbe(TestGDPCudaGraphE2E):
                 if not token_ok:
                     at = next(i for i in range(n) if te[i] != tg[i])
                     print(f"      first token diff at index {at}: {te[at]} vs {tg[at]}")
+
+        print("\n=== final token comparison ===")
+        for rid in sorted(set(tokens["eager"]) & set(tokens["graph"])):
+            te, tg = tokens["eager"][rid], tokens["graph"][rid]
+            if te == tg:
+                print(f"  req {rid}: identical ({len(te)} tokens)")
+                continue
+            if first_bad_token_step is None:
+                first_bad_token_step = ("post-loop", rid)
+            n = min(len(te), len(tg))
+            at = next((i for i in range(n) if te[i] != tg[i]), n)
+            print(f"  req {rid}: DIVERGED at index {at}\n    eager: {te}\n    graph: {tg}")
 
         print(
             f"\n=== verdict ===\n"

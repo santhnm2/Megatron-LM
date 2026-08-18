@@ -45,22 +45,42 @@ def _first(x):
 
 
 def _attach(model, store):
-    """Record each decoder layer's input and output hidden states."""
-    handles = []
-    for i, layer in enumerate(model.decoder.layers):
+    """Record input/output hidden states for every module outside the captured layers.
 
-        def pre_hook(module, args, i=i):
+    Submodules *inside* a decoder layer are skipped on purpose: with
+    `cuda_graph_impl="local"` a captured layer replays kernels without running
+    Python, so their hooks never fire in the graph arm and the comparison would
+    silently drop them. The layers themselves are hooked at their boundary
+    (`nn.Module._call_impl` runs hooks before `CudaGraphManager` takes over), and
+    everything after the last layer -- the final norm and the output layer --
+    runs eagerly in both arms.
+    """
+    handles = []
+
+    def add(name, module):
+        def pre_hook(module, args, name=name):
             t = _first(args)
             if t is not None:
-                store[f"layer{i}.in"] = t.detach().float().clone()
+                store[f"{name}.in"] = t.detach().float().clone()
 
-        def post_hook(module, args, output, i=i):
+        def post_hook(module, args, output, name=name):
             t = _first(output)
             if t is not None:
-                store[f"layer{i}.out"] = t.detach().float().clone()
+                store[f"{name}.out"] = t.detach().float().clone()
 
-        handles.append(layer.register_forward_pre_hook(pre_hook))
-        handles.append(layer.register_forward_hook(post_hook))
+        handles.append(module.register_forward_pre_hook(pre_hook))
+        handles.append(module.register_forward_hook(post_hook))
+
+    for i, layer in enumerate(model.decoder.layers):
+        add(f"2_layer{i}", layer)
+
+    for name, module in model.named_modules():
+        if not name or ".layers." in name or name.endswith(".layers"):
+            continue
+        # Sort key prefix so the report reads in rough execution order.
+        prefix = "1_" if "embedding" in name else ("3_" if "decoder" != name else "2z_")
+        add(f"{prefix}{name}", module)
+
     return handles
 
 
@@ -100,9 +120,18 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
                 disable_batch_invariant_mode()
 
     def _compare_arms(self):
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
+
         model = self._create_model()
         prompts = self._create_prompts()[:2]
         assert [len(p) for p in prompts] == PROMPT_LENS
+        print(
+            f"  batch_invariant_enabled={is_batch_invariant_mode_enabled()}  "
+            f"output_layer={type(model.output_layer).__name__}  "
+            f"logit_scale={getattr(model, 'logit_scale', None)}"
+        )
 
         acts, logits = {}, {}
         for label, ngraphs in (("eager", None), ("graph", NUM_CUDA_GRAPHS)):
@@ -127,8 +156,12 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             all_logits = engine.controller._all_logits_cuda
             logits[label] = all_logits[0, :REAL_TOKENS].float().clone()
 
-        print("\n=== per-layer divergence over the 199 real token positions ===")
-        print("  (layer 0 = GDP/mamba, layer 1 = attention, layer 2 = MLP)")
+        print("\n=== per-module divergence over the 199 real token positions ===")
+        print("  (2_layer0 = GDP/mamba, 2_layer1 = attention, 2_layer2 = MLP)")
+        only_eager = sorted(set(acts["eager"]) - set(acts["graph"]))
+        only_graph = sorted(set(acts["graph"]) - set(acts["eager"]))
+        if only_eager or only_graph:
+            print(f"  NOT COMPARED (one arm only): eager={only_eager} graph={only_graph}")
         first_bad = None
         for name in sorted(set(acts["eager"]) & set(acts["graph"])):
             a = acts["eager"][name][:REAL_TOKENS]

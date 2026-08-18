@@ -71,8 +71,30 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
     def test_cuda_graphs_do_not_change_generated_tokens(self, *args, **kwargs):
         """Neutralised so the probe runs on its own."""
 
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["cublas", "batchinv"])
     @torch.inference_mode()
-    def test_locate_divergent_layer(self):
+    def test_locate_divergent_layer(self, batch_invariant):
+        if batch_invariant:
+            # Global GEMM mode only. `config.batch_invariant_mode` is a different,
+            # stronger switch that routes Mamba decode through
+            # MambaBatchInvariantDecode, which GDP does not implement.
+            # backend="triton" avoids requiring DeepGEMM bf16 bindings.
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                disable_batch_invariant_mode,
+                enable_batch_invariant_mode,
+            )
+
+            try:
+                enable_batch_invariant_mode(backend="triton")
+            except (RuntimeError, ValueError) as exc:
+                pytest.skip(f"batch-invariant mode unavailable: {exc}")
+        try:
+            self._compare_arms()
+        finally:
+            if batch_invariant:
+                disable_batch_invariant_mode()
+
+    def _compare_arms(self):
         model = self._create_model()
         prompts = self._create_prompts()[:2]
         assert [len(p) for p in prompts] == PROMPT_LENS

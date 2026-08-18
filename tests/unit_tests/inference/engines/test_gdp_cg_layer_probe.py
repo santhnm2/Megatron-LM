@@ -70,6 +70,37 @@ def _align(a, b, n):
     return a.narrow(axis, 0, n), b.narrow(axis, 0, n), axis
 
 
+class _ManagerPatch:
+    """Record every captured layer's output by patching `CudaGraphManager.__call__`.
+
+    `cudagraph_manager` is itself an `nn.Module`, so it cannot be swapped for a
+    plain callable -- `nn.Module.__setattr__` rejects a non-Module over a child
+    module. Patch the class once instead and dispatch on the calling layer's id.
+    """
+
+    def __init__(self, layers, store):
+        from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+        self.cls = CudaGraphManager
+        self.orig = CudaGraphManager.__call__
+        self.names = {id(layer): f"2_layer{i}.out" for i, layer in enumerate(layers)}
+        orig, names = self.orig, self.names
+
+        def patched(manager, megatron_module, args, kwargs, cache_key=None):
+            out = orig(manager, megatron_module, args, kwargs, cache_key)
+            name = names.get(id(megatron_module))
+            t = _first(out)
+            if name is not None and t is not None:
+                store[name] = t.detach().float().clone()
+            return out
+
+        CudaGraphManager.__call__ = patched
+
+    def remove(self):
+        """Match the `handle.remove()` interface used for hooks."""
+        self.cls.__call__ = self.orig
+
+
 def _attach(model, store):
     """Record input/output hidden states for every module outside the captured layers.
 
@@ -99,6 +130,12 @@ def _attach(model, store):
 
     for i, layer in enumerate(model.decoder.layers):
         add(f"2_layer{i}", layer)
+    # Post-hooks do not fire in the graph arm, so a captured layer's output has to
+    # be taken where Python still runs: `TransformerLayer.forward` calls
+    # `self.cudagraph_manager(...)` on every step (the manager decides capture vs
+    # replay) and returns its result.
+    if any(hasattr(layer, "cudagraph_manager") for layer in model.decoder.layers):
+        handles.append(_ManagerPatch(model.decoder.layers, store))
 
     for name, module in model.named_modules():
         if not name or ".layers." in name or name.endswith(".layers"):

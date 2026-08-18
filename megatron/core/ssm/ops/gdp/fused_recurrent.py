@@ -41,8 +41,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     state_indices,
     state_slot_stride,
     state_head_stride,
-    state_k_stride,
-    state_v_stride,
     cu_seqlens,
     scale,
     T,
@@ -71,42 +69,18 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_n * T, i_n * T + T
-
-    o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-
-    p_o = o + (bos * HV + i_hv) * V + o_v
-
-    # Dynamic batching addresses a persistent per-request cache by slot; static
+    # Dynamic batching addresses a persistent per-request cache by slot; a
+    # padding request carries -1, reads no state and writes none. Static
     # batching keeps the dense layout, where request i owns row i.
     if HAS_STATE_INDICES:
         i_s = tl.load(state_indices + i_n).to(tl.int64)
+        state_offset = i_s * state_slot_stride + i_hv * state_head_stride
     else:
         i_s = i_n
+        state_offset = i_nh * K * V
 
-    # A padding request (-1) owns no slot. Return before the recurrence runs:
-    # its inputs are whatever the padded buffer held, so the outputs are zeroed
-    # here rather than computed and masked afterwards, and no state is touched.
-    if i_s < 0:
-        for _ in tl.range(0, T):
-            tl.store(p_o, 0.0, mask=mask_v)
-            p_o += HV * V
-        return
-
-    if HAS_STATE_INDICES:
-        # Address the cache through its own strides; the last two dimensions are
-        # not guaranteed contiguous.
-        state_offset = (
-            i_s * state_slot_stride
-            + i_hv * state_head_stride
-            + o_k[:, None] * state_k_stride
-            + o_v[None, :] * state_v_stride
-        )
-    else:
-        state_offset = i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
 
     p_q = q + (bos * H + i_h) * K + o_k
     p_k = k + (bos * H + i_h) * K + o_k
@@ -118,9 +92,15 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     else:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
 
+    p_o = o + (bos * HV + i_hv) * V + o_v
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        p_h0 = h0 + state_offset
+    if USE_INITIAL_STATE and i_s >= 0:
+        p_h0 = h0 + state_offset + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in tl.range(0, T):
@@ -153,8 +133,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta += HV * (1 if IS_BETA_HEADWISE else V)
         p_o += HV * V
 
-    if STORE_FINAL_STATE:
-        p_ht = ht + state_offset
+    if STORE_FINAL_STATE and i_s >= 0:
+        p_ht = ht + state_offset + o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -190,8 +170,7 @@ def fused_recurrent_gated_delta_rule_update(
             `initial_state` / `output_final_state`, which gather and scatter a
             dense state instead.
         state_indices: `[N]` cache slot per sequence; `-1` marks a padding
-            request, whose output is zeroed in-kernel and whose state is left
-            untouched -- the recurrence does not run for it at all.
+            request, whose output is zeroed and whose state is untouched.
 
     Returns `(o, final_state)` with `o` shaped like `v`. When `state` is given,
     `final_state` is that same cache tensor, updated in place.
@@ -237,8 +216,6 @@ def fused_recurrent_gated_delta_rule_update(
         state_indices=state_indices,
         state_slot_stride=state.stride(0) if state is not None else 0,
         state_head_stride=state.stride(1) if state is not None else 0,
-        state_k_stride=state.stride(2) if state is not None else 0,
-        state_v_stride=state.stride(3) if state is not None else 0,
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
@@ -253,4 +230,9 @@ def fused_recurrent_gated_delta_rule_update(
         num_warps=1,
         num_stages=3,
     )
+    if state_indices is not None:
+        # A padding row's recurrence ran over whatever the padded input buffer
+        # held, so its output is overwritten rather than merely left unwritten:
+        # the contract is zero, and a stale inf/NaN would survive a mask.
+        o = o.masked_fill((state_indices < 0).view(-1, *([1] * (o.ndim - 1))), 0)
     return o, final_state

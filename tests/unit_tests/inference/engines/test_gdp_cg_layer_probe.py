@@ -207,9 +207,10 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             if batch_invariant:
                 disable_batch_invariant_mode()
 
+    @pytest.mark.parametrize("pin_num_splits", [False, True], ids=["plain", "numsplits1"])
     @pytest.mark.parametrize("fa_version", [3, 4], ids=["fa3", "fa4"])
     @torch.inference_mode()
-    def test_attention_batch_invariant(self, fa_version):
+    def test_attention_batch_invariant(self, fa_version, pin_num_splits):
         """Turn on `config.batch_invariant_mode` and see whether attention settles.
 
         `attention.py:320` reads the flag, and every FA3/FA4 call site then passes
@@ -248,9 +249,12 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             print(f"  batch_invariant_mode set on {patched} module(s)")
             assert patched > 0, "no attention module exposed batch_invariant_mode"
 
-        print(f"\n########## attention batch-invariant, FA{fa_version} ##########")
+        print(
+            f"\n########## FA{fa_version}, num_splits="
+            f"{1 if pin_num_splits else 0} ##########"
+        )
         with _config_overrides(dict(flash_attention_version=fa_version)):
-            self._compare_arms(post_build=enable_on_attention)
+            self._compare_arms(post_build=enable_on_attention if pin_num_splits else None)
 
     @torch.inference_mode()
     def test_eager_shape_sensitivity(self):

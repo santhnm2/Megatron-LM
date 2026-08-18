@@ -224,27 +224,33 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
         already bit-exact -- path.
         """
         from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            te_supports_batch_invariant_attention,
-        )
-        from megatron.core.transformer.enums import AttnBackend
 
         if fa_version == 3 and not HAVE_FA3:
             pytest.skip("FlashAttention 3 not available")
         if fa_version == 4 and not HAVE_FA4:
             pytest.skip("FlashAttention 4 not available")
-        if not te_supports_batch_invariant_attention():
-            pytest.skip("TE lacks explicit FlashAttention version selection (needs >= 2.18)")
 
-        overrides = dict(
-            batch_invariant_mode=True,
-            attention_backend=AttnBackend.flash,
-            flash_attention_version=fa_version,
-            attention_dropout=0.0,
-        )
+        # Deliberately NOT setting `config.batch_invariant_mode`. That flag drags in
+        # `assert_te_supports_batch_invariant_attention()` via
+        # `language_module._set_attention_backend`, which exists so the *training*
+        # (TransformerEngine) attention runs the same FlashAttention generation as
+        # inference -- train/rollout parity. This test is inference-only and never
+        # executes TE attention, so that gate does not apply. Pin the FA generation
+        # through the config (`_resolve_flash_version` reads it directly, no TE) and
+        # set the flag straight onto the attention modules, which is all the
+        # `num_splits` call sites actually read.
+        def enable_on_attention(model):
+            patched = 0
+            for module in model.modules():
+                if hasattr(module, "batch_invariant_mode"):
+                    module.batch_invariant_mode = True
+                    patched += 1
+            print(f"  batch_invariant_mode set on {patched} module(s)")
+            assert patched > 0, "no attention module exposed batch_invariant_mode"
+
         print(f"\n########## attention batch-invariant, FA{fa_version} ##########")
-        with _config_overrides(overrides):
-            self._compare_arms()
+        with _config_overrides(dict(flash_attention_version=fa_version)):
+            self._compare_arms(post_build=enable_on_attention)
 
     @torch.inference_mode()
     def test_eager_shape_sensitivity(self):
@@ -296,12 +302,14 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
 
         self._report(acts, logits, "pad200", "pad1720")
 
-    def _compare_arms(self):
+    def _compare_arms(self, post_build=None):
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             is_batch_invariant_mode_enabled,
         )
 
         model = self._create_model()
+        if post_build is not None:
+            post_build(model)
         prompts = self._create_prompts()[:2]
         assert [len(p) for p in prompts] == PROMPT_LENS
         print(

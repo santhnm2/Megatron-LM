@@ -44,6 +44,32 @@ def _first(x):
     return x if isinstance(x, torch.Tensor) else None
 
 
+def _align(a, b, n):
+    """Trim both tensors to the first `n` real tokens, whichever axis that is.
+
+    The two arms pad to different token counts (200 vs 1720), so the token axis
+    is the one whose size differs -- dim 0 for `[S, B, H]` hidden states, dim 1
+    for the embedding's `[B, S]` input ids. Returns `(None, None, None)` when the
+    shapes differ in more than one axis, which is not something to compare.
+    """
+    if a.shape == b.shape:
+        # Same shape in both arms: the token axis is not identifiable from the
+        # difference, so fall back to the first axis long enough to hold them.
+        axis = next((i for i, s in enumerate(a.shape) if s >= n), None)
+        if axis is None:
+            return None, None, None
+        return a.narrow(axis, 0, n), b.narrow(axis, 0, n), axis
+    if a.ndim != b.ndim:
+        return None, None, None
+    diff = [i for i, (x, y) in enumerate(zip(a.shape, b.shape)) if x != y]
+    if len(diff) != 1:
+        return None, None, None
+    axis = diff[0]
+    if a.shape[axis] < n or b.shape[axis] < n:
+        return None, None, None
+    return a.narrow(axis, 0, n), b.narrow(axis, 0, n), axis
+
+
 def _attach(model, store):
     """Record input/output hidden states for every module outside the captured layers.
 
@@ -164,17 +190,23 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             print(f"  NOT COMPARED (one arm only): eager={only_eager} graph={only_graph}")
         first_bad = None
         for name in sorted(set(acts["eager"]) & set(acts["graph"])):
-            a = acts["eager"][name][:REAL_TOKENS]
-            b = acts["graph"][name][:REAL_TOKENS]
+            a, b, axis = _align(acts["eager"][name], acts["graph"][name], REAL_TOKENS)
+            if a is None:
+                print(
+                    f"  {name:<28} SKIPPED: shapes "
+                    f"{tuple(acts['eager'][name].shape)} vs {tuple(acts['graph'][name].shape)} "
+                    "differ on more than the token axis"
+                )
+                continue
             d = (a - b).abs()
             worst = float(d.max())
             scale = float(a.abs().max())
             # Per sequence, so we can see whether only request 1 moves.
-            seq0 = float(d[: PROMPT_LENS[0]].max())
-            seq1 = float(d[PROMPT_LENS[0] : REAL_TOKENS].max())
+            seq0 = float(d.narrow(axis, 0, PROMPT_LENS[0]).max())
+            seq1 = float(d.narrow(axis, PROMPT_LENS[0], PROMPT_LENS[1]).max())
             print(
-                f"  {name:<12} max|diff|={worst:.3e} (rel {worst / max(scale, 1e-30):.3e})  "
-                f"seq0={seq0:.3e}  seq1={seq1:.3e}"
+                f"  {name:<28} dim{axis} max|diff|={worst:.3e} "
+                f"(rel {worst / max(scale, 1e-30):.3e})  seq0={seq0:.3e}  seq1={seq1:.3e}"
             )
             if worst > 0 and first_bad is None:
                 first_bad = name

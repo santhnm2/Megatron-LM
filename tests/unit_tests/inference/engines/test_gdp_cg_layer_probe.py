@@ -145,6 +145,56 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             if batch_invariant:
                 disable_batch_invariant_mode()
 
+    @torch.inference_mode()
+    def test_eager_shape_sensitivity(self):
+        """Two EAGER engines at different padded token counts. No graphs anywhere.
+
+        This is the control the whole investigation needs. Every hook fires in
+        both arms (nothing is captured, so nothing skips Python), which finally
+        makes per-layer localization possible, and it answers the prior question
+        directly: if the layers already disagree between a 200-token and a
+        1720-token padded batch with graphs switched off entirely, then the
+        divergence is shape sensitivity in the layer GEMMs and CUDA graphs are
+        merely what changes the shape.
+        """
+        from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+        model = self._create_model()
+        prompts = self._create_prompts()[:2]
+
+        acts, logits = {}, {}
+        original_token_rounder = DynamicInferenceContext.TOKEN_ROUNDER
+        try:
+            for label, token_rounder in (("pad200", 4), ("pad1720", 1720)):
+                # Only the token axis moves; REQUEST_ROUNDER stays at 4 so the
+                # padded prefill request count is identical in both arms.
+                DynamicInferenceContext.TOKEN_ROUNDER = token_rounder
+                engine = self._build_engine(model, num_cuda_graphs=None)
+                for i, prompt in enumerate(prompts):
+                    engine._add_request(self._make_request(i, prompt))
+
+                store = {}
+                handles = _attach(model, store)
+                try:
+                    engine.step_modern()
+                finally:
+                    for h in handles:
+                        h.remove()
+
+                ctx = engine.context
+                print(
+                    f"\n[{label}] dims={ctx.batch_dimensions} "
+                    f"padded={ctx.padded_batch_dimensions} "
+                    f"graphed={ctx.using_cuda_graph_this_step()}"
+                )
+                assert not ctx.using_cuda_graph_this_step(), "this control must stay eager"
+                acts[label] = store
+                logits[label] = engine.controller._all_logits_cuda[0, :REAL_TOKENS].float().clone()
+        finally:
+            DynamicInferenceContext.TOKEN_ROUNDER = original_token_rounder
+
+        self._report(acts, logits, "pad200", "pad1720")
+
     def _compare_arms(self):
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             is_batch_invariant_mode_enabled,
@@ -182,19 +232,24 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             all_logits = engine.controller._all_logits_cuda
             logits[label] = all_logits[0, :REAL_TOKENS].float().clone()
 
-        print("\n=== per-module divergence over the 199 real token positions ===")
+        self._report(acts, logits, "eager", "graph")
+
+    @staticmethod
+    def _report(acts, logits, a_label, b_label):
+        """Print per-module divergence between two arms, then the logit tie analysis."""
+        print(f"\n=== per-module divergence, {a_label} vs {b_label}, 199 real tokens ===")
         print("  (2_layer0 = GDP/mamba, 2_layer1 = attention, 2_layer2 = MLP)")
-        only_eager = sorted(set(acts["eager"]) - set(acts["graph"]))
-        only_graph = sorted(set(acts["graph"]) - set(acts["eager"]))
-        if only_eager or only_graph:
-            print(f"  NOT COMPARED (one arm only): eager={only_eager} graph={only_graph}")
+        only_a = sorted(set(acts[a_label]) - set(acts[b_label]))
+        only_b = sorted(set(acts[b_label]) - set(acts[a_label]))
+        if only_a or only_b:
+            print(f"  NOT COMPARED (one arm only): {a_label}={only_a} {b_label}={only_b}")
         first_bad = None
-        for name in sorted(set(acts["eager"]) & set(acts["graph"])):
-            a, b, axis = _align(acts["eager"][name], acts["graph"][name], REAL_TOKENS)
+        for name in sorted(set(acts[a_label]) & set(acts[b_label])):
+            ta, tb = acts[a_label][name], acts[b_label][name]
+            a, b, axis = _align(ta, tb, REAL_TOKENS)
             if a is None:
                 print(
-                    f"  {name:<28} SKIPPED: shapes "
-                    f"{tuple(acts['eager'][name].shape)} vs {tuple(acts['graph'][name].shape)} "
+                    f"  {name:<32} SKIPPED: shapes {tuple(ta.shape)} vs {tuple(tb.shape)} "
                     "differ on more than the token axis"
                 )
                 continue
@@ -205,7 +260,7 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
             seq0 = float(d.narrow(axis, 0, PROMPT_LENS[0]).max())
             seq1 = float(d.narrow(axis, PROMPT_LENS[0], PROMPT_LENS[1]).max())
             print(
-                f"  {name:<28} dim{axis} max|diff|={worst:.3e} "
+                f"  {name:<32} dim{axis} max|diff|={worst:.3e} "
                 f"(rel {worst / max(scale, 1e-30):.3e})  seq0={seq0:.3e}  seq1={seq1:.3e}"
             )
             if worst > 0 and first_bad is None:
@@ -213,18 +268,18 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
         print(f"  first divergent tensor: {first_bad}")
 
         print("\n=== last-token logits: is the token flip a near-tie? ===")
-        ends = [PROMPT_LENS[0] - 1, REAL_TOKENS - 1]
-        for rid, pos in enumerate(ends):
-            le, lg = logits["eager"][pos], logits["graph"][pos]
-            delta = float((le - lg).abs().max())
-            top2_e = torch.topk(le, 2).values
-            top2_g = torch.topk(lg, 2).values
-            gap_e = float(top2_e[0] - top2_e[1])
-            arg_e, arg_g = int(le.argmax()), int(lg.argmax())
+        for rid, pos in enumerate([PROMPT_LENS[0] - 1, REAL_TOKENS - 1]):
+            la, lb = logits[a_label][pos], logits[b_label][pos]
+            delta = float((la - lb).abs().max())
+            top2_a = torch.topk(la, 2).values
+            top2_b = torch.topk(lb, 2).values
+            gap_a = float(top2_a[0] - top2_a[1])
+            arg_a, arg_b = int(la.argmax()), int(lb.argmax())
             print(
                 f"  req {rid} (pos {pos}): max|dlogit|={delta:.3e}  "
-                f"eager top-2 gap={gap_e:.3e}  graph top-2 gap={float(top2_g[0] - top2_g[1]):.3e}\n"
-                f"      argmax eager={arg_e} graph={arg_g} "
-                f"{'FLIPPED' if arg_e != arg_g else 'same'}  "
-                f"=> {'tie-break (|dlogit| > gap)' if delta > gap_e else 'gap survives |dlogit|'}"
+                f"{a_label} top-2 gap={gap_a:.3e}  "
+                f"{b_label} top-2 gap={float(top2_b[0] - top2_b[1]):.3e}\n"
+                f"      argmax {a_label}={arg_a} {b_label}={arg_b} "
+                f"{'FLIPPED' if arg_a != arg_b else 'same'}  "
+                f"=> {'tie-break (|dlogit| > gap)' if delta > gap_a else 'gap survives |dlogit|'}"
             )

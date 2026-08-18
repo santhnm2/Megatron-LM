@@ -22,6 +22,8 @@ bit-exact tokens across a 199 -> 1720 shape change is not achievable.
 Not a real test -- delete once the question is settled.
 """
 
+import contextlib
+
 import pytest
 import torch
 
@@ -68,6 +70,29 @@ def _align(a, b, n):
     if a.shape[axis] < n or b.shape[axis] < n:
         return None, None, None
     return a.narrow(axis, 0, n), b.narrow(axis, 0, n), axis
+
+
+@contextlib.contextmanager
+def _config_overrides(overrides):
+    """Inject extra `TransformerConfig` fields into the inherited `_create_model`.
+
+    The base class builds its config inline with keyword arguments, so patching
+    the symbol it looks up is cheaper -- and stays in sync -- compared with
+    duplicating the whole config here.
+    """
+    import tests.unit_tests.inference.engines.test_gdp_cuda_graph_e2e as e2e
+
+    original = e2e.TransformerConfig
+
+    def patched(**kwargs):
+        kwargs.update(overrides)
+        return original(**kwargs)
+
+    e2e.TransformerConfig = patched
+    try:
+        yield
+    finally:
+        e2e.TransformerConfig = original
 
 
 class _ManagerPatch:
@@ -181,6 +206,45 @@ class TestGDPLayerProbe(TestGDPCudaGraphE2E):
         finally:
             if batch_invariant:
                 disable_batch_invariant_mode()
+
+    @pytest.mark.parametrize("fa_version", [3, 4], ids=["fa3", "fa4"])
+    @torch.inference_mode()
+    def test_attention_batch_invariant(self, fa_version):
+        """Turn on `config.batch_invariant_mode` and see whether attention settles.
+
+        `attention.py:320` reads the flag, and every FA3/FA4 call site then passes
+        `num_splits=1` instead of `0`, pinning the split-k schedule that otherwise
+        varies with the batch metadata. FA2 is excluded by an explicit assert at
+        `attention.py:1127`, hence the version override.
+
+        The remaining requirements come from `transformer_config.py:2977-2998`:
+        bf16 params (already), `attention_backend=flash`, `flash_attention_version`
+        in (3, 4), `context_parallel_size=1` (already), zero attention dropout, no
+        MoE (already). GDP never reads the flag, so it keeps its existing -- and
+        already bit-exact -- path.
+        """
+        from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            te_supports_batch_invariant_attention,
+        )
+        from megatron.core.transformer.enums import AttnBackend
+
+        if fa_version == 3 and not HAVE_FA3:
+            pytest.skip("FlashAttention 3 not available")
+        if fa_version == 4 and not HAVE_FA4:
+            pytest.skip("FlashAttention 4 not available")
+        if not te_supports_batch_invariant_attention():
+            pytest.skip("TE lacks explicit FlashAttention version selection (needs >= 2.18)")
+
+        overrides = dict(
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=fa_version,
+            attention_dropout=0.0,
+        )
+        print(f"\n########## attention batch-invariant, FA{fa_version} ##########")
+        with _config_overrides(overrides):
+            self._compare_arms()
 
     @torch.inference_mode()
     def test_eager_shape_sensitivity(self):

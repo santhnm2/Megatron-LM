@@ -59,6 +59,19 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
+        # compute_and_store_offsets() records extraction offsets on the
+        # model-wide SSM chunk quantum, but MambaMetadata converts those offsets
+        # to chunk indices with the Mamba kernel chunk size. The conversion is
+        # only valid when the quantum is a multiple of it -- which fails for a
+        # model whose only SSM layers are Gated Delta Product (quantum 64, no
+        # Mamba chunking to convert against). GDP prefix caching is not
+        # implemented yet; fail here rather than silently mis-index.
+        assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
+            "Mamba prefix caching requires an SSM chunk alignment that is a multiple of "
+            f"mamba_chunk_size ({context.mamba_chunk_size}); got "
+            f"{context.ssm_chunk_alignment}. Gated Delta Product prefix caching is not "
+            "supported yet."
+        )
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.pool_size
 
@@ -458,17 +471,18 @@ class MambaSlotAllocator:
         last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
         penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # SSM chunk size the mamba kernel actually runs with. States can only be
-        # extracted at multiples of this value, and it must match the value used
-        # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
-        mamba_chunk_size = ctx.mamba_chunk_size
+        # Quantum every SSM mixer in the model agrees is a chunk boundary. States
+        # can only be extracted there, and it is a multiple of the Mamba kernel
+        # chunk size (asserted in __init__), so the offset -> chunk-index
+        # conversion in MambaMetadata stays consistent.
+        ssm_chunk_alignment = ctx.ssm_chunk_alignment
 
         # Keep only boundaries that land inside this chunk's computed tokens and on
-        # a mamba-chunk boundary (required for mid-sequence state extraction).
+        # an SSM chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
         for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
             offset = abs_pos - chunk_start
-            if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
+            if offset > 0 and offset < seq_len and offset % ssm_chunk_alignment == 0:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)

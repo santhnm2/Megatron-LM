@@ -1258,6 +1258,17 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
         return (conv_states_shape, ssm_states_shape)
 
+    @property
+    def ssm_inference_chunk_size(self) -> int:
+        """Chunk length the dynamic-inference prefill kernels actually run at.
+
+        The Mamba2 SSD kernels run at the same chunk size for training and
+        inference, so this is just `chunk_size`. It exists so callers that need
+        a chunk-aligned boundary can ask every SSM mixer the same question --
+        Gated Delta Product answers 64 regardless of its `chunk_size`.
+        """
+        return self.chunk_size
+
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
 

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
@@ -43,10 +44,28 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    ssm_chunk_alignment: Optional[int] = None
+    """Token quantum that a prefill chunk boundary must land on for *every* SSM
+    mixer in the model to see a clean chunk boundary. Defaults to
+    `mamba_chunk_size`, which is correct for any Mamba-only model.
+
+    This is the LCM of each mixer's `ssm_inference_chunk_size`, which is not
+    always its `chunk_size`: the forked Gated Delta Product prefill kernels run
+    at a fixed 64 whatever `chunk_size` says. Only the paths that genuinely
+    require an aligned boundary consult it -- batch-invariant chunked prefill,
+    which replays the partial tail at decode, and recurrent-state extraction for
+    prefix caching, which can only snapshot at a chunk boundary. Ordinary
+    chunked prefill splits anywhere, because each step re-chunks from its own
+    slice start."""
+
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
+
+    def __post_init__(self):
+        if self.ssm_chunk_alignment is None:
+            self.ssm_chunk_alignment = self.mamba_chunk_size
 
     @classmethod
     def from_model(
@@ -77,25 +96,40 @@ class MambaInferenceStateConfig:
                 ssm_states_dtype = torch.float32
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.chunk_size
-                    break
-            # Gated Delta Product layers register as Mamba layers but carry a
-            # Householder count, which sizes their (separate) chunk descriptors.
+            # Every SSM variant registers under the MAMBA symbol, so one pass
+            # collects all three chunk-related facts.
+            mamba_chunk_size = None
             gdp_num_householder = 0
+            ssm_chunk_alignment = 1
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    num_householder = getattr(layer.mixer, 'num_householder', None)
-                    if num_householder is not None:
-                        # The descriptors are shared across layers, so one count
-                        # has to cover every GDP layer.
-                        assert gdp_num_householder in (0, num_householder), (
-                            "every GDP layer must use the same num_householder; got "
-                            f"{gdp_num_householder} and {num_householder}"
-                        )
-                        gdp_num_householder = num_householder
+                if layer_type != Symbols.MAMBA or not hasattr(layer, 'mixer'):
+                    continue
+                mixer = layer.mixer
+                if mamba_chunk_size is None:
+                    mamba_chunk_size = mixer.chunk_size
+                # Gated Delta Product layers register as Mamba layers but carry
+                # a Householder count, which sizes their (separate) chunk
+                # descriptors.
+                num_householder = getattr(mixer, 'num_householder', None)
+                if num_householder is not None:
+                    # The descriptors are shared across layers, so one count
+                    # has to cover every GDP layer.
+                    assert gdp_num_householder in (0, num_householder), (
+                        "every GDP layer must use the same num_householder; got "
+                        f"{gdp_num_householder} and {num_householder}"
+                    )
+                    gdp_num_householder = num_householder
+                # A boundary is only clean if it is clean for every mixer, so
+                # the alignment quantum is the LCM over the model's mixers.
+                # Falls back to chunk_size for any mixer predating the property.
+                ssm_chunk_alignment = math.lcm(
+                    ssm_chunk_alignment,
+                    getattr(mixer, 'ssm_inference_chunk_size', mixer.chunk_size),
+                )
+            if mamba_chunk_size is None:
+                mamba_chunk_size = 128
+            if ssm_chunk_alignment == 1:
+                ssm_chunk_alignment = mamba_chunk_size
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -103,6 +137,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                ssm_chunk_alignment=ssm_chunk_alignment,
                 gdp_num_householder=gdp_num_householder,
             )
         return None

@@ -1809,16 +1809,16 @@ class DynamicInferenceEngine(AbstractEngine):
     def _mamba_batch_invariant_prefill_chunk_length(
         self, req: DynamicInferenceRequest, capacity: int
     ) -> int:
-        """Raw prefill length that computes an aligned chunk within ``capacity``.
+        """Raw prefill length that computes an aligned chunk within `capacity`.
 
-        Non-final calls must start and end at Mamba chunk boundaries. The final
+        Non-final calls must start and end at SSM chunk boundaries. The final
         prompt call may be shorter because it seeds the decode replay tail.
         """
         remaining = len(req.remaining_prompt_tokens)
         if capacity >= remaining:
             return remaining
 
-        chunk_size = self.context.mamba_chunk_size
+        chunk_size = self.context.ssm_chunk_alignment
         computed_tokens = (capacity // chunk_size) * chunk_size
         if remaining - computed_tokens == 1:
             computed_tokens -= chunk_size

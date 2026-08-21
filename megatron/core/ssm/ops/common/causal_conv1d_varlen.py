@@ -21,6 +21,13 @@ from megatron.core.ssm.ops.common.determinism import autotune_configs
 # rather than to an unrelated difference between two checkouts.
 _CONV_CARRY_DISABLED = os.environ.get("MCORE_DEBUG_DISABLE_CONV_CARRY", "0") == "1"
 
+# DEBUG PROBE -- do not merge. Set MCORE_DEBUG_CONV_CARRY_PROBE=1 to print, per
+# call, whether any request presented a slice shorter than d_conv and how large
+# the carried-over values were. Distinguishes "the ablation changed nothing
+# because this mixer never hits the short-slice case" from "it changed values
+# but the sampled tokens happened not to move".
+_CONV_CARRY_PROBE = os.environ.get("MCORE_DEBUG_CONV_CARRY_PROBE", "0") == "1"
+
 
 # Two block-dim regimes:
 #   1. vLLM-style: small BLOCK_T, large BLOCK_C, pipelined. Many small programs maximize
@@ -407,6 +414,26 @@ def causal_conv1d_varlen_carry_states(
     in_range = token_indices < total_tokens
     token_indices = torch.where(in_range, token_indices, torch.zeros_like(token_indices))
     slice_taps = x[token_indices].transpose(1, 2)  # [N, conv_dim, d_conv]
+
+    if _CONV_CARRY_PROBE:
+        # DEBUG PROBE -- do not merge. Answers "did this call actually depend on
+        # the carry?", which a pass/fail at the engine level cannot distinguish
+        # from "this mixer never takes the path". Syncs to host, so run eagerly
+        # (num_cuda_graphs=None); it would break graph capture.
+        _taps_from_slice = from_slice.sum(dim=1)  # [N] == min(slice_len, d_conv)
+        _carrying = (_taps_from_slice > 0) & (_taps_from_slice < d_conv)
+        _true_taps = previous_states.gather(
+            2, prev_columns[:, None, :].expand(num_requests, conv_dim, d_conv)
+        )
+        _discarded = ~from_slice[:, None, :]
+        _delta = (_true_taps * _discarded).abs().max().item()
+        print(
+            f"[conv-carry-probe] conv_dim={conv_dim} d_conv={d_conv} "
+            f"requests={num_requests} short_slices={int(_carrying.sum().item())} "
+            f"min_taps_from_slice={int(_taps_from_slice.min().item())} "
+            f"max_carried_magnitude={_delta:.6g}",
+            flush=True,
+        )
 
     if _CONV_CARRY_DISABLED:
         # DEBUG ABLATION -- do not merge. Zero-fill the columns that predate this

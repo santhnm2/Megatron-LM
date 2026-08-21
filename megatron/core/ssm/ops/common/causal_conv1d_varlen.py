@@ -6,11 +6,20 @@ Supports packed variable-length sequences where `causal_conv1d_fn` cannot accept
 both `seq_idx` and `initial_states` simultaneously.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from megatron.core.ssm.ops.common.determinism import autotune_configs
+
+# DEBUG ABLATION -- do not merge. Set MCORE_DEBUG_DISABLE_CONV_CARRY=1 to make
+# `causal_conv1d_varlen_carry_states` behave the way the pre-fix code did: build
+# the conv state from the current slice alone and zero-fill anything older. Lets
+# the same test binary run both ways so a failure can be attributed to the carry
+# rather than to an unrelated difference between two checkouts.
+_CONV_CARRY_DISABLED = os.environ.get("MCORE_DEBUG_DISABLE_CONV_CARRY", "0") == "1"
 
 
 # Two block-dim regimes:
@@ -399,8 +408,16 @@ def causal_conv1d_varlen_carry_states(
     token_indices = torch.where(in_range, token_indices, torch.zeros_like(token_indices))
     slice_taps = x[token_indices].transpose(1, 2)  # [N, conv_dim, d_conv]
 
-    previous_taps = previous_states.gather(
-        2, prev_columns[:, None, :].expand(num_requests, conv_dim, d_conv)
-    )
+    if _CONV_CARRY_DISABLED:
+        # DEBUG ABLATION -- do not merge. Zero-fill the columns that predate this
+        # slice instead of carrying them, reproducing the pre-fix behavior of
+        # `causal_conv1d_varlen_states(x, cu_seqlens, state_len=d_conv)`, which
+        # derived the whole state from the slice and left-padded with zeros.
+        # Identical for slices of at least d_conv tokens; wrong for shorter ones.
+        previous_taps = torch.zeros_like(slice_taps)
+    else:
+        previous_taps = previous_states.gather(
+            2, prev_columns[:, None, :].expand(num_requests, conv_dim, d_conv)
+        )
 
     return torch.where(from_slice[:, None, :], slice_taps, previous_taps)

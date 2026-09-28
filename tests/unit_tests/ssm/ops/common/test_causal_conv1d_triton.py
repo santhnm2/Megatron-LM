@@ -11,6 +11,71 @@ def _requires_cuda():
         pytest.skip("CUDA not available")
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize("batch", [1, 4, 64])
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_vllm_product_rounding(batch, use_graph):
+    """Compare live indexed decode updates against the optional parity reference."""
+    _requires_cuda()
+    reference = pytest.importorskip("vllm.model_executor.layers.mamba.ops.causal_conv1d")
+    torch.manual_seed(391)
+    dim, width, capacity = 1536, 4, batch + 3
+    projected = torch.randn(batch + 1, 2576, device="cuda", dtype=torch.bfloat16)
+    x = projected[:, 1024:2560]
+    reference_x = torch.empty_like(x)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(capacity, dim, width, device="cuda", dtype=torch.bfloat16)
+    actual_state = initial.clone()
+    reference_state = initial[:, :, -3:].contiguous()
+    slots = torch.arange(batch, 0, -1, device="cuda", dtype=torch.int32)
+    actual_indices = torch.cat([slots, slots.new_tensor([-1])])
+    reference_indices = torch.cat([slots, slots.new_tensor([0])])
+
+    def run():
+        reference_x.copy_(x)
+        expected = reference.causal_conv1d_update(
+            reference_x, reference_state, weight, bias, "silu", conv_state_indices=reference_indices
+        )
+        actual = causal_conv1d_update(
+            x,
+            actual_state,
+            weight,
+            bias,
+            "silu",
+            actual_indices,
+            round_products_to_input_dtype=True,
+        )
+        return expected, actual
+
+    def check(expected, actual):
+        for left, right in [
+            (expected[:batch], actual[:batch]),
+            (reference_state, actual_state[:, :, -3:]),
+        ]:
+            assert left.shape == right.shape and left.dtype == right.dtype
+            assert torch.equal(
+                left.contiguous().view(torch.uint8), right.contiguous().view(torch.uint8)
+            )
+        assert torch.count_nonzero(actual[-1]) == 0
+
+    # Compile before graph capture, then reset both histories identically.
+    run()
+    actual_state.copy_(initial)
+    reference_state.copy_(initial[:, :, -3:])
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            expected, actual = run()
+        # Capture records operations; outputs are valid only after replay.
+        for _ in range(3):
+            graph.replay()
+            check(expected, actual)
+    else:
+        for _ in range(3):
+            check(*run())
+
+
 # ---------------------- Reference Implementations ---------------------- #
 
 

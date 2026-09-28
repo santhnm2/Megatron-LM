@@ -92,6 +92,7 @@ mlm = [
 ]
 
 dev = [
+    "apache-tvm-ffi==0.1.11",
     "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
     "nvidia-resiliency-ext==0.7.0",
     "tqdm",
@@ -141,6 +142,19 @@ ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
     "flash-linear-attention==0.5.1",
+]
+inference-parity = [
+    "apache-tvm-ffi==0.1.9",
+    "cuda-bindings==13.3.1",
+    "cuda-pathfinder==1.5.6",
+    "einops>=0.8.2",
+    "ninja>=1.13.0",
+    "nvidia-cutlass-dsl[cu13]==4.5.2",
+    "quack-kernels==0.4.1",
+    "torch>=2.11",
+    "torch-c-dlpack-ext==0.1.5",
+    "triton==3.6.0",
+    "typing-extensions>=4.16.0",
 ]
 
 [dependency-groups]
@@ -193,6 +207,12 @@ batch_invariant = ["deep_gemm"]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 
 [tool.uv]
+# The audited worker retains CUTLASS 4.5.2 / TVM FFI 0.1.9. Main's dev and
+# SSM extras require TVM FFI 0.1.11; provision these environments separately.
+conflicts = [
+    [{ extra = "dev" }, { extra = "inference-parity" }],
+    [{ extra = "ssm" }, { extra = "inference-parity" }],
+]
 managed = true
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
@@ -215,9 +235,30 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
     "tilelang==0.1.12",
-    "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
+]
+
+# Preserve main's Mamba/TileLang compatibility override without changing the
+# FFI requirement of every package in the separate inference-parity environment.
+# Dependencies from pinned Mamba 0048fbf, with the same TileLang/FFI versions
+# previously imposed by main's global overrides.
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.2.post1"
+requires-dist = [
+    "torch",
+    "tilelang==0.1.12",
+    "apache-tvm-ffi==0.1.11",
+    "quack-kernels>=0.3.4",
+    "triton>=3.5.0",
+    "ninja",
+    "einops",
+    "transformers",
+    "packaging",
+    "setuptools>=61.0.0",
+    "causal-conv1d>=1.2.0; extra == 'causal-conv1d'",
+    "pytest; extra == 'dev'",
 ]
 
 [[tool.uv.dependency-metadata]]

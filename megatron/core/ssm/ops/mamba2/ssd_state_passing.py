@@ -7,20 +7,18 @@ import torch
 import triton
 import triton.language as tl
 
-from megatron.core.ssm.ops.common.determinism import autotune_configs
+from megatron.core.ssm.ops.triton_helpers import fast_exp
 
 
 @triton.autotune(
-    configs=autotune_configs(
-        [
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-        ]
-    ),
+    configs=[
+        triton.Config({"BLOCK_SIZE": 64}),
+        triton.Config({"BLOCK_SIZE": 128}),
+        triton.Config({"BLOCK_SIZE": 256}),
+        triton.Config({"BLOCK_SIZE": 512}),
+        triton.Config({"BLOCK_SIZE": 1024}),
+        triton.Config({"BLOCK_SIZE": 2048}),
+    ],
     key=["dim"],
 )
 @triton.jit
@@ -110,7 +108,7 @@ def _state_passing_fwd_kernel(
                     states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
             prev_seq_idx = seq_idx
-            states = tl.exp(dA_cs) * states + new_states
+            states = fast_exp(dA_cs) * states + new_states
             if HAS_DST_STATES:
                 dst_idx = tl.load(dst_indices_ptr + c).to(tl.int64)
                 dst_ptrs = (

@@ -111,7 +111,7 @@ class MTPContextMixin:
             and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
             self.mtp_decoder_hidden_states = torch.empty(
-                self.max_tokens,
+                self.max_padded_tokens,
                 1,
                 self.hidden_size,
                 device=torch.cuda.current_device(),

@@ -256,6 +256,9 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.training:
             return super().forward(x)
 
+        if getattr(self, '_vllm_normalized_replicated_input', False):
+            return _apply_linear(x, self.weight, self.config), None
+
         if self.tp_size == 1:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)
@@ -545,6 +548,18 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.training:
             return super().forward(x)
+
+        if hasattr(self, '_vllm_communicator'):
+            shape = x.shape[:-1] + (self.weight.shape[0],)
+            flat = x.reshape(-1, x.shape[-1])
+            real_tokens = getattr(self, '_vllm_token_count', None)
+            partial = _apply_linear(flat[:real_tokens], self.weight, self.config)
+            reduced = self._vllm_communicator.all_reduce(partial)
+            if reduced.shape[0] < flat.shape[0]:
+                reduced = torch.nn.functional.pad(
+                    reduced, (0, 0, 0, flat.shape[0] - reduced.shape[0])
+                )
+            return reduced.view(shape), None
 
         if self.tp_size == 1:
             x = _apply_linear(x, self.weight, self.config)

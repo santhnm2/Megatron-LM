@@ -1047,6 +1047,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         block_table,
         is_decode_only,
         softmax_offset: Optional[Tensor] = None,
+        num_active_tokens: Optional[int] = None,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
 
@@ -1069,12 +1070,47 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 ``exp(qk_i) / (exp(softmax_offset) + sum_j exp(qk_j))`` —
                 the same denominator-with-sink formulation used by the
                 static-inference path (TE / DotProductAttention).
+            num_active_tokens (int): Actual prefill token count for the vLLM
+                parity profile, excluding model-buffer padding.
         Return:
             (Tensor) Attention output.
         """
 
         assert not self.training
         assert block_table is not None
+
+        if self.config.inference_vllm_parity:
+            from megatron.core.inference.parity_kernels.cute.interface import _flash_attn_fwd
+
+            if softmax_offset is not None or self.config.window_size is not None:
+                raise ValueError('vLLM parity currently requires full attention without sinks')
+            query = q.squeeze(1)
+            if is_decode_only:
+                # The graph can retain SP-aligned model rows while attention
+                # uses a smaller native request bucket. Metadata defines that
+                # bucket; padding rows do not participate in FA4 dispatch.
+                query = query[: seqlens_k.shape[0] * max_seqlen_q]
+            elif num_active_tokens is not None:
+                query = query[:num_active_tokens]
+            output, _ = _flash_attn_fwd(
+                query,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                seqused_k=seqlens_k,
+                page_table=block_table,
+                softmax_scale=q.shape[-1] ** -0.5,
+                causal=True,
+                num_splits=0,
+                return_lse=False,
+            )
+            if output.shape[0] < q.shape[0]:
+                padded_output = torch.zeros_like(q.squeeze(1))
+                padded_output[: output.shape[0]].copy_(output)
+                output = padded_output
+            return output.unsqueeze(1)
 
         # Resolve sliding-window-attention size for this layer.
         # `config.window_size` is a (left, right) tuple, where -1 means infinite
@@ -1659,6 +1695,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     block_table,
                     inference_context.is_decode_only(),
                     softmax_offset=self._get_inference_softmax_offset(),
+                    num_active_tokens=inference_context.active_token_count,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
@@ -1910,6 +1947,13 @@ class SelfAttention(Attention):
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
+        if self.config.inference_vllm_parity and not self.training:
+            from megatron.core.inference.vllm_parity import attention_qkv
+
+            if output_gate or not split_qkv:
+                raise ValueError('vLLM parity requires split QKV and no output gate')
+            return attention_qkv(self, hidden_states)
+
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)

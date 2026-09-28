@@ -25,6 +25,7 @@ class MambaMetadata:
         d_conv: int = 0,
         decode_indices_dtype: torch.dtype = torch.int64,
         gdp_num_householder: int = 0,
+        align_chunk_boundaries: bool = False,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -50,6 +51,8 @@ class MambaMetadata:
                 `(sequence, chunk-within-sequence)` pairs rather than by token
                 boundary, and additionally need a chunking of the Householder-
                 expanded stream, which no Mamba2 buffer describes.
+            align_chunk_boundaries (bool): Reserve an additional partial chunk per
+                request for CPU metadata aligned to previously computed tokens.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
@@ -60,7 +63,9 @@ class MambaMetadata:
         self.decode_indices_dtype = decode_indices_dtype
 
         # Maximum possible chunks across all batch configurations
-        self.max_chunks = max_tokens // mamba_chunk_size + max_requests
+        self.max_chunks = max_tokens // mamba_chunk_size + max_requests * (
+            2 if align_chunk_boundaries else 1
+        )
 
         # Map from requests to slots in the static Mamba state buffer (CPU for bookkeeping).
         self.request_to_mamba_state_idx = torch.full(
@@ -676,6 +681,7 @@ class MambaMetadata:
         enable_chunked_prefill: bool,
         intermediate_offsets_gpu: Optional[torch.Tensor] = None,
         intermediate_counts_gpu: Optional[torch.Tensor] = None,
+        prefill_context_lengths: Optional[torch.Tensor] = None,
     ) -> dict:
         """Compute all Mamba metadata on CPU, writing directly into the bound
         pinned CPU views.
@@ -694,6 +700,9 @@ class MambaMetadata:
             enable_chunked_prefill: Whether chunked prefill is enabled.
             intermediate_offsets_gpu: GPU tensor of per-request intermediate offsets, or None.
             intermediate_counts_gpu: GPU tensor of per-request intermediate counts, or None.
+            prefill_context_lengths: CPU lengths already computed for the real
+                prefill requests. When provided, align SSD chunks to the original
+                sequence as vLLM does, including a partial first chunk.
         """
         assert self._cpu_bufs is not None, "bind_cpu_buffers() must be called first"
         bufs = self._cpu_bufs
@@ -773,14 +782,25 @@ class MambaMetadata:
             for i in range(padded_prefill_count):
                 start = cu_seqlens_all[i]
                 end = cu_seqlens_all[i + 1]
-                s_len = end - start
-                n_chunks = max(1, (s_len + chunk_size - 1) // chunk_size)
-                boundaries = [min(start + (k + 1) * chunk_size, end) for k in range(n_chunks)]
+                offset = (
+                    int(prefill_context_lengths[i]) % chunk_size
+                    if prefill_context_lengths is not None and i < real_prefill_count
+                    else 0
+                )
+                first_end = min(start + chunk_size - offset, end)
+                boundaries = [first_end]
+                boundaries.extend(range(first_end + chunk_size, end, chunk_size))
+                if first_end < end:
+                    boundaries.append(end)
+                n_chunks = len(boundaries)
                 chunk_boundaries.extend(boundaries)
                 chunk_to_seq_list.extend([i] * n_chunks)
                 last_chunk_idx_list.append(len(chunk_boundaries) - 2)
 
-            padded_max_chunks = padded_token_count // chunk_size + padded_prefill_count
+            padded_max_chunks = padded_token_count // chunk_size + padded_prefill_count * (
+                2 if prefill_context_lengths is not None else 1
+            )
+            assert len(chunk_to_seq_list) <= padded_max_chunks <= self.max_chunks
             last_boundary = chunk_boundaries[-1]
             pad_b = padded_max_chunks + 1 - len(chunk_boundaries)
             if pad_b > 0:

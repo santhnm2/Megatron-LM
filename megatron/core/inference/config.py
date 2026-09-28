@@ -113,7 +113,20 @@ class MambaInferenceStateConfig:
                 # chunks. Rounding the cache to BF16 changes the next transition.
                 ssm_states_dtype = torch.float32
             elif ssm_states_dtype is None:
-                ssm_states_dtype = model.config.params_dtype
+                ssm_states_dtype = (
+                    torch.float32
+                    if model.config.inference_vllm_parity
+                    else model.config.params_dtype
+                )
+            if model.config.inference_vllm_parity:
+                from megatron.core.inference.vllm_parity import configure_ssd_autotune_cache
+
+                # SSD warms before the adapter's first forward/graph capture.
+                # Apply the reference policy before its first tuning decision.
+                configure_ssd_autotune_cache()
+                for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                    if layer_type == Symbols.MAMBA:
+                        layer.mixer.warmup_vllm_ssd(ssm_states_dtype)
             # `decoder.layers` is pipeline-local, so a stage holding no SSM
             # layer falls back to the Mamba defaults while a stage holding GDP
             # layers reports 64. Safe today because every consumer of a

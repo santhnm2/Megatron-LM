@@ -456,3 +456,52 @@ def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
         return o, state
 
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="fla chunk_gated_delta_rule")
+
+
+def test_parity_aligned_ssd_chunks_replay():
+    """BF16 dt/bias, FP32 boundary states and partial first chunks replay exactly."""
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+
+    seeded()
+    length, heads, width, groups, state = 356, 8, 64, 1, 128
+    x = torch.randn(length, heads, width, device="cuda", dtype=torch.bfloat16)
+    dt = torch.rand(length, heads, device="cuda", dtype=x.dtype) * 0.1
+    A = -torch.rand(heads, device="cuda") - 1.0
+    B = torch.randn(length, groups, state, device="cuda", dtype=x.dtype)
+    C = torch.randn_like(B)
+    D = torch.randn(heads, device="cuda", dtype=x.dtype)
+    bias = torch.rand(heads, device="cuda", dtype=x.dtype)
+    initial = torch.randn(2, heads, width, state, device="cuda", dtype=torch.float32)
+    # Context offsets 32 and 127 leave 96-token and 1-token first chunks.
+    boundaries = torch.tensor([0, 96, 224, 226, 227, 355, 356], device="cuda", dtype=torch.int32)
+    last = torch.tensor([2, 5], device="cuda", dtype=torch.int32)
+    seq = torch.tensor([0, 0, 0, 1, 1, 1], device="cuda", dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    def run(x, dt, A, B, C, D, bias, initial, out):
+        states = mamba_chunk_scan_combined_varlen(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            128,
+            boundaries,
+            last,
+            seq,
+            out,
+            D=D,
+            dt_bias=bias,
+            initial_states=initial,
+            dt_softplus=True,
+            state_dtype=torch.float32,
+        )
+        return out, states
+
+    assert_replays_bit_exact(
+        run,
+        (x, dt, A, B, C, D, bias, initial, out),
+        replays=4,
+        backward=False,
+        what="parity_aligned_ssd_chunks",
+    )

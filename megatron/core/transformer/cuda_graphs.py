@@ -1399,11 +1399,18 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
+                # Some inference collectives register IPC buffer addresses when
+                # capture finishes. Their context must enclose torch.cuda.graph
+                # so registration runs after capture_end and before first replay.
+                capture_context = getattr(
+                    self.base_module, "cuda_graph_capture_context", nullcontext
+                )
                 capture_comm_context = (
                     track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
                 )
                 with (
                     capture_comm_context as capture_comms,
+                    capture_context(),
                     torch.cuda.graph(
                         self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
                     ),

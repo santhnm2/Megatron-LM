@@ -1,0 +1,335 @@
+{
+  "vllm_tag": "v0.25.1",
+  "flash_attention_commit": "2c839c33742309ec41e620bf837495ec9926c56e",
+  "files": [
+    {
+      "source": "vllm-0.25.1/LICENSE",
+      "destination": "LICENSE.vllm",
+      "upstream_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "local_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/LICENSE",
+      "destination": "LICENSE.flash-attention",
+      "upstream_sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73",
+      "local_sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/moe/moe_ops.h",
+      "destination": "csrc/libtorch_stable/moe/moe_ops.h",
+      "upstream_sha256": "98c0a6bec450a4e44992810231914635f4c37fb9567c66d99f5b67788b8f7227",
+      "local_sha256": "98c0a6bec450a4e44992810231914635f4c37fb9567c66d99f5b67788b8f7227"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/ops.h",
+      "destination": "csrc/libtorch_stable/ops.h",
+      "upstream_sha256": "83eea40a361bbc192dab50bbafbe9496a15951706f0e20f5b5148094a7d39d28",
+      "local_sha256": "83eea40a361bbc192dab50bbafbe9496a15951706f0e20f5b5148094a7d39d28"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/custom_all_reduce.cu",
+      "destination": "csrc/libtorch_stable/custom_all_reduce.cu",
+      "upstream_sha256": "06c19a4a22a6ff1663365e557e7e8f6b88ec5a05b07e86285cfe26aa84975bf2",
+      "local_sha256": "391bbfd80046df6010c3404813edc11e065fd887ebce57d8cb2fb9e614225d2c"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/custom_all_reduce.cuh",
+      "destination": "csrc/custom_all_reduce.cuh",
+      "upstream_sha256": "9b73571484ca4ae00a86c9380a3f6189aa8e30ceb43bc0f5198c9569e8996e5d",
+      "local_sha256": "5ce7d6b80844285ca576b069d854ea2455ed233b8692e7d8ddf9ff05ef67b06c"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/torch_utils.h",
+      "destination": "csrc/libtorch_stable/torch_utils.h",
+      "upstream_sha256": "f619e1943039a67a3254f7e0679e1f3e0faa9d8fccae795f3b20df9e91a8a429",
+      "local_sha256": "f619e1943039a67a3254f7e0679e1f3e0faa9d8fccae795f3b20df9e91a8a429"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/moe/grouped_topk_kernels.cu",
+      "destination": "csrc/libtorch_stable/moe/grouped_topk_kernels.cu",
+      "upstream_sha256": "20a37bf18816bd6cc9f3ef2c9e8ef4a5453b23f4c869e1035506fa2c11721c96",
+      "local_sha256": "3cd8c36fc063d8a7157601276f93190332b2176249b1618fabb53ba6af9eceaf"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/moe/moeTopKFuncs.cuh",
+      "destination": "csrc/libtorch_stable/moe/moeTopKFuncs.cuh",
+      "upstream_sha256": "391d32c800d334d0bf880fc74b2a0a59292b1484cded3cda4a52026732b7df80",
+      "local_sha256": "a07a6ec35ad3b4589c4c673fb0e9e7115044291e210ce1e461cc7a8d245eb0c0"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu",
+      "destination": "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu",
+      "upstream_sha256": "e2bdb00824895cf7f43569159910ca369db3d7ad1da08c51cff2325d03d2e68b",
+      "local_sha256": "36cbadf53b023814aea8e995e997f8f1948502985556dcecda8ee3124b2276d9"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/quantization/vectorization.cuh",
+      "destination": "csrc/libtorch_stable/quantization/vectorization.cuh",
+      "upstream_sha256": "6b28cf0cfe9e948c989274adbfa46c6cdec393bf245efb49678213eca15171e7",
+      "local_sha256": "060aabb676f201c3292a6764a7ae0be8ece33d60d7128d7cd31335a4f6901d18"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/dispatch_utils.h",
+      "destination": "csrc/libtorch_stable/dispatch_utils.h",
+      "upstream_sha256": "7ec1bb7b43cee1e9d8e8150c799618f53e37b7060b061f628049f454d6272e76",
+      "local_sha256": "7ec1bb7b43cee1e9d8e8150c799618f53e37b7060b061f628049f454d6272e76"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/core/math.hpp",
+      "destination": "csrc/libtorch_stable/core/math.hpp",
+      "upstream_sha256": "b80a3ffbbe5944c865331da95261696e430981b623d447adf24f272241104f59",
+      "local_sha256": "b80a3ffbbe5944c865331da95261696e430981b623d447adf24f272241104f59"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/cuda_compat.h",
+      "destination": "csrc/cuda_compat.h",
+      "upstream_sha256": "959bc9e0e73e020d777530b18bf12160d35cc4eb976335955395729700b2f975",
+      "local_sha256": "959bc9e0e73e020d777530b18bf12160d35cc4eb976335955395729700b2f975"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/layernorm_kernels.cu",
+      "destination": "csrc/libtorch_stable/layernorm_kernels.cu",
+      "upstream_sha256": "faaf442f9a520eb7d636acac06b7b52a1765da9b5db13d0d818ff2e1e2537a82",
+      "local_sha256": "f3fd1d1c44859a461d5b30a0f2076977afbd846ebf2d0427102bdcf621a6b43f"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/quantization/vectorization_utils.cuh",
+      "destination": "csrc/libtorch_stable/quantization/vectorization_utils.cuh",
+      "upstream_sha256": "991d501211c90a6a5c88d1062723b04c73ca1418d84f8aa07e255bd97128dff8",
+      "local_sha256": "fd451f69962bbb957da963761a98a48411c7830514df79146aae96cb280f433f"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/type_convert.cuh",
+      "destination": "csrc/libtorch_stable/type_convert.cuh",
+      "upstream_sha256": "9274a7464c53de92976f6b5a19cc548b315f5d85e68b825515a6ff1fd73be4ca",
+      "local_sha256": "39f75872c40860efbb702ff7778b31cd77c130a59fc0c7476b10e42e7d3f8b96"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/core/batch_invariant.hpp",
+      "destination": "csrc/core/batch_invariant.hpp",
+      "upstream_sha256": "0f7d5937bf059a1fe2a13d8710667d3ec826ba0bf221c0137e477773ad6049bd",
+      "local_sha256": "716842f7639ba551e55168e5ec5ba000d84f7a3dc9295cb24efd352f068ff927"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/cub_helpers.h",
+      "destination": "csrc/libtorch_stable/cub_helpers.h",
+      "upstream_sha256": "91bd3c5f862387c475806a13245f0353369439a4e83962d2798e820314c48c31",
+      "local_sha256": "91bd3c5f862387c475806a13245f0353369439a4e83962d2798e820314c48c31"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/__init__.py",
+      "destination": "cute/__init__.py",
+      "upstream_sha256": "50713012c3a5e8045f368672342aea6eeeb3b3ce0968cb5639b1f158b9499487",
+      "local_sha256": "5c01a671840fac7748386562b11e2718a8f7050087601d2dbc6cf53335b83dc0"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/blackwell_helpers.py",
+      "destination": "cute/blackwell_helpers.py",
+      "upstream_sha256": "16eb08f592e33208546743e0d25c940afb899d770f35af52caac2fbcb73d7fee",
+      "local_sha256": "c25b5985803e452b214517b55157143dc151872d7870b639eab0fa4b3f69d02f"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/block_info.py",
+      "destination": "cute/block_info.py",
+      "upstream_sha256": "9f140eaa9e528dc1c35e25da1de2cc43dbc20747d5187f8c1fc2c60c8644fba8",
+      "local_sha256": "51ac66b5b5c8dea21d0eacc357f7afe658b18aa27d1d0771bfadd3e1bc5c3828"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/block_sparse_utils.py",
+      "destination": "cute/block_sparse_utils.py",
+      "upstream_sha256": "27718205ec642ea6c2cef7fafab0ce21bc7f2ecf5ed554a965d5f803539f80d2",
+      "local_sha256": "88ee8e0119b4e79d477f8c23b724370ca46d653cf5b878b29e749875a6a8092c"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/block_sparsity.py",
+      "destination": "cute/block_sparsity.py",
+      "upstream_sha256": "bdbdae10f4b6eb4958907244b2a37664536e2c6da5ad1b562f82388e458ed906",
+      "local_sha256": "3b33761cc9aecb394afedf11c07ee137f44d6753d8de08361e9b86440f9b37e4"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/cache_utils.py",
+      "destination": "cute/cache_utils.py",
+      "upstream_sha256": "ded91c4f65ea434386eacf200cbcc9f1c604ad8b9b7dcbbe80e3264d794c00df",
+      "local_sha256": "23774d7025107b37502b37453f827a1ee4f34663377f55d4ce9018e49c376976"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/cute_dsl_ptxas.py",
+      "destination": "cute/cute_dsl_ptxas.py",
+      "upstream_sha256": "21f0674c9f5a99d7c339092e49d5822d387b0a4673888becff1ac073cb5ac619",
+      "local_sha256": "acce0bb4c445a205effe07705f259ceac6eec38d92b2f2a2a7da9804ab3d5c66"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/cute_dsl_utils.py",
+      "destination": "cute/cute_dsl_utils.py",
+      "upstream_sha256": "d9a05367193aa4f54875547b7ebc9be7d26b8a30d1910b354a6b9edfb5127990",
+      "local_sha256": "f7a31f7345dd8ed62d53c6a93d6af12faeb8b87a1bfc47a0f3f352887c78f239"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/fa_logging.py",
+      "destination": "cute/fa_logging.py",
+      "upstream_sha256": "bc71edfa4b1cb7af64b78def09e790ff4c6fe64ab4fcf8e3d9699f44e8d3c0a0",
+      "local_sha256": "bc71edfa4b1cb7af64b78def09e790ff4c6fe64ab4fcf8e3d9699f44e8d3c0a0"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/fast_math.py",
+      "destination": "cute/fast_math.py",
+      "upstream_sha256": "7e5f822bf4d0ba36967558f3ae9a1408b410cb726c31222cd61703569d1be738",
+      "local_sha256": "7e5f822bf4d0ba36967558f3ae9a1408b410cb726c31222cd61703569d1be738"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/flash_fwd_combine.py",
+      "destination": "cute/flash_fwd_combine.py",
+      "upstream_sha256": "e7e65d6a6ff0586fc865d1d40f05e456bc22bd1450f72bb0ba8ed4d7eee065fc",
+      "local_sha256": "05293531f2a4760c8ed3b8cb001283dc8eeb1184da96a14b81034ef61d0b8512"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/flash_fwd_sm100.py",
+      "destination": "cute/flash_fwd_sm100.py",
+      "upstream_sha256": "035dacccbb93cbe90271ccf806c9d58ce9ee276d1ca595b60053671f46bffe3c",
+      "local_sha256": "fb9fdb31a473db75b606a3acb131448bf1eacd9c449613a23c2cf29878ad3649"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/interface.py",
+      "destination": "cute/interface.py",
+      "upstream_sha256": "9ae16942bff2b8f7705b469eafbd8c82b96f93e4a3264c78683f86342bb5ebdf",
+      "local_sha256": "e6dbd9690106395cef18d046e7cf0129efbc485786c3078f474b7ea3b3611f6c"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/mask.py",
+      "destination": "cute/mask.py",
+      "upstream_sha256": "a295eb3241e9762f980d490e23cab9f460392f054ad57c39159dbfb9cf4abec6",
+      "local_sha256": "ae2334e806a1b7fbedb7c461fdbc7ade582e7fdf1d2cd2e203c7146ff09b15b5"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/mma_sm100_desc.py",
+      "destination": "cute/mma_sm100_desc.py",
+      "upstream_sha256": "ac6ec28b2f1a4b797c391a7807b88f83b430452d418262c3dfa7b0f3516e39f9",
+      "local_sha256": "ac6ec28b2f1a4b797c391a7807b88f83b430452d418262c3dfa7b0f3516e39f9"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/named_barrier.py",
+      "destination": "cute/named_barrier.py",
+      "upstream_sha256": "e9e2680224af6ba8260e36aae4bb2fdcf589b75bd0d07050df7c4c59e1c716dd",
+      "local_sha256": "e9e2680224af6ba8260e36aae4bb2fdcf589b75bd0d07050df7c4c59e1c716dd"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/pack_gqa.py",
+      "destination": "cute/pack_gqa.py",
+      "upstream_sha256": "b111f91c56406850918a7b9a4bbbc6d391f79ef608f1c0e104d525a979ede8db",
+      "local_sha256": "47e35710eceb6afa0d12651bd785a723f8989847f6349bd77dbe690bbd3acc94"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/paged_kv.py",
+      "destination": "cute/paged_kv.py",
+      "upstream_sha256": "1a0642add392a7ff20db9270b9b136848f5498a1c977ca71c68cbc0471058251",
+      "local_sha256": "7e7ad926c7c11e8b14a3d983a79011216b1bec9db44068f7087a15c660994536"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/pipeline.py",
+      "destination": "cute/pipeline.py",
+      "upstream_sha256": "849bce91c72be0a5c7458979e10c8290f45e05253a83600e30fb9540c61ed56a",
+      "local_sha256": "63cc7896b1838903b3d454e11e2fcee64e7ac3b212b3e2f8ac49c61b2372c07c"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/seqlen_info.py",
+      "destination": "cute/seqlen_info.py",
+      "upstream_sha256": "74df5465bfbb8ea1bd0eb0633c2f25601f356e1fa822f9d382a89132f8dcabeb",
+      "local_sha256": "ff13fe01ae80f8ad312d34356f6fbd2c825ccb440fb148f1fae21df58744a98a"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/softmax.py",
+      "destination": "cute/softmax.py",
+      "upstream_sha256": "6ca26da796b2794cc9dba5fdc5907e02c40b59b4033470a64d374989ec7cff91",
+      "local_sha256": "ab1aa9909a171707260af7967a9deddabe00486972d08f28de841675b6ae60e7"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/tile_scheduler.py",
+      "destination": "cute/tile_scheduler.py",
+      "upstream_sha256": "a2f36e052733e7aa67a0f78fe1f9e4c414dcd0ddb554a22d471cafb5562ef489",
+      "local_sha256": "ebedda029c9c2406c54c2806743f57e0f55e0970759edcffc2f5aff86cb1d402"
+    },
+    {
+      "source": "flash-attention-2c839c33742309ec41e620bf837495ec9926c56e/flash_attn/cute/utils.py",
+      "destination": "cute/utils.py",
+      "upstream_sha256": "0adb633cddf07a50c9a5b89280a2acd344cd4b709357e44ede0055b00d67e3d2",
+      "local_sha256": "fbb6ed95c57308cc185a056130be73f4d9ae002d83034b1927687b8f8661b5ee"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/model_executor/layers/fused_moe/fused_moe.py",
+      "destination": "moe_gemm.py",
+      "upstream_sha256": "72811a4e543cc6f415f184cb951b61522643cddc4d6456f61a2f8c1a53b2cf79",
+      "local_sha256": "ccb7618621b28708dec1d7db6cb38e22272b597ead051f8199babb8ae4154a04"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/distributed/device_communicators/symm_mem.py",
+      "destination": "symm_mem.py",
+      "upstream_sha256": "56a5dfe2c00867e51725199e9c72ab06c608eaa2d178c4495e83281bab9868cb",
+      "adapted": true,
+      "local_sha256": "5f9c15e87faca908415c050f0b4c1d7166fb186171a71d2e33f48ad4757cb180"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/distributed/device_communicators/all_reduce_utils.py",
+      "destination": "collective_sizes.py",
+      "upstream_sha256": "3fc9b469a461755c6a266a0176b6da7abf83dd91e5631ab0254d9d79917b0c0c",
+      "adapted": true,
+      "local_sha256": "06f81a3a0fb7c055d39497a48f43e45a38b45ebb564610a5af5843b973abaeaf"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/distributed/device_communicators/custom_all_reduce.py",
+      "destination": "collectives.py",
+      "upstream_sha256": "3ed3ff9bbcaf361071ce6af77b879f5d269ba816366f56619cb3c21d486c52e7",
+      "adapted": true,
+      "local_sha256": "3f7a4bd01490f4b2f4a5d24829cc86e1c491b167907f4763d96045bb1248ae65"
+    },
+    {
+      "source": "vllm-0.25.1/csrc/libtorch_stable/torch_bindings.cpp",
+      "destination": "csrc/bindings.cpp",
+      "upstream_sha256": "b9be706ab2203bfcadce075f30714711ef3c10da01d80846b83c70db8c6b7c9f",
+      "adapted": true,
+      "local_sha256": "8f45c794b594d849c0d7c40dbf0a954d3e2ecbd79595bd02710da1b857c66dc2"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/model_executor/layers/fused_moe/fused_moe.py",
+      "destination": "moe.py",
+      "upstream_sha256": "72811a4e543cc6f415f184cb951b61522643cddc4d6456f61a2f8c1a53b2cf79",
+      "adapted": true,
+      "local_sha256": "7ecbd849d1a5413d562dd74eaa2747ded3aab16d85bd67be06e286de8e31cb89"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/distributed/device_communicators/pynccl.py",
+      "destination": "collectives.py",
+      "upstream_sha256": "28596817ee9fb842026624a8a6c32b0637630b6b908ddb2a79ecccbeac531e35",
+      "adapted": true,
+      "local_sha256": "3f7a4bd01490f4b2f4a5d24829cc86e1c491b167907f4763d96045bb1248ae65"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/distributed/device_communicators/pynccl_wrapper.py",
+      "destination": "collectives.py",
+      "upstream_sha256": "5379921210d91f743bff98e57cb441a11eb6422f17dd687606c7326d64659541",
+      "adapted": true,
+      "local_sha256": "3f7a4bd01490f4b2f4a5d24829cc86e1c491b167907f4763d96045bb1248ae65"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/distributed/device_communicators/cuda_communicator.py",
+      "destination": "collectives.py",
+      "upstream_sha256": "d64357f3459d5ae69f27c7f999af44e498aa3332d6f1c2ed79dce284326ed201",
+      "adapted": true,
+      "local_sha256": "3f7a4bd01490f4b2f4a5d24829cc86e1c491b167907f4763d96045bb1248ae65"
+    },
+    {
+      "source": "vllm-0.25.1/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py",
+      "destination": "moe.py",
+      "upstream_sha256": "6a541bfdcf9e9a09fc888ea3f4a2e9689181e889e3a3ac9f49716d8d59cca142",
+      "adapted": true,
+      "local_sha256": "7ecbd849d1a5413d562dd74eaa2747ded3aab16d85bd67be06e286de8e31cb89"
+    }
+  ],
+  "modifications": [
+    "Removed FlashAttention backward/autograd/public training APIs, unused architectures, MLA and hd256 dispatch.",
+    "Kept the transitive forward/combine import closure, including the optional local PTXAS hook.",
+    "Replaced the testing module dependency with its two-line fake-mode helper.",
+    "Removed bundled device/shape MoE tables; the audited GB300 reference has no matching table.",
+    "Kernel arithmetic in retained attention kernel/helper modules is unchanged."
+  ],
+  "scope": "BF16 Blackwell SM10x forward attention (head dimensions <=128); audited GB300 MoE fallback"
+}

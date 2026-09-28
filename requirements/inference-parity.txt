@@ -1,0 +1,14 @@
+# Audited CUDA 13 / BF16 numerical parity profile. No vLLM installation required.
+# Install into the Megatron worker environment; keep its CUDA-enabled PyTorch build.
+torch>=2.11
+triton==3.6.0
+nvidia-cutlass-dsl[cu13]==4.5.2
+nvidia-cutlass-dsl-libs-cu13==4.5.2
+quack-kernels==0.4.1
+apache-tvm-ffi==0.1.9
+torch-c-dlpack-ext==0.1.5
+cuda-bindings==13.3.1
+cuda-pathfinder==1.5.6
+einops
+typing_extensions
+ninja

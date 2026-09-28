@@ -375,6 +375,9 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
+        if self.config.inference_vllm_parity:
+            self._vllm_parity = None
+
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
@@ -569,6 +572,12 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        if self.config.inference_vllm_parity and InferenceMode.is_active():
+            if self._vllm_parity is None:
+                from megatron.core.inference.vllm_parity import VllmHybridParity
+
+                self._vllm_parity = VllmHybridParity(self)
+            return self._vllm_parity.forward(self, hidden_states, inference_context)
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.mhc_num_residual_streams

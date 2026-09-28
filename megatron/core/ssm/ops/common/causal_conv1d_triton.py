@@ -57,6 +57,7 @@ def causal_conv1d_update_kernel(
     HAS_STATE_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
+    ROUND_PRODUCTS: tl.constexpr,
 ):
     """Triton implementation of causal_conv1d_update (kernel)."""
     batch_id = tl.program_id(0)
@@ -216,7 +217,18 @@ def causal_conv1d_update_kernel(
 
         # Compute output
         out_val = bias_val
-        if WIDTH == 2:
+        if ROUND_PRODUCTS:
+            # vLLM accumulates input-dtype products sequentially into FP32.
+            # Casting each product prevents FP32 multiply-add fusion across
+            # that rounding boundary while retaining Megatron's cache layout.
+            product_dtype = x_ptr.dtype.element_ty
+            out_val += (w0 * x_val_0).to(product_dtype).to(tl.float32)
+            out_val += (w1 * x_val_1).to(product_dtype).to(tl.float32)
+            if WIDTH >= 3:
+                out_val += (w2 * x_val_2).to(product_dtype).to(tl.float32)
+            if WIDTH >= 4:
+                out_val += (w3 * x_val_3).to(product_dtype).to(tl.float32)
+        elif WIDTH == 2:
             out_val += w0 * x_val_0 + w1 * x_val_1
         elif WIDTH == 3:
             out_val += w0 * x_val_0 + w1 * x_val_1 + w2 * x_val_2
@@ -224,7 +236,10 @@ def causal_conv1d_update_kernel(
             out_val += w0 * x_val_0 + w1 * x_val_1 + w2 * x_val_2 + w3 * x_val_3
 
         if SILU_ACTIVATION:
-            out_val = out_val * tl.sigmoid(out_val)
+            if ROUND_PRODUCTS:
+                out_val = out_val / (1 + tl.exp(-out_val))
+            else:
+                out_val = out_val * tl.sigmoid(out_val)
 
         tl.store(out_ptrs, out_val.to(out_ptrs.dtype.element_ty), mask=mask)
 
@@ -237,6 +252,7 @@ def causal_conv1d_update(
     silu_activation: bool,
     conv_state_indices: torch.Tensor | None,
     intermediate_conv_states: torch.Tensor | None = None,
+    round_products_to_input_dtype: bool = False,
 ) -> torch.Tensor:
     """Triton implementation of causal_conv1d_update (entrypoint)."""
 
@@ -317,6 +333,7 @@ def causal_conv1d_update(
         HAS_STATE_INDICES=has_state_indices,
         HAS_INT_STATE=has_int_state,
         SILU_ACTIVATION=silu_activation == "silu",
+        ROUND_PRODUCTS=round_products_to_input_dtype,
     )
 
     if is_2d:

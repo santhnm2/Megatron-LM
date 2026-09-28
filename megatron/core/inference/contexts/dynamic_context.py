@@ -373,6 +373,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+        self.inference_vllm_parity = model_config.inference_vllm_parity
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -744,6 +745,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+        # Keep the scheduling budget exact while allocating room for the
+        # rounded forward shape (for example, 8480 real tokens need 8512 slots).
+        self.max_padded_tokens = self.round_up_tokens(self.max_tokens, tp_size=tp_size)
 
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
@@ -809,9 +813,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.transformer_impl == "transformer_engine"
         )
 
-        # We only allow non-decode cuda graphs for the nvls dispatcher
+        # The vLLM 0.25.1 reference profile captures full decode graphs and runs
+        # prefill through compiled primitives without graph-size padding.
+        # Padding a prefill can select a different router GEMM reduction.
+        # Other profiles only allow non-decode graphs for the nvls dispatcher.
         force_disable_non_decode_cuda_graphs = (
-            self._nccl_ep_dispatcher or self._training_ep_dispatcher
+            self._nccl_ep_dispatcher
+            or self._training_ep_dispatcher
+            or model_config.inference_vllm_parity
         )
 
         self.use_cuda_graphs_for_non_decode_steps = (
@@ -847,6 +856,26 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
         )
 
+        # Keep SP-aligned model buffers, but capture the reference's small
+        # attention batches independently. FA4's native split heuristic uses
+        # the metadata request count, including padding; 1 and 4 requests can
+        # therefore have different reduction orders on identical logical KV.
+        if model_config.inference_vllm_parity and self.num_speculative_tokens == 0:
+            decode_graphs = [
+                dims for dims in self.cuda_graph_batch_dimensions_list if not dims.prefill_req_count
+            ]
+            if decode_graphs:
+                smallest = min(decode_graphs)
+                for count in (1, 2, 4):
+                    if count < smallest.decode_req_count:
+                        self.cuda_graph_batch_dimensions_list.append(
+                            InferenceBatchDimensions(
+                                token_count=smallest.token_count,
+                                decode_req_count=smallest.decode_req_count,
+                                attention_req_count=count,
+                            )
+                        )
+
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
         #
@@ -880,9 +909,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
             # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
-            moe_max_rows = max(
-                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
-            )
+            moe_max_rows = max(self.max_padded_tokens, self.max_padded_tokens // tp_size * ep_size)
             VllmFusedMoeBuffers.allocate_buffers(
                 max_tokens=moe_max_rows,
                 topk=model_config.moe_router_topk,
@@ -1059,12 +1086,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
-                max_tokens=self.max_tokens,
+                max_tokens=self.max_padded_tokens,
                 max_intermediate_count=self.max_mamba_intermediate_states_per_step,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
                 decode_indices_dtype=self._mamba_decode_indices_dtype,
                 gdp_num_householder=self.gdp_num_householder,
+                align_chunk_boundaries=self.inference_vllm_parity,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
@@ -1248,8 +1276,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # `[:n_active]` but on CPU at `[paused_count:total_count)` — so the
         # staging slots here are refreshed each step by copying the active
         # slice from the persistent `request_*` tensors above.
-        _tok_int64_bytes = self.max_tokens * 8
-        _tok_int32_bytes = self.max_tokens * 4
+        _tok_int64_bytes = self.max_padded_tokens * 8
+        _tok_int32_bytes = self.max_padded_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
         # Scalar: real (unpadded) token count for the current step. Refreshed
@@ -1286,16 +1314,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             _mamba_align_pad = (
                 _decode_index_bytes - _pre_mamba_bytes % _decode_index_bytes
             ) % _decode_index_bytes
-            self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
+            self._max_mamba_chunks = (
+                self.max_padded_tokens // self.mamba_chunk_size
+                + self.max_requests * (2 if self.inference_vllm_parity else 1)
+            )
             _mamba_batch_indices_decode_bytes = self.max_requests * _decode_index_bytes
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
-            _mamba_seq_idx_bytes = self.max_tokens * 4
+            _mamba_seq_idx_bytes = self.max_padded_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
             _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
             _mamba_last_chunk_indices_bytes = self.max_requests * 4
             _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
-            _mamba_conv_seq_idx_bytes = self.max_tokens * 4
-            _mamba_conv_seq_start_bytes = self.max_tokens * 4
+            _mamba_conv_seq_idx_bytes = self.max_padded_tokens * 4
+            _mamba_conv_seq_start_bytes = self.max_padded_tokens * 4
         else:
             _mamba_align_pad = 0
             self._max_mamba_chunks = 0
@@ -1487,7 +1518,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._cpu_mamba_seq_idx = (
                 self._cpu_bookkeeping_buf[_off : _off + _mamba_seq_idx_bytes]
                 .view(torch.int32)
-                .view(1, self.max_tokens)
+                .view(1, self.max_padded_tokens)
             )
             _off += _mamba_seq_idx_bytes
             self._cpu_mamba_cu_seqlens = self._cpu_bookkeeping_buf[
@@ -1539,7 +1570,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Populated per-step by transfer_bookkeeping_to_gpu().
         self.gpu_view = ContextGPUView(
             max_requests=self.max_requests,
-            max_tokens=self.max_tokens,
+            max_tokens=self.max_padded_tokens,
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
@@ -2530,6 +2561,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
+        if (
+            construct_graph_dimensions is not None
+            and construct_graph_dimensions.attention_req_count
+        ):
+            # Capture uses SP-sized dummy requests. Its attention capacity is
+            # explicitly smaller and becomes the runtime graph selection key.
+            best_graph = construct_graph_dimensions
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
@@ -2693,7 +2731,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # initialize_attention_state() and transfer_bookkeeping_to_gpu() see
         # populated entries (the actual data fill happens at the H2D).
         mha.set_state_data(
-            padded_active_request_count=padded_bs,
+            padded_active_request_count=(
+                real_bs
+                if self.inference_vllm_parity and not self.using_cuda_graph_this_step()
+                else (self.padded_batch_dimensions.attention_req_count or padded_bs)
+            ),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
@@ -2718,6 +2760,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
                 intermediate_offsets_gpu=intermediate_offsets_gpu,
                 intermediate_counts_gpu=intermediate_counts_gpu,
+                prefill_context_lengths=(
+                    request_kv_length_offsets_view[
+                        attn_dimensions.decode_req_count : attn_dimensions.req_count
+                    ]
+                    if self.inference_vllm_parity
+                    else None
+                ),
             )
 
         if self.moe_enable_routing_replay:

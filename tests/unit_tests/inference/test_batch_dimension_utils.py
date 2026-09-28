@@ -178,6 +178,27 @@ class TestCUDAGraphTokenCountAlignment:
         assert None not in selected, "Decode-only step at the request limit found no graph"
 
 
+class TestAttentionRequestCapacity:
+    """Attention capacity selects distinct graphs without shrinking SP buffers."""
+
+    @pytest.mark.parametrize("requests,capacity", [(1, 1), (2, 2), (3, 0), (4, 0)])
+    def test_small_decode_graph_selection(self, requests, capacity):
+        graphs = [BD(4, 0, 4), BD(4, 0, 4, 1), BD(4, 0, 4, 2)]
+        selected = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            BD(requests, 0, requests), graphs, strict=True, match_ep_token_counts=False
+        )
+        assert selected.attention_req_count == capacity
+        assert selected.token_count == selected.decode_req_count == 4
+        assert all(graph.is_valid(4, 4096, 0) for graph in graphs)
+        # The graph manager must retain all three captured variants.
+        assert len({graph: object() for graph in graphs}) == 3
+
+    def test_invalid_attention_capacity(self):
+        assert not BD(4, 0, 4, 5).is_valid(4, 4096, 0)
+        assert not BD(4, 1, 3, 1).is_valid(4, 4096, 0)
+        assert not BD(4, 0, 2, 1).is_valid(4, 4096, 1)
+
+
 class TestGenerateCUDAGraphEdgeCases:
     """Single-process tests for graph generation edge cases."""
 

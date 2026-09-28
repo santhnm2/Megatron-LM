@@ -10,6 +10,8 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -247,3 +249,44 @@ def test_dsv4_q_rms_norm_replays(dtype, layout):
     assert_replays_bit_exact(
         lambda q: _q_rms_norm(q, 1e-6), (q,), replays=3, contention=True, what="_q_rms_norm"
     )
+
+
+@pytest.mark.parametrize("groups", [2, 4])
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_parity_attention_qkv_shards(monkeypatch, groups, rank):
+    """Checkpoint shards preserve query order and replicate the correct KV head."""
+    from megatron.core.inference import vllm_parity
+
+    heads, head_dim, hidden, tp = 8, 8, 32, 4
+    # Distinct exact integer projections make a wrong head/order unambiguous.
+    q = torch.arange(heads * head_dim, dtype=torch.float32)[:, None].expand(-1, hidden)
+    k = 100 + torch.arange(groups * head_dim, dtype=torch.float32)[:, None].expand(-1, hidden)
+    v = 200 + torch.arange(groups * head_dim, dtype=torch.float32)[:, None].expand(-1, hidden)
+    packed = torch.cat(
+        [
+            torch.cat((qpart, kpart, vpart))
+            for qpart, kpart, vpart in zip(q.chunk(groups), k.chunk(groups), v.chunk(groups))
+        ]
+    )
+    layer = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_channels=head_dim, num_attention_heads=heads, num_query_groups=groups
+        ),
+        pg_collection=SimpleNamespace(tp=object()),
+        linear_qkv=SimpleNamespace(weight=packed.chunk(tp)[rank]),
+    )
+    monkeypatch.setattr(vllm_parity.dist, "get_world_size", lambda group: tp)
+    monkeypatch.setattr(vllm_parity.dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(
+        vllm_parity.dist, "all_gather_into_tensor", lambda out, local, group: out.copy_(packed)
+    )
+    x = torch.ones(3, 1, hidden)
+    actual = vllm_parity.attention_qkv(layer, x)
+    kv_head = rank // (tp // groups)
+    expected = (
+        F.linear(x, q.chunk(tp)[rank]).reshape(3, 1, heads // tp, head_dim),
+        F.linear(x, k.chunk(groups)[kv_head]).reshape(3, 1, 1, head_dim),
+        F.linear(x, v.chunk(groups)[kv_head]).reshape(3, 1, 1, head_dim),
+    )
+    for result, reference in zip(actual, expected):
+        assert torch.equal(result, reference)

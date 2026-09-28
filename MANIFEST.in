@@ -3,3 +3,4 @@ include megatron/core/README.md
 include megatron/core/package_info.py
 global-exclude LICENSE
 recursive-include requirements *
+recursive-include megatron/core/inference/parity_kernels *.cu *.cuh *.h *.hpp *.cpp *.json LICENSE.* *.md

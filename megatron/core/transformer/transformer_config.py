@@ -1385,6 +1385,28 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
+    inference_vllm_parity: bool = False
+    """Experimental Nemotron-H inference path using the pinned vLLM primitives.
+
+    Requires vLLM 0.25.1 in the same Python environment, PP=CP=EP=1, and
+    expert tensor parallelism equal to tensor parallelism. It keeps the
+    Megatron model parameters, request engine, and recurrent/KV caches.
+    Training continues to use the original forward path.
+    """
+
+    inference_vllm_compile_norm: bool = True
+    """Compile grouped gated and residual normalization as in the production reference.
+
+    False is an eager-reference diagnostic; it is not production parity.
+    """
+
+    inference_vllm_compile_moe: bool = True
+    """Compile the routed-expert scale and shared-expert addition together.
+
+    Production vLLM fuses these operations without intermediate BF16 rounding.
+    False selects the separately rounded eager-reference diagnostic.
+    """
+
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -1940,7 +1962,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
-            if self.expert_tensor_parallel_size > 1:
+            if self.expert_tensor_parallel_size > 1 and not self.inference_vllm_parity:
                 raise ValueError(
                     "Inference-optimized MoE layers does not support expert tensor parallelism."
                 )

@@ -712,6 +712,80 @@ class TestMambaPrefixCachingE2E:
         assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id
         assert finished[0] == finished[2]
 
+    @pytest.mark.parametrize("schedule", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC])
+    @pytest.mark.parametrize("cache_recurrent_state", [False, True])
+    @torch.inference_mode()
+    def test_chunked_prefill_kv_hit_without_recurrent_snapshot(
+        self, schedule, cache_recurrent_state
+    ):
+        """A KV-only hit must not skip recurrent updates on a continuation chunk.
+
+        Two unrelated requests exhaust a four-slot recurrent cache while the
+        larger KV cache retains the first prompt. Repeating that prompt must
+        produce the same logits and recurrent state as its initial prefill.
+        The no-snapshot configuration exercises memory-only KV deduplication.
+        """
+        model = self._create_model()
+        engine = self._build_engine(
+            model,
+            ssm_state_config(model),
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            prefix_caching_mamba_gb=0.1 if cache_recurrent_state else 0.0,
+            max_tokens=512,
+            max_requests=4,
+            async_sched_mode=schedule,
+        )
+        ctx = engine.context
+        if cache_recurrent_state:
+            per_slot_bytes = ctx.num_mamba_layers * (
+                math.prod(ctx.mamba_conv_states_shape) * ctx.mamba_conv_states_dtype.itemsize
+                + math.prod(ctx.mamba_ssm_states_shape) * ctx.mamba_ssm_states_dtype.itemsize
+            )
+            budget_bytes = per_slot_bytes * (ctx.max_mamba_intermediate_states_per_step + 4)
+            ctx._allocate_mamba_cache(budget_bytes / 1024**3)
+            assert ctx.mamba_slot_allocator.max_slots == 4
+
+        captures = []
+
+        def capture_prefill(module, args, output):
+            logits = output[0] if isinstance(output, tuple) else output
+            slot = int(ctx.mamba_metadata.request_to_mamba_state_idx[0])
+            # Legacy emits all padded tokens; async emits the last token only.
+            row = ctx.active_token_count - 1 if logits.shape[1] > ctx.total_request_count else 0
+            captures[:] = [
+                logits[0, row].detach().clone(),
+                ctx.mamba_ssm_states[:, slot].clone(),
+                ctx.mamba_conv_states[:, slot].clone(),
+            ]
+
+        handle = model.register_forward_hook(capture_prefill)
+        try:
+            for request_id, offset in enumerate((0, 2000, 4000, 0)):
+                prompt = torch.arange(offset, offset + 832, dtype=torch.int64, device="cuda")
+                req = self._make_request(request_id, prompt, True, num_tokens=1)
+                engine._add_request(req)
+                if request_id == 3:
+                    assert all(h in ctx.kv_block_allocator.kv_hash_to_block_id for h in hashes)
+                    if cache_recurrent_state:
+                        assert all(
+                            h not in ctx.mamba_slot_allocator.hash_to_block_id for h in hashes
+                        )
+                for _ in range(20):
+                    result = engine.step_modern()
+                    if result["finished_requests"]:
+                        break
+                else:
+                    pytest.fail("Request did not finish within 20 steps")
+                assert not engine.has_unfinished_requests()
+                if request_id == 0:
+                    hashes = req.precomputed_block_hashes[:3]
+                    initial = captures.copy()
+            for expected, actual in zip(initial, captures):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            handle.remove()
+
     @torch.inference_mode()
     def test_mamba_chunked_prefill_unaligned_boundary_snapshot(self):
         """Chunked prefill snapshots Mamba state at the last block boundary.

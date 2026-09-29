@@ -23,7 +23,13 @@ and `ops/mamba2` layout. All 52 vendored runtime files are unchanged.
   comparisons and 20 SSD-policy comparisons. All 32 parity helper ASTs (plus
   eight other cached helpers) match controlled run 4074593 after source
   filename normalization. Production tuning winners remain native.
-- The recorded-history stress rerun is still pending.
+- Native stress job 4074911 completes all 1,636 requests, with exact recorded
+  input histories, zero request errors and no CUDA faults in the retained engine
+  log. It generates 372,004 tokens over 64 conversations and contexts up to
+  196,480 tokens. Fresh manual review covers 44 outputs across all 32 tasks;
+  some are incorrect or repetitive. The raw Ray-log archive is missing, so the
+  fault scan currently covers the engine log only. See the
+  [stress report](vllm_parity_stress_test.md) for evidence and limits.
 
 The frozen runtime matches all 651 MCore files in both validation wheels.
 Test-only launch compatibility adapts the older pinned NeMo-RL/Bridge container

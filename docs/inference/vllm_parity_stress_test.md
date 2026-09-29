@@ -1,5 +1,59 @@
 # Recorded-history stress test of self-contained parity inference
 
+## Port to current main — September 28, 2026
+
+Branch `vllm-numerical-parity-main`, implementation commit `cfa2b0b488`, starts
+directly at main `c035a426e7`. Native stress job **4074911** completes all
+**1,636 requests**, with **zero request errors** and **no CUDA faults found in
+the retained engine log**. Slurm reports `COMPLETED`, exit `0:0`. The worker
+preflight confirms `vllm_available: false`; production tuning remains native.
+The source used by this run is byte-identical to the full-model and native
+policy validation source. Subsequent branch changes are documentation only.
+
+| Measurement | Main-based run 4074911 |
+|---|---:|
+| Recorded conversations / SWE tasks | 64 / 32 |
+| Peak concurrent client requests | 64 |
+| Prompt length range | 5,776–196,480 tokens |
+| Total prompt tokens | 130,753,329 |
+| Fresh generated tokens | 372,004 |
+| Stop / length finishes | 1,311 / 325 |
+| Replay duration, excluding startup | 1,538.3 seconds |
+| Maximum sampled GPU memory per device | 97,659 MiB |
+
+All 1,636 request IDs and all 12 recorded-history protocol fields match run
+4022383, including exact prefix hashes, prompt lengths, output limits and turn
+boundaries. The client is byte-identical to that earlier run and validates
+server-echoed prompt tokens. Fresh outputs never enter subsequent history;
+generated commands are never executed. Independent stochastic output tokens and
+timings are not an equality test or controlled performance comparison.
+
+Fresh manual review covers **44 outputs across all 32 tasks**: every original
+41 review request ID, plus three new first/longest phase selections. This also
+covers every candidate selected by the final analyzer. At 195,982 and 196,480
+input tokens, the responses recognize recorded passing tests and request a diff.
+Other responses contain wrong source-language searches, an identity comparator
+described as deep equality, attempts to run a deleted script, and strong
+circular reasoning in Rust macro, Salesforce path, SNS ARN and PHP debugging.
+The compression screen flags none of these repetitive responses. This is a
+serving-stability result, **not a blanket generation-quality pass** or evidence
+about the cause of RL looping. Generated fixes were not executed or scored.
+
+Graph buckets 4, 8, 16, 24 and 32 appear in sampled engine status lines. The
+largest sampled actual batch is 31 requests, including 31 decodes; these are
+samples rather than a complete replay count.
+
+**Log-coverage limitation:** the cleanup collector did not retain the raw Ray
+logs. The CUDA-fault scan covers the retained engine log, which receives Ray
+worker output with log deduplication disabled. It does not claim a separate
+scan of the missing raw logs.
+
+Evidence is retained under `swe_inference_audit/parity_main_v1/`, including the
+frozen source and NeMo-RL manifests, launch overlays, quality results 4073680,
+full-model results 4074593, native-policy results 4074731, and stress results
+4074911. The separate numerical checks rerun the original acceptance scenarios;
+see [the main-port validation summary](vllm_numerical_parity.md#port-to-current-main-2026-09-28).
+
 ## Result — September 26, 2026
 
 The self-contained parity implementation completed **1,636 / 1,636 requests**

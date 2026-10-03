@@ -624,7 +624,13 @@ def hybrid_config_from_args(
         assert (
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
-    elif args.spec is not None:
+    # NOT `elif`: --spec was previously ignored under `inference_optimized`, so
+    # `hybrid_stack_spec` stayed None and the provider silently fell back to
+    # `hybrid_inference_stack_spec` (MambaMixer) even when the user asked for, say,
+    # `gated_delta_product_stack_spec`. Checkpoints new enough to serialize their model
+    # config carry the spec and so escaped this; older ones built a Mamba model against
+    # GatedDeltaProduct weights.
+    if args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
             raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")

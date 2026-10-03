@@ -474,7 +474,16 @@ class HybridStack(MegatronModule):
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
-        for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
+        # `_execution_layer_config_list`, not `layer_config_list`: with moe_shortcut_connection
+        # a ShortcutMoEBlock fuses two original layers into one entry of `self.layers`, so the
+        # per-original-layer `layer_config_list` no longer lines up positionally -- config[0]
+        # would be paired with the block rather than with the layer it describes.
+        for layer_config, layer in zip(
+            self._execution_layer_config_list, self.layers, strict=True
+        ):
+            # The recurrent mixer lives on the block's wrapped compute layer.
+            if isinstance(layer, ShortcutMoEBlock):
+                layer = layer.attn_layer
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:

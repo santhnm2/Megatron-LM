@@ -42,7 +42,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -80,7 +80,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -918,6 +918,9 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    batch_invariant_mode: bool = False
+    batch_invariant_backend: str = "te_native"
+    flash_attention_version: Optional[int] = None
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
@@ -958,6 +961,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
+    mtp_num_layers: Optional[int] = None
     # A repeated (rather than per-depth) MTP head is one of the gates on
     # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
     mtp_use_repeated_layer: bool = False
@@ -997,6 +1001,11 @@ class DynamicEngineTestConfig:
             self.position_embedding_type = (
                 "none" if self.num_speculative_tokens else "learned_absolute"
             )
+
+        # Preserve the historical test-harness behavior while allowing tests to
+        # build dormant or repeated MTP layers independently of active speculation.
+        if self.mtp_num_layers is None:
+            self.mtp_num_layers = self.num_speculative_tokens
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -1192,7 +1201,7 @@ class DynamicInferenceEngineTestBase:
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1234,6 +1243,13 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                flash_attention_version=test_config.flash_attention_version,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1276,7 +1292,7 @@ class DynamicInferenceEngineTestBase:
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
-            if test_config.num_speculative_tokens > 0:
+            if test_config.mtp_num_layers > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
@@ -1303,7 +1319,7 @@ class DynamicInferenceEngineTestBase:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1334,6 +1350,13 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                flash_attention_version=test_config.flash_attention_version,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1357,9 +1380,9 @@ class DynamicInferenceEngineTestBase:
             )
 
             # Hybrid model.
-            # When speculative tokens are configured, append MTP depth sections
+            # When MTP layers are configured, append their depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.mtp_num_layers
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
@@ -1549,7 +1572,8 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1, kv_block_allocator=types.SimpleNamespace()
     )
-    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.requests = {request.request_id: RequestEntry(record=record, future=mock.Mock())}
+    engine._discard_prompt_logprob_state = mock.Mock()
     engine.waiting_request_ids = deque()
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -1596,9 +1620,13 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     request = record[-1]
     future = asyncio.get_running_loop().create_future()
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.requests = {41: types.SimpleNamespace(record=record, future=future)}
+    engine.requests = {41: RequestEntry(record=record, future=future)}
     engine.context = types.SimpleNamespace(
-        kv_block_allocator=types.SimpleNamespace(), remove_vlm_request_data=mock.Mock()
+        kv_block_allocator=types.SimpleNamespace(),
+        remove_vlm_request_data=mock.Mock(),
+        prompt_logprobs_cache_keys={},
+        prompt_logprobs_block_hashes={},
+        prompt_logprobs_matched_refs={},
     )
     engine.controller = types.SimpleNamespace(
         tokenizer=types.SimpleNamespace(
@@ -1642,7 +1670,7 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     )
     failed_record = DynamicInferenceRequestRecord.from_request(failed)
     failed_future = asyncio.get_running_loop().create_future()
-    engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
+    engine.requests = {42: RequestEntry(record=failed_record, future=failed_future)}
     engine.failed_request_ids = []
     engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
     submit = dynamic_engine.Headers.SUBMIT_REQUEST.value
@@ -1695,8 +1723,10 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     to_record = DynamicInferenceRequestRecord.from_request
     engine.requests = {
-        request.request_id: types.SimpleNamespace(record=to_record(request)) for request in requests
+        request.request_id: RequestEntry(record=to_record(request), future=mock.Mock())
+        for request in requests
     }
+    engine._discard_prompt_logprob_state = mock.Mock()
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
@@ -2352,19 +2382,25 @@ def test_streaming_partials_are_sent():
         generated_tokens=[11, 12, 13],
         generated_log_probs=[-0.1, -0.2, -0.3],
         generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
-        prompt_log_probs=[-0.4],
-        prompt_top_n_logprobs=[{"prompt": -0.04}],
+        prompt_log_probs=None,
+        prompt_top_n_logprobs=None,
         sampling_params=types.SimpleNamespace(
             streaming=True, return_log_probs=True, skip_prompt_log_probs=False
         ),
     )
-    engine.requests = {7: types.SimpleNamespace(record=[request])}
+    entry = types.SimpleNamespace(record=[request], prompt_logprobs_complete=True)
+    engine.requests = {7: entry}
+    engine._materialize_prompt_logprob_sidecars = mock.Mock(
+        side_effect=lambda _, **__: request.__dict__.update(
+            prompt_log_probs=[-0.4], prompt_top_n_logprobs=[{"prompt": -0.04}]
+        )
+    )
     engine.socket_for_receiving_requests = mock.Mock()
 
     engine._try_send_streaming_partials()
 
-    # Partials go out as [metadata, body] frames: the metadata names the request
-    # ids so the coordinator can route without decoding the bodies.
+    engine._materialize_prompt_logprob_sidecars.assert_called_once_with(entry, retain_state=True)
+    # Metadata names the request IDs so the coordinator can route the body.
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
     assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]

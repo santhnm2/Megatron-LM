@@ -442,6 +442,20 @@ class TestMtpDecodeBookkeeping:
         # Every capture row is a real (non-padding) row, so nothing is sentinel-filled.
         assert context.gpu_view.mha_query_lengths[:4].cpu().tolist() == [1, 1, 1, 1]
 
+    def test_eager_scratch_staging_uses_non_graph_metadata(self):
+        """An eager EP dummy stages on scratch too, but launches with the eager metadata."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        dummy = context.kv_block_allocator.dummy_block_idx
+
+        context.mtp_metadata.begin_decode_for_capture(2, graphed=False)
+        context._mtp_setup_decode_step()
+
+        assert context.active_attn_metadata is context.non_graph_attn_metadata
+        assert context._using_cuda_graph_this_step is False
+        assert (context.gpu_view.token_to_block_idx[:2] == dummy).all()
+        assert context.gpu_view.mha_kv_seq_lengths[:2].cpu().tolist() == [1, 1]
+
     def test_begin_decode_for_capture_touches_only_scratch_kv(self):
         """Capture-time metadata must point every row at the scratch block."""
         context = _make_context()

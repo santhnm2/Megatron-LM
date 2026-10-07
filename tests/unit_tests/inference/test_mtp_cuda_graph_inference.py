@@ -1476,17 +1476,17 @@ class TestMtpKvCacheIdleExpertParallelRank:
     def test_idle_rank_matches_active_rank_with_cuda_graphs(self, model_type):
         """Same parity contract with MTP CUDA graphs captured by the engine warmup.
 
-        Graphed is the harder case: the active rank replays the KV-aware ("mtp_kv", ...)
-        graphs while the idle rank must replay the cache-free ("mtp", ...) ones, and both
-        families have to have been captured at the same batch size.
+        Graphed is the harder case: with the MTP KV cache on, both ranks replay the KV-aware
+        ("mtp_kv", ...) graphs (the idle rank staged on the dummy block), so the family has to
+        have been captured at the batch size both ranks resolve to.
         """
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_idle = ep_rank % 2 == 0
 
         model = self._build_model(model_type=model_type)
         controller, context = self._build_controller(model, num_cuda_graphs=-1)
-        # Engine construction runs create_cuda_graphs(), capturing both MTP graph families
-        # exactly as production warmup does.
+        # Engine construction runs create_cuda_graphs(), capturing the MTP graphs exactly as
+        # production warmup does.
         DynamicInferenceEngine(controller, context)
 
         if is_idle:

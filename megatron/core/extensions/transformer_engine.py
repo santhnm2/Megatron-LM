@@ -3945,6 +3945,24 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
     )
 
     try:
+        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+            mark_qb_bin_bounds_validated,
+        )
+    except ImportError:
+        mark_qb_bin_bounds_validated = None
+
+    try:
+        _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_qb = {
+            "qb_histogram",
+            "qb_bin_bounds",
+            "qb_histogram_mode",
+        }.issubset(_fused_topk_sig.parameters)
+        del _fused_topk_sig
+    except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_qb = False
+
+    try:
         _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
         fused_topk_with_score_function_supports_topk_indices = (
             "topk_indices" in _fused_topk_sig.parameters
@@ -3958,6 +3976,8 @@ else:
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
     fused_topk_with_score_function_supports_topk_indices = False
+    fused_topk_with_score_function_supports_qb = False
+    mark_qb_bin_bounds_validated = None
 
 
 def set_save_original_input(module):

@@ -43,20 +43,11 @@ def checkpoint_keys(monkeypatch):
 
 
 def test_checkpoint_detection(checkpoint_keys):
-    args = SimpleNamespace(moe_router_enable_expert_bias=False)
+    args = SimpleNamespace()
     assert vlm._mimo_checkpoint_prefix_map(args) is None
-    vlm._enable_checkpoint_expert_bias(args)
-    assert not args.moe_router_enable_expert_bias
 
-    checkpoint_keys += [
-        _ENCODER_KEY,
-        _PROJECTION_KEY,
-        'language_model.module.module.decoder.layers.1.mlp.router.expert_bias',
-    ]
+    checkpoint_keys += [_ENCODER_KEY, _PROJECTION_KEY]
     assert vlm._mimo_checkpoint_prefix_map(args) == _PREFIX_MAP
-    # Trained biases in the checkpoint win over its saved args.
-    vlm._enable_checkpoint_expert_bias(args)
-    assert args.moe_router_enable_expert_bias
 
     checkpoint_keys += [f'{_MODALITY}encoders.other_encoder.patch_embed.weight']
     with pytest.raises(ValueError, match='one vision encoder'):

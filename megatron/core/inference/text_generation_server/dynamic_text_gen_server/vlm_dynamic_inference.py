@@ -204,23 +204,6 @@ def _mimo_checkpoint_prefix_map(args):
     }
 
 
-def _enable_checkpoint_expert_bias(args):
-    """Route with the trained router expert biases when the checkpoint carries them.
-
-    Routing adds each MoE router's expert_bias to the scores when selecting experts. A checkpoint
-    can hold trained biases while its saved args disable them (e.g. quantile balancing that
-    estimates expert_bias from global-batch histograms), and --use-checkpoint-args would then
-    build routers without them.
-    """
-    if any(key.endswith('router.expert_bias') for key in _checkpoint_tensor_keys(args)):
-        if not args.moe_router_enable_expert_bias:
-            print_rank_0(
-                'Enabling moe_router_enable_expert_bias: the checkpoint has trained router '
-                'expert biases'
-            )
-        args.moe_router_enable_expert_bias = True
-
-
 # Image token roles a tokenizer_config.json can declare, by the arg they fill.
 _TOKENIZER_IMAGE_TOKENS = {
     'image_token_id': 'image_token',
@@ -368,7 +351,6 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     # module under its own prefix; load a vision checkpoint into a LLaVAModel that uses those
     # key names.
     if hasattr(checkpoint_args, 'mimo_llm_tp'):
-        _enable_checkpoint_expert_bias(args)
         prefix_map = _mimo_checkpoint_prefix_map(args)
         if prefix_map is not None:
             args.mimo_checkpoint_prefix_map = prefix_map

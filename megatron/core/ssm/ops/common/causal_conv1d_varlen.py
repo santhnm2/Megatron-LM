@@ -39,6 +39,7 @@ def _causal_conv1d_varlen_kernel(
     out_ptr,
     total_tokens,
     conv_dim: tl.constexpr,
+    x_stride_token,
     initial_states_stride_req,
     initial_states_stride_dim,
     WIDTH: tl.constexpr,
@@ -49,7 +50,9 @@ def _causal_conv1d_varlen_kernel(
 ):
     """Depthwise causal conv1d over packed varlen sequences with initial states and SiLU.
 
-    Fully vectorized over BLOCK_T tokens x BLOCK_C channels per thread block.
+    Fully vectorized over BLOCK_T tokens x BLOCK_C channels per thread block. `x` rows are
+    `x_stride_token` apart, so a channel slice of a wider projection is read in place; the
+    output is dense `(total_tokens, conv_dim)`.
     """
     pid_c = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -78,10 +81,11 @@ def _causal_conv1d_varlen_kernel(
         src = t_off - (WIDTH - 1) + j  # (BLOCK_T,)
         in_seq = src >= req_start  # (BLOCK_T,) — True if source is within the sequence
 
-        # Load from x for in-sequence positions (mask out out-of-bounds)
-        src_safe = tl.maximum(src, 0)
+        # Load from x for in-sequence positions (mask out out-of-bounds). int64 row offsets:
+        # the token stride of a projection slice is the full projection width.
+        src_safe = tl.maximum(src, 0).to(tl.int64)
         x_val = tl.load(
-            x_ptr + src_safe[:, None] * conv_dim + c_off[None, :],
+            x_ptr + src_safe[:, None] * x_stride_token + c_off[None, :],
             mask=t_mask[:, None] & c_mask[None, :] & in_seq[:, None],
             other=0.0,
         ).to(
@@ -140,7 +144,9 @@ def causal_conv1d_varlen_fn(
     between `seq_idx` and `initial_states`.
 
     Args:
-        x: Input tensor of shape (total_tokens, conv_dim), channels-last packed.
+        x: Input tensor of shape (total_tokens, conv_dim), channels-last packed. Only the
+            channel dimension must be contiguous, so a channel slice of a wider projection
+            output can be passed without a copy.
         weight: Convolution weights of shape (conv_dim, d_conv).
         bias: Bias of shape (conv_dim,), or None for a bias-free convolution
             (Gated Delta Product layers default to ``conv_bias=False``).
@@ -159,14 +165,14 @@ def causal_conv1d_varlen_fn(
         Output tensor of shape (total_tokens, conv_dim).
     """
     assert activation == "silu", f"Only silu activation is supported, got {activation}"
-    assert x.is_contiguous(), "x must be contiguous"
+    assert x.stride(1) == 1, "x must be contiguous along the channel dimension"
     assert weight.is_contiguous(), "weight must be contiguous"
 
     total_tokens, conv_dim = x.shape
     d_conv = weight.shape[1]
     num_requests = cu_seqlens.shape[0] - 1
 
-    out = torch.empty_like(x)
+    out = torch.empty((total_tokens, conv_dim), dtype=x.dtype, device=x.device)
 
     # Use precomputed per-token metadata if provided (CUDA graph compatible),
     # otherwise compute from cu_seqlens via repeat_interleave.
@@ -214,6 +220,7 @@ def causal_conv1d_varlen_fn(
         out,
         total_tokens,
         conv_dim,
+        x.stride(0),
         is_stride_req,
         is_stride_dim,
         WIDTH=d_conv,

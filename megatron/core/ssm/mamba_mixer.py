@@ -891,7 +891,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
         xBC_out = causal_conv1d_varlen_fn(
-            x=xBC.squeeze(0).contiguous(),
+            x=xBC.squeeze(0),
             weight=conv_weight,
             bias=conv_bias,
             cu_seqlens=cu_seqlens,

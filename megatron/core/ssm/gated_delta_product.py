@@ -997,13 +997,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         (``seq_idx``) and start offsets (``seq_start``) rather than deriving them,
         which is what makes the step replayable from a CUDA graph. Stays in the
         (b, l, d) layout like ``_decode_conv``: the kernel takes a packed ``(T, d)``
-        sequence, so squeeze the batch dim rather than transposing to [B, D, L].
+        sequence, so squeeze the batch dim rather than transposing to [B, D, L]. The
+        kernel reads ``x``'s rows at their stride, so the VKQ slice of the input
+        projection is convolved in place rather than copied out first.
         ``initial_states`` carries each request's left boundary: zeros for a fresh
         prefill, the previous chunk's tail under chunked prefill.
         """
         assert self.cp is not None
         return causal_conv1d_varlen_fn(
-            x=x.squeeze(0).contiguous(),
+            x=x.squeeze(0),
             weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
             bias=self.cp.get_conv1d_bias(),
             cu_seqlens=cu_seqlens,

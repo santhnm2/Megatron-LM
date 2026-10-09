@@ -195,6 +195,50 @@ def _carry_reference(x, cu_seqlens, previous_states):
     return out
 
 
+class TestCausalConv1dVarlenStridedInput:
+    """The kernel reads `x` rows at their stride, so a channel slice of a wider projection
+    output needs no copy. It must produce exactly what the dense copy would."""
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("precomputed", [False, True])
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_slice_matches_dense_copy(self, dtype, precomputed, has_bias):
+        torch.manual_seed(7)
+        conv_dim, d_conv = 192, 4
+        seq_lens = [1, 2, 37, 300, 5]
+        cu_seqlens = torch.tensor(
+            [0] + list(torch.tensor(seq_lens).cumsum(0)), dtype=torch.int32, device="cuda"
+        )
+        total = int(cu_seqlens[-1])
+        # The conv input sits between two other projection outputs, as VKQ does between
+        # z and ba in the Gated Delta Product input projection.
+        proj = torch.randn(total, 64 + conv_dim + 40, dtype=dtype, device="cuda")
+        x = proj[:, 64 : 64 + conv_dim]
+        assert not x.is_contiguous() and x.stride(1) == 1
+        weight = torch.randn(conv_dim, d_conv, dtype=dtype, device="cuda")
+        bias = torch.randn(conv_dim, dtype=dtype, device="cuda") if has_bias else None
+        initial_states = torch.randn(
+            len(seq_lens), conv_dim, d_conv - 1, dtype=dtype, device="cuda"
+        )
+        kwargs = {}
+        if precomputed:
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            kwargs["precomputed_seq_idx"] = torch.repeat_interleave(
+                torch.arange(len(seq_lens), device="cuda", dtype=torch.int32), lengths
+            )
+            kwargs["precomputed_seq_start"] = torch.repeat_interleave(cu_seqlens[:-1], lengths).to(
+                torch.int32
+            )
+
+        out = causal_conv1d_varlen_fn(x, weight, bias, cu_seqlens, initial_states, **kwargs)
+        ref = causal_conv1d_varlen_fn(
+            x.contiguous(), weight, bias, cu_seqlens, initial_states, **kwargs
+        )
+        assert out.is_contiguous() and out.shape == (total, conv_dim)
+        assert torch.equal(out, ref)
+
+
 def _run_carry(lengths, d_conv=4, conv_dim=3, seed=0):
     torch.manual_seed(seed)
     cu_seqlens = torch.tensor(

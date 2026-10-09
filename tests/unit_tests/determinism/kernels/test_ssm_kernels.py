@@ -242,8 +242,10 @@ def test_causal_conv1d_update_spec_decode_replays():
     )
 
 
+@pytest.mark.parametrize("strided", [False, True], ids=["dense", "strided"])
 @pytest.mark.parametrize("cache_autotuning", [False, True], ids=["no_cache", "autotune_cache"])
-def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
+def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning, strided):
+    """``strided`` reads ``x`` as a channel slice of a wider projection, as prefill does."""
     from megatron.core.ssm.ops.common import causal_conv1d_varlen
 
     monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", "1" if cache_autotuning else "0")
@@ -267,7 +269,10 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
     seeded()
     dim, width = 2048, 4
     bounds = [0, 1000, 1500, 2048, 4096, 8192]
-    x = torch.randn(bounds[-1], dim, device="cuda", dtype=torch.bfloat16)
+    if strided:
+        x = torch.randn(bounds[-1], dim + 384, device="cuda", dtype=torch.bfloat16)[:, 256:-128]
+    else:
+        x = torch.randn(bounds[-1], dim, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
     cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")

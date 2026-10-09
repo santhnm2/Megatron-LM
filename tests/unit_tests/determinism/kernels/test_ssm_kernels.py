@@ -292,7 +292,7 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning, strided):
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-def _gdp_case():
+def _gdp_case(initial_state_from_cache=False):
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 
     seeded()
@@ -307,6 +307,35 @@ def _gdp_case():
     initial_state = torch.randn(len(bounds) - 1, H, K, V, device="cuda")
 
     def fn(q, k, v, g, beta, initial_state):
+        if initial_state_from_cache:
+            # Each sequence starts from, and overwrites, its own slot of a state cache. Slot
+            # indexing is the dynamic-batching path, which takes precomputed descriptors.
+            from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors
+
+            indices, indices_dp, offsets, _, _ = build_gdp_chunk_descriptors(
+                bounds, len(bounds) - 1, M, T
+            )
+            cache = initial_state.clone()
+            slots = torch.arange(len(bounds) - 1, dtype=torch.int32, device="cuda")
+            o, _ = chunk_gated_delta_product_varlen(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                M,
+                cu_seqlens,
+                state=cache,
+                state_indices=slots,
+                initial_state_from_cache=True,
+                use_qk_l2norm_in_kernel=True,
+                chunk_indices=torch.tensor(indices, dtype=torch.int32, device="cuda").view(-1, 2),
+                chunk_indices_dp=torch.tensor(indices_dp, dtype=torch.int32, device="cuda").view(
+                    -1, 2
+                ),
+                chunk_offsets=torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+            )
+            return o, cache
         return chunk_gated_delta_product_varlen(
             q,
             k,
@@ -323,16 +352,23 @@ def _gdp_case():
     return fn, (q, k, v, g, beta, initial_state)
 
 
-def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
-    """Runtime pinning covers the GDP autotuners, which training imports before determinism."""
+@pytest.mark.parametrize("initial_state_from_cache", [False, True], ids=["gathered", "in_cache"])
+def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch, initial_state_from_cache):
+    """Runtime pinning covers the GDP autotuners, which training imports before determinism.
+
+    ``in_cache`` reads the initial states from the state cache, which runs the chunk-state
+    kernel through its own autotuner (it restores the cache between timed trials).
+    """
     from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
 
-    tuners = (
-        _autotuner(chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64),
-        _autotuner(chunk_o.chunk_fwd_kernel_o),
+    kernel_h = (
+        chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64_state_in_cache
+        if initial_state_from_cache
+        else chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64
     )
+    tuners = (_autotuner(kernel_h), _autotuner(chunk_o.chunk_fwd_kernel_o))
     _forbid_benchmarks(monkeypatch, *tuners)
-    fn, args = _gdp_case()
+    fn, args = _gdp_case(initial_state_from_cache=initial_state_from_cache)
     fn(*args)
     torch.cuda.synchronize()
     _assert_pinned(*tuners)

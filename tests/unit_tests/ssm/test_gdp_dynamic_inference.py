@@ -1612,3 +1612,52 @@ class TestChunkGatedDeltaProductVarlen:
         torch.testing.assert_close(
             state_padded[untouched], state[untouched], atol=0, rtol=0, equal_nan=True
         )
+
+    @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+    def test_initial_state_from_cache_matches_gathered(self, state_dtype):
+        """Reading each request's incoming state from its cache slot inside the scan
+        is bitwise the old path of gathering `state[slots]` into `initial_state` first --
+        including continuation chunks (non-zero incoming state) and -1 padding requests.
+        `H=6` gives the in-place autotuner a key no other test uses, so its
+        `restore_value` trials run here on live data."""
+        seq_lens = [96, 33, 130, 0, 0]
+        q, k, v, g, beta, state, desc = _prefill_inputs(
+            seq_lens, H=6, K=128, V=64, num_householder=3, num_slots=8, padded_tokens=320
+        )
+        state = state.to(state_dtype)
+        slots = torch.tensor([5, 1, 3, -1, -1], device="cuda", dtype=torch.int32)
+
+        def run(from_cache):
+            cache = state.clone()
+            if from_cache:
+                kwargs = dict(initial_state_from_cache=True)
+            else:
+                kwargs = dict(initial_state=cache[slots.long()])
+            o, _, chunk_states = chunk_gated_delta_product_varlen(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                num_householder=3,
+                state=cache,
+                state_indices=slots,
+                use_qk_l2norm_in_kernel=True,
+                return_chunk_states=True,
+                **kwargs,
+                **desc,
+            )
+            return o, cache, chunk_states
+
+        # In-place first, so a fresh autotune benchmarks on this cache.
+        o_cache, cache_cache, states_cache = run(from_cache=True)
+        o_gather, cache_gather, states_gather = run(from_cache=False)
+
+        assert torch.equal(o_cache, o_gather)
+        assert torch.equal(cache_cache, cache_gather)
+        # Only the real requests' chunk rows are written; the rest of the padded buffer
+        # is uninitialized and never read.
+        real_rows = sum((n + 63) // 64 for n in seq_lens)
+        assert torch.equal(states_cache[:real_rows], states_gather[:real_rows])
+        untouched = [s for s in range(8) if s not in {5, 1, 3}]
+        assert torch.equal(cache_cache[untouched], state[untouched])

@@ -25,29 +25,8 @@ from megatron.core.tuning import autotune_configs
 from .common import HAVE_TRITON, exp2, prepare_chunk_indices, prepare_chunk_offsets, tl, triton
 
 
-@triton.heuristics(
-    {
-        'USE_G': lambda args: args['g'] is not None,
-        'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
-        'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-        'HAS_STATE_INDICES': lambda args: args['state_indices'] is not None,
-        'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
-        'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    }
-)
-@triton.autotune(
-    configs=autotune_configs(
-        [
-            triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-            for num_warps in [2, 4]
-            for num_stages in [2, 3, 4]
-            for BV in [32, 64]
-        ]
-    ),
-    key=['H', 'K', 'V', 'BT', 'USE_G'],
-)
 @triton.jit(do_not_specialize=['T'])
-def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
+def _chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     k,
     v,
     w,
@@ -74,6 +53,7 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     HAS_STATE_INDICES: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INITIAL_STATE_IN_CACHE: tl.constexpr,
 ):
     """Sweep one sequence's chunks, carrying the `[K, V]` state in registers."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -108,22 +88,30 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     stride_v = H * V
     stride_h = H * K * V
     stride_k = H * K
-    if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K * V
     if HAS_STATE_INDICES:
         # Dynamic batching: `ht` is the per-request cache, addressed by slot.
         # A padding request carries -1 and must leave the cache untouched.
         i_s = tl.load(state_indices + i_n).to(tl.int64)
     else:
         i_s = i_n
+    if USE_INITIAL_STATE:
+        if INITIAL_STATE_IN_CACHE:
+            # `h0` is the state cache itself: read this sequence's slot, the same
+            # region the epilogue overwrites. Only this program touches it, and it
+            # reads before it writes, so the in-place update is safe.
+            h0 = h0 + i_s * ht_slot_stride + i_h * ht_head_stride
+        else:
+            h0 = h0 + i_nh * K * V
     if STORE_FINAL_STATE:
         if HAS_STATE_INDICES:
             ht = ht + i_s * ht_slot_stride + i_h * ht_head_stride
         else:
             ht = ht + i_nh * K * V
 
-    # load initial state
-    if USE_INITIAL_STATE:
+    # load initial state. A padding sequence (slot -1) is zero-length, so its state is
+    # never used or stored; skipping the load keeps a cache-resident `h0` from being
+    # dereferenced at slot -1.
+    if USE_INITIAL_STATE and i_s >= 0:
         p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -231,6 +219,43 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
+_KERNEL_H_HEURISTICS = {
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
+    'HAS_STATE_INDICES': lambda args: args['state_indices'] is not None,
+    'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+}
+_KERNEL_H_CONFIGS = autotune_configs(
+    [
+        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [2, 3, 4]
+        for BV in [32, 64]
+    ]
+)
+_KERNEL_H_KEY = ['H', 'K', 'V', 'BT', 'USE_G']
+
+chunk_gated_delta_product_fwd_kernel_h_blockdim64 = triton.heuristics(_KERNEL_H_HEURISTICS)(
+    triton.autotune(configs=_KERNEL_H_CONFIGS, key=_KERNEL_H_KEY)(
+        _chunk_gated_delta_product_fwd_kernel_h_blockdim64
+    )
+)
+# The same kernel when it reads its initial state from the cache it also writes
+# (`INITIAL_STATE_IN_CACHE`). Benchmarking runs every candidate config on the live
+# arguments, so without restoring `ht` each trial would start from the previous
+# trial's final state. `restore_value` snapshots the cache before tuning and
+# restores it after every trial; it costs a copy only while autotuning.
+chunk_gated_delta_product_fwd_kernel_h_blockdim64_state_in_cache = triton.heuristics(
+    _KERNEL_H_HEURISTICS
+)(
+    triton.autotune(configs=_KERNEL_H_CONFIGS, key=_KERNEL_H_KEY, restore_value=['ht'])(
+        _chunk_gated_delta_product_fwd_kernel_h_blockdim64
+    )
+)
+
+
 def chunk_gated_delta_product_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -247,6 +272,7 @@ def chunk_gated_delta_product_fwd_h(
     state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     states_dtype: torch.dtype | None = None,
+    initial_state_from_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the inter-chunk state recurrence.
 
@@ -276,6 +302,10 @@ def chunk_gated_delta_product_fwd_h(
             caller snapshots `h` for prefix caching: the recurrence accumulates
             in fp32 and only rounds on store, so an fp32 `h` preserves the full
             snapshot precision instead of the bf16 the working dtype would keep.
+        initial_state_from_cache: Start each sequence from its `state` slot at
+            `state_indices` instead of from a dense `initial_state`, which must then be
+            `None`. Saves gathering the cache rows into a separate tensor first; padding
+            slots (`-1`) start from zeros.
 
     Returns `(h, v_new, final_state)`. `h` holds the state at each unexpanded
     chunk boundary.
@@ -319,17 +349,28 @@ def chunk_gated_delta_product_fwd_h(
         final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
     v_new = torch.empty_like(u) if save_new_value else None
 
+    if initial_state_from_cache:
+        assert initial_state is None, "pass either initial_state or initial_state_from_cache"
+        assert (
+            state is not None and state_indices is not None
+        ), "initial_state_from_cache reads the state cache at state_indices"
+        kernel = chunk_gated_delta_product_fwd_kernel_h_blockdim64_state_in_cache
+        h0 = state
+    else:
+        kernel = chunk_gated_delta_product_fwd_kernel_h_blockdim64
+        h0 = initial_state
+
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), N * H)
 
-    chunk_gated_delta_product_fwd_kernel_h_blockdim64[grid](
+    kernel[grid](
         k=k,
         v=u,
         w=w,
         v_new=v_new,
         g=g,
         h=h,
-        h0=initial_state,
+        h0=h0,
         ht=final_state,
         state_indices=state_indices,
         ht_slot_stride=state.stride(0) if state is not None else 0,
@@ -342,5 +383,6 @@ def chunk_gated_delta_product_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        INITIAL_STATE_IN_CACHE=initial_state_from_cache,
     )
     return h, v_new, final_state

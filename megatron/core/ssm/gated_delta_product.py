@@ -1321,12 +1321,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         # calls the in-tree fork rather than _run_gdp_kernel because dynamic batching is
         # forward-only, and the fork resumes each request's recurrence from its cached
         # state and writes the final state straight back into the cache at
-        # `batch_indices` (skipping -1 padding slots), so no scatter follows.
-        # `initial_state` is passed unconditionally -- it selects a `tl.constexpr`
-        # branch in the state kernel, so making it depend on the batch content would
-        # respecialize the kernel underneath a captured graph.
-        initial_ssm_state = ssm_state[batch_indices]
-
+        # `batch_indices` (skipping -1 padding slots), so neither a gather of the
+        # incoming states nor a scatter of the outgoing ones is needed:
+        # `initial_state_from_cache` has the scan read each slot before it overwrites
+        # it. The flag is constant rather than dependent on the batch content, since it
+        # selects a `tl.constexpr` branch that a captured graph must not respecialize.
         chunk_scan_result = chunk_gated_delta_product_varlen(
             query,
             key,
@@ -1340,7 +1339,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             chunk_offsets=metadata.gdp_chunk_offsets,
             state=ssm_state,
             state_indices=batch_indices,
-            initial_state=initial_ssm_state,
+            initial_state_from_cache=True,
             use_qk_l2norm_in_kernel=True,
             return_chunk_states=extract_intermediates,
         )

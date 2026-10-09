@@ -54,6 +54,7 @@ def chunk_gated_delta_product_varlen(
     state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     return_chunk_states: bool = False,
+    initial_state_from_cache: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Variable-length chunked Gated Delta Product forward pass.
 
@@ -83,6 +84,12 @@ def chunk_gated_delta_product_varlen(
             tokens -- which is the mid-sequence state prefix caching snapshots.
             Note this differs from the Mamba2 chunk scan, whose raw states are
             indexed by the chunk they come *out* of.
+        initial_state_from_cache: Start each sequence from its `state` slot at
+            `state_indices` -- the state the slot holds on entry, e.g. the previous
+            chunk's under chunked prefill -- rather than from `initial_state`, which
+            must be `None`. The scan reads the slot before overwriting it, so no
+            gathered copy of the cache rows is needed. Padding slots (`-1`) are
+            zero-length and start from zeros.
 
     Returns `(o, final_state)` with `o` shaped `[1, T, H, V]`, or
     `(o, final_state, chunk_states)` when `return_chunk_states` is set.
@@ -110,6 +117,9 @@ def chunk_gated_delta_product_varlen(
     assert beta.shape == (B, T * num_householder, H), f"unexpected beta shape {tuple(beta.shape)}"
     if g is not None:
         assert g.shape == (B, T, H), f"unexpected decay shape {tuple(g.shape)}"
+    assert not initial_state_from_cache or (
+        initial_state is None and state is not None and state_indices is not None
+    ), "initial_state_from_cache reads `state` at `state_indices` in place of `initial_state`"
     if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
         raise ValueError(
             "The number of initial states is expected to be equal to the number of input "
@@ -222,6 +232,7 @@ def chunk_gated_delta_product_varlen(
         state=state,
         state_indices=state_indices,
         states_dtype=chunk_states_dtype,
+        initial_state_from_cache=initial_state_from_cache,
     )
     o = chunk_gated_delta_product_fwd_o(
         q=q,

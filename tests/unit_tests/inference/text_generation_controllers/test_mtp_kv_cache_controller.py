@@ -86,6 +86,8 @@ def _make_context(
         mha_block_table=torch.zeros(
             (MAX_REQUESTS, MAX_KV_BLOCK_COUNT), dtype=torch.int32, device=DEVICE
         ),
+        # The step's GPU bookkeeping, which the EP dummy MTP forwards must leave intact.
+        _buf=torch.zeros(64, dtype=torch.uint8, device=DEVICE),
     )
 
     context = SimpleNamespace(
@@ -94,6 +96,12 @@ def _make_context(
         # end-of-phase cleanups (`end_forward`, releasing the hidden states) that these tests
         # assert on, and a no-op scope would drop them silently.
         active_attn_metadata=None,
+        graph_attn_metadata={
+            "mha_metadata": SimpleNamespace(state_data={}, _max_seqlen_q=0, _max_seqlen_k=0)
+        },
+        non_graph_attn_metadata={
+            "mha_metadata": SimpleNamespace(state_data={}, _max_seqlen_q=0, _max_seqlen_k=0)
+        },
         active_token_count=0,
         padded_active_token_count=0,
         _using_cuda_graph_this_step=False,
@@ -1079,9 +1087,21 @@ class TestMtpCudaGraphs:
             context, num_mtp_depths=2, active_request_count=2, graphed=True
         )
         controller.model_config.expert_model_parallel_size = 2
+        # The step's own forward runs after this and reads the bookkeeping the dummy overwrites.
+        context.gpu_view._buf.fill_(7)
+        step_mha = context.non_graph_attn_metadata["mha_metadata"]
+        step_mha._max_seqlen_q = 64
+
+        def clobber():
+            context.gpu_view._buf.fill_(0)
+            step_mha._max_seqlen_q = 1
+
+        context._mtp_setup_decode_step.side_effect = clobber
 
         controller._run_dummy_serial_mtp_forward()
 
+        assert context.gpu_view._buf.eq(7).all()
+        assert step_mha._max_seqlen_q == 64
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
             assert call["cache_key"] == ("mtp_kv", 2, None)

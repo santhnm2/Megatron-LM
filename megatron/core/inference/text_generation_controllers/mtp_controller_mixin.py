@@ -747,13 +747,14 @@ class MTPControllerMixin:
         # staged on the dummy block (`begin_decode_for_capture`) rather than taken from the
         # context's requests: this also runs on ranks holding real requests (the async-sched
         # primer), whose draft KV it must not overwrite. `_mtp_forward_phase` restores the main
-        # step's attention metadata afterwards.
+        # step's attention metadata afterwards, and since this runs before the step's own forward
+        # (which reads the same shared GPU bookkeeping buffer), the step's bookkeeping too.
         mtp_cache_active = getattr(context, "enable_mtp_kv_cache", False) and has_mtp
         main_graphed = getattr(self, "_mtp_resolved_padded_count", None) is not None
         mtp_forward_eager = not main_graphed
         mtp_graph_key_prefix = "mtp_kv" if mtp_cache_active else "mtp"
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
-        with context._mtp_forward_phase():
+        with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
                 self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)

@@ -297,7 +297,8 @@ class TestMTPCudaGraphInference:
         MTP runners are stored in the CudaGraphManager's lookup table
         rather than the global inference record.  A runner with
         `fwd_graph_recorded=True` confirms the graph was captured and
-        replayed.
+        replayed. Both families count: the cache-free ("mtp", ...) graphs, and
+        the KV-aware ("mtp_kv", ...) graphs used when the MTP KV cache is on.
         """
         unwrapped = unwrap_model(model)
         manager = getattr(unwrapped, '_mtp_cudagraph_manager', None)
@@ -305,7 +306,9 @@ class TestMTPCudaGraphInference:
             assert not expect_replayed, "No MTP CudaGraphManager found on the model"
             return
         table = manager.custom_cudagraphs_lookup_table
-        mtp_runners = [v for k, v in table.items() if isinstance(k, tuple) and k[0] == 'mtp']
+        mtp_runners = [
+            v for k, v in table.items() if isinstance(k, tuple) and k[0] in ('mtp', 'mtp_kv')
+        ]
         if expect_replayed:
             assert (
                 len(mtp_runners) > 0

@@ -133,9 +133,10 @@ class MTPControllerMixin:
         One varlen roll-by-one forward over all active requests' committed tokens, so a committed
         position p always holds draft KV = f(h_p^main + emb(t_{p+1})) and never a stale
         chained-draft-hidden value (the cause of depth-increasing acceptance decay). K/V are pure
-        projections of the input (no RoPE), so only the write positions matter; the output hidden
-        is discarded. `_mtp_decode_commit_segments` and `_mtp_prefill_commit_segments` derive the
-        per-request positions.
+        projections of the input (no RoPE), so only the write positions matter for them. The
+        attention still reads each request's full draft-KV history, so the output hidden matches
+        a full-sequence forward; it is discarded today. `_mtp_decode_commit_segments` and
+        `_mtp_prefill_commit_segments` derive the per-request positions.
 
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """

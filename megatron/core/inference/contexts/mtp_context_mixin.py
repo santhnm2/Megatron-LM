@@ -443,7 +443,8 @@ class MTPContextMixin:
         """Populate token write maps + MHA metadata for a varlen roll-by-one MTP write forward.
 
         Each request writes `append_counts[r]` consecutive positions starting at
-        `request_start_positions[r]`, or at 0 when that is None (a fresh prompt seed).
+        `request_start_positions[r]`, or at 0 when that is None (a fresh prompt seed), and its
+        queries attend over every position before and including the one they write.
 
         `append_counts`/`block_table_prefill` are GPU tensors for the P requests in active-slice
         order. `total` is `append_counts.sum()`; pass it when the caller already has it, to skip
@@ -489,34 +490,51 @@ class MTPContextMixin:
             inherited_blocks=inherited,
         )
 
-        # MHA metadata: fresh causal prefill, so per-request kv_length == query_length and one
-        # staged length buffer serves as both. `stage_prefill_lengths` also absorbs the padded
-        # query rows, either into a trailing pad request or into the last real request.
-        seq_lengths = self.mtp_metadata.stage_prefill_lengths(
-            append_counts=append_counts, pad_tokens=padded_total - total
+        # MHA metadata: each request's queries attend over its whole draft-KV history, not just
+        # the run written here, so the output hidden is the one a full-sequence forward would
+        # produce. `stage_prefill_lengths` also absorbs the padded query rows, either into a
+        # trailing pad request or into the last real request.
+        query_lengths, kv_lengths = self.mtp_metadata.stage_prefill_lengths(
+            append_counts=append_counts,
+            start_positions=request_start_positions,
+            pad_tokens=padded_total - total,
         )
-        p = seq_lengths.numel()
+        p = query_lengths.numel()
         padded_p = max(padded_p, p)
 
+        # When the pad rows join a full batch's last request they read past its last real
+        # position, possibly into block-table columns it does not own (-1). Point those at the
+        # dummy block for the read. The write maps keep the real table: every real write lands
+        # in an owned block, and pad writes already go to the dummy block.
+        read_block_table = torch.where(
+            block_table_prefill < 0,
+            torch.full_like(block_table_prefill, self.kv_block_allocator.dummy_block_idx),
+            block_table_prefill,
+        )
         self.mtp_metadata.write_mha_metadata(
             gpu_view=gv,
-            query_lengths=seq_lengths,
-            kv_lengths=seq_lengths,
-            block_table=block_table_prefill,
+            query_lengths=query_lengths,
+            kv_lengths=kv_lengths,
+            block_table=read_block_table,
             padded_request_count=padded_p,
         )
 
-        # Read the bound back off `seq_lengths` rather than off `append_counts`: either branch
-        # above may have introduced a run longer than any single `append_counts` entry.
-        max_seqlen = int(seq_lengths.max().item()) if p > 0 else 1
+        # Read the bounds back off the staged lengths rather than off `append_counts`: either
+        # padding branch above may have lengthened a run. One host read covers both.
+        if p > 0:
+            max_seqlen_q, max_seqlen_k = torch.stack(
+                [query_lengths.max(), kv_lengths.max()]
+            ).tolist()
+        else:
+            max_seqlen_q = max_seqlen_k = 1
         # Never publish max_seqlen_q == 1 for this varlen pass: FlashAttention-2 would read it as
         # one query token per sequence and, under GQA, reshape q assuming total_q == num_seqs,
         # which requests contributing zero rows break. Raising the bound is safe.
         self._mtp_activate_attn_metadata(
             graphed=False,
             padded_request_count=padded_p,
-            max_seqlen_q=max(2, max_seqlen),
-            max_seqlen_k=max_seqlen,
+            max_seqlen_q=max(2, max_seqlen_q),
+            max_seqlen_k=max_seqlen_k,
             token_count=total,
             padded_token_count=padded_total,
         )

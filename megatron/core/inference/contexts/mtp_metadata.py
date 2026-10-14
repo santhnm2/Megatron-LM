@@ -332,11 +332,17 @@ class MTPMetadata:
         torch.add(self.active_offsets, 1, out=kv_lengths)
         return query_lengths, kv_lengths
 
-    def stage_prefill_lengths(self, append_counts: Tensor, pad_tokens: int) -> Tensor:
+    def stage_prefill_lengths(
+        self, append_counts: Tensor, start_positions: Optional[Tensor], pad_tokens: int
+    ) -> Tuple[Tensor, Tensor]:
         """Stage the MHA lengths for a varlen commit pass, absorbing the padded query rows.
 
-        The commit pass is a fresh causal prefill, so a request's KV length equals its query
-        length and one buffer serves as both.
+        Each request's queries are its `append_counts[r]` rewritten positions, and its keys are
+        its whole draft-KV history through the last of them: `start_positions[r] +
+        append_counts[r]`. The paged kernel reads keys from the head of the block-table row and
+        aligns the causal mask bottom-right, so query i attends to positions `<= start + i` --
+        the same span a training forward over the full sequence would attend to. A request with
+        no query rows gets no keys, like a padded request slot.
 
         The hidden is padded to a TP multiple for the sequence-parallel scatter, so attention
         sees `total + pad_tokens` query rows while `append_counts` describes only `total`. Varlen
@@ -345,27 +351,38 @@ class MTPMetadata:
 
         Args:
             append_counts (Tensor): [P] KV entries each request writes this pass.
+            start_positions (Optional[Tensor]): [P] write position of each request's first
+                entry, or None when every request starts at 0 (a fresh prompt seed).
             pad_tokens (int): Query rows appended to reach the TP multiple.
 
         Returns:
-            (Tensor): Per-request length view, `P` long, or `P + 1` when the pad rows were given
-            their own trailing request.
+            (Tuple[Tensor, Tensor]): Per-request query- and KV-length views, `P` long, or
+            `P + 1` when the pad rows were given their own trailing request.
         """
         num_prefill = append_counts.numel()
         # A spare request slot carries the pad rows in their own trailing request, which attends
         # solely to itself out of the dummy block. A full batch occupies every slot, so extend
-        # the last real request's run instead: its reads stay inside blocks it already owns,
-        # since this varlen forward reads from the head of each block-table row and the run
-        # grows by at most `tp_size - 1`.
+        # the last real request's query AND key runs by the pad instead. Growing both keeps
+        # `kv_length - query_length` fixed, so the bottom-right causal mask still aligns that
+        # request's real rows with their own positions; only the pad rows read past them, and
+        # the caller points any unowned block-table entry they reach at the dummy block.
         use_spare_slot = pad_tokens > 0 and num_prefill < self.max_requests
         num_requests = num_prefill + 1 if use_spare_slot else num_prefill
-        lengths = self.query_lengths[:num_requests]
-        lengths[:num_prefill].copy_(append_counts)
+        query_lengths = self.query_lengths[:num_requests]
+        kv_lengths = self.kv_lengths[:num_requests]
+        query_lengths[:num_prefill].copy_(append_counts)
+        if start_positions is None:
+            kv_lengths[:num_prefill].copy_(append_counts)
+        else:
+            history = start_positions.to(append_counts.device) + append_counts
+            kv_lengths[:num_prefill].copy_(torch.where(append_counts > 0, history, 0))
         if use_spare_slot:
-            lengths[num_prefill:num_requests].fill_(pad_tokens)
+            query_lengths[num_prefill:num_requests].fill_(pad_tokens)
+            kv_lengths[num_prefill:num_requests].fill_(pad_tokens)
         elif pad_tokens > 0:
-            lengths[num_prefill - 1 : num_prefill] += pad_tokens
-        return lengths
+            query_lengths[num_prefill - 1 : num_prefill] += pad_tokens
+            kv_lengths[num_prefill - 1 : num_prefill] += pad_tokens
+        return query_lengths, kv_lengths
 
     # ------------------------------------------------------------------
     # GPU-view writes. Shared by every MTP forward: the decode and prefill setups differ only

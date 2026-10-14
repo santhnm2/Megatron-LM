@@ -639,7 +639,7 @@ class TestMtpPrefillBookkeeping:
         assert gv.token_to_request_idx[:5].cpu().tolist() == [0, 0, 0, 1, 1]
         assert gv.token_to_block_idx[:5].cpu().tolist() == [3, 3, 3, 7, 7]
         assert gv.token_to_local_position_within_kv_block[:5].cpu().tolist() == [0, 1, 2, 0, 1]
-        # Fresh causal prefill: kv_length == query_length per request.
+        # A seed starts at position 0, so its history is exactly its own run.
         assert gv.mha_query_lengths[:2].cpu().tolist() == [3, 2]
         assert gv.mha_kv_seq_lengths[:2].cpu().tolist() == [3, 2]
         assert gv.mha_cu_query_seq_lengths[:3].cpu().tolist() == [0, 3, 5]
@@ -684,6 +684,83 @@ class TestMtpPrefillBookkeeping:
             0,
             1,
         ]
+
+    def test_commit_refresh_attends_over_full_history(self):
+        """Queries read every position up to their own, not just the run written this pass.
+
+        The paged kernel reads keys from the head of the block-table row and aligns the causal
+        mask bottom-right, so `kv_length = start + count` lets query i see positions <= start + i.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        block_table = self._block_table(context, [[3, 4], [7, 9]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([2, 3], device=device),
+            block_table_prefill=block_table,
+            request_start_positions=torch.tensor([4, 9], device=device),
+        )
+
+        gv = context.gpu_view
+        assert gv.mha_query_lengths[:2].cpu().tolist() == [2, 3]
+        assert gv.mha_kv_seq_lengths[:2].cpu().tolist() == [6, 12]
+        assert gv.mha_cu_query_seq_lengths[:3].cpu().tolist() == [0, 2, 5]
+        assert gv.mha_cu_kv_seq_lengths[:3].cpu().tolist() == [0, 6, 18]
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        assert mha.state_data["max_seqlen_q"] == 3
+        assert mha.state_data["max_seqlen_k"] == 12
+
+    def test_commit_refresh_request_with_no_rows_reads_no_keys(self):
+        """A decode request that accepted no drafts contributes neither queries nor keys."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        block_table = self._block_table(context, [[3, 4], [7, 9]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([0, 2], device=device),
+            block_table_prefill=block_table,
+            request_start_positions=torch.tensor([5, 7], device=device),
+        )
+
+        gv = context.gpu_view
+        assert gv.mha_query_lengths[:2].cpu().tolist() == [0, 2]
+        assert gv.mha_kv_seq_lengths[:2].cpu().tolist() == [0, 9]
+
+    def test_full_batch_pad_rows_keep_real_rows_aligned(self):
+        """Pad rows joining the last request must not shift its real rows' causal window.
+
+        Growing its query and key runs by the same amount keeps `kv - q == start`, so the real
+        rows still attend to positions <= start + i. The pad rows read past the run, so every
+        unowned (-1) block-table entry they could reach is pointed at the dummy block.
+        """
+        max_requests = 3
+        context = _make_context(max_requests=max_requests)
+        device = torch.cuda.current_device()
+        block_table = self._block_table(context, [[3, 4]] * max_requests)
+        starts = [4, 5, 6]
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([0, 1, 2], device=device),
+            block_table_prefill=block_table,
+            padded_token_count=4,
+            padded_request_count=max_requests,
+            request_start_positions=torch.tensor(starts, device=device),
+        )
+
+        gv = context.gpu_view
+        q = gv.mha_query_lengths[:max_requests].cpu().tolist()
+        kv = gv.mha_kv_seq_lengths[:max_requests].cpu().tolist()
+        assert q == [0, 1, 3]
+        assert kv == [0, 6, 9]
+        assert kv[2] - q[2] == starts[2]
+        dummy = context.kv_block_allocator.dummy_block_idx
+        read_table = gv.mha_block_table[:max_requests]
+        assert (read_table >= 0).all()
+        assert (read_table[:, :2].cpu() == torch.tensor([3, 4]).to(read_table.dtype)).all()
+        assert (read_table[:, 2:] == dummy).all()
+        # The write maps still use the owned blocks for real rows and the dummy for the pad row.
+        assert gv.token_to_block_idx[:4].cpu().tolist() == [3, 3, 3, dummy]
+        assert context.non_graph_attn_metadata["mha_metadata"].state_data["max_seqlen_k"] == 9
 
     def test_prefill_step_neutralizes_token_and_request_padding(self):
         """SP token padding and request padding must never index real KV."""

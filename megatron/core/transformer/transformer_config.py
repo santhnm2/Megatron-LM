@@ -387,6 +387,21 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
+    dsa_indexer_mode: Literal["standard", "simplified"] = "standard"
+    """DSA indexer formulation. ``simplified`` uses learned single-head Q/K projections
+    over the attention input (DSA over GQA)."""
+
+    dsa_simplified_use_learned_k: bool = False
+    """Whether the simplified DSA indexer uses a learned key projection."""
+
+    dsa_min_memory_backend: Literal["reference", "cute"] = "reference"
+    """Sparse attention implementation for DSA over GQA.
+
+    Separate from ``dsa_kernel_backend``, which selects fused DSA-over-MLA kernels. ``cute``
+    uses the simplified-sparse-attention package for prefill and CuTe decode kernels, and
+    requires the validated learned-Q/K, BF16, MQA configuration.
+    """
+
     ####################
     # Compressed sparse attention
     ####################
@@ -1596,6 +1611,64 @@ class TransformerConfig(ModelParallelConfig):
         new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
         return new_config
 
+    def _validate_dsa_gqa_cute_config(self) -> None:
+        """Validate the DSA-over-GQA contract implemented by the CuTe kernels."""
+        if self.dsa_kernel_backend != "none":
+            raise ValueError(
+                "dsa_min_memory_backend='cute' selects the GQA implementation; "
+                "leave the separate MLA dsa_kernel_backend at 'none'."
+            )
+        if self.multi_latent_attention:
+            raise ValueError("The CuTe DSA backend supports GQA/MQA, not absorbed MLA.")
+        if self.transformer_impl not in ("transformer_engine", "inference_optimized"):
+            raise ValueError(
+                "The CuTe DSA backend requires Transformer Engine "
+                "(transformer_engine or inference_optimized)."
+            )
+        if self.dsa_indexer_mode != "simplified" or not self.dsa_simplified_use_learned_k:
+            raise ValueError("The CuTe DSA backend requires the simplified learned-Q/K indexer.")
+        if self.tensor_model_parallel_size != 1:
+            raise ValueError("The CuTe DSA backend currently requires TP1.")
+        if self.context_parallel_size != 1:
+            raise ValueError("The CuTe DSA backend does not support context parallelism.")
+        if self.num_query_groups != 1:
+            raise ValueError("The CuTe DSA backend currently requires MQA1.")
+        if self.num_attention_heads not in (16, 32, 96) or self.kv_channels != 256:
+            raise ValueError(
+                "The CuTe DSA backend requires Hq in (16, 32, 96) and head dimension 256."
+            )
+        if self.dsa_indexer_n_heads != 1 or self.dsa_indexer_head_dim != 128:
+            raise ValueError("The CuTe DSA backend requires one 128-dimensional indexer head.")
+        if self.dsa_indexer_topk not in (512, 1024, 2048) or self.dsa_indexer_topk_freq != 1:
+            raise ValueError(
+                "The CuTe DSA backend requires top-K in (512, 1024, 2048) "
+                "without cross-layer sharing."
+            )
+        if not self.bf16 or self.params_dtype != torch.bfloat16:
+            raise ValueError("The CuTe DSA backend requires BF16 activations and parameters.")
+        if self.attention_dropout != 0.0 or self.softmax_type != "vanilla":
+            raise ValueError(
+                "The CuTe DSA backend requires zero attention dropout and vanilla softmax."
+            )
+        if self.window_size is not None:
+            raise ValueError("The CuTe DSA backend does not support sliding-window attention.")
+        if self.apply_query_key_layer_scaling:
+            raise ValueError("CuTe sparse attention requires softmax scale 1/sqrt(head_dim).")
+        if self.qk_clip or self.log_max_attention_logit:
+            raise ValueError("CuTe sparse attention does not expose attention logits.")
+        if self.dsa_indexer_rotate_activation or self.dsa_indexer_scoring_relu:
+            raise ValueError(
+                "The CuTe DSA backend requires unrotated, unweighted dot-product index scores."
+            )
+        if self.attention_backend == AttnBackend.unfused:
+            raise ValueError(
+                "The CuTe DSA backend cannot be selected with unfused attention fallback."
+            )
+        if self.fused_single_qkv_rope or self.attention_output_gate:
+            raise ValueError(
+                "The CuTe DSA backend does not support fused single-QKV RoPE or output gates."
+            )
+
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
@@ -1710,6 +1783,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.dsa_kernel_backend is None:
             self.dsa_kernel_backend = (
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
+            )
+
+        if self.dsa_min_memory_backend == "cute" and self.experimental_attention_variant != "dsa":
+            raise ValueError(
+                "dsa_min_memory_backend='cute' requires experimental_attention_variant='dsa'."
             )
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
@@ -1830,6 +1908,13 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            if self.dsa_min_memory_backend == "cute":
+                self._validate_dsa_gqa_cute_config()
+            elif self.dsa_indexer_mode != "standard":
+                raise ValueError(
+                    "dsa_indexer_mode='simplified' is only implemented by "
+                    "dsa_min_memory_backend='cute'."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."

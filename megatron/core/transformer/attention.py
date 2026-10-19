@@ -520,6 +520,31 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             **extra_kwargs,
         )
 
+    def _needs_qkv_layernorm_output(self) -> bool:
+        """Return whether this attention variant consumes the fused QKV norm output."""
+        return False
+
+    def _get_core_attention_extra_kwargs(
+        self,
+        *,
+        hidden_states: Tensor,
+        qkv_layernorm_output: Optional[Tensor],
+        rotary_pos_emb,
+        rotary_pos_cos: Optional[Tensor],
+        rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
+    ) -> dict[str, object]:
+        """Return optional tensor inputs for an experimental core-attention module."""
+        del (
+            hidden_states,
+            qkv_layernorm_output,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            rotary_pos_cos_sin,
+        )
+        return {}
+
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
@@ -1335,6 +1360,24 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """Specialized attention subclasses retain their atomic forward path."""
         return type(self).forward is Attention.forward
 
+    def _dynamic_core_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: BaseInferenceContext,
+        block_table: Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        **kwargs,
+    ) -> Tensor:
+        """Hook for attention variants that need a custom dynamic-batching path."""
+        raise NotImplementedError(
+            "Experimental core-attention inputs are not supported by dynamic batching."
+        )
+
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -1449,18 +1492,25 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        needs_qkv_layernorm_output = self._needs_qkv_layernorm_output()
         with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
+                **({"return_layernorm_output": True} if needs_qkv_layernorm_output else {}),
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        qkv_layernorm_output = None
+        if needs_qkv_layernorm_output:
+            if not isinstance(qkv_output, (tuple, list)) or len(qkv_output) < 2:
+                raise RuntimeError("Attention requested a QKV norm output, but none was returned.")
+            *qkv_output, qkv_layernorm_output = qkv_output
         if split_qkv:
             if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
@@ -1614,6 +1664,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
+            hidden_states=hidden_states,
+            qkv_layernorm_output=qkv_layernorm_output,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+        )
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
@@ -1626,6 +1684,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -1639,7 +1698,23 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
+
+            elif core_attention_extra_kwargs:
+                # Attention variants with extra core-attention inputs own their paged path.
+                core_attn_out = self._dynamic_core_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    inference_context,
+                    block_table,
+                    attn_mask_type,
+                    attention_bias,
+                    packed_seq_params,
+                    **core_attention_extra_kwargs,
+                )
 
             else:
                 # Dynamic batching attention kernel.
@@ -1900,6 +1975,7 @@ class SelfAttention(Attention):
         key_value_states: Tensor | None = None,
         output_gate: bool = False,
         split_qkv: bool = True,
+        return_layernorm_output: bool = False,
     ) -> (
         tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
@@ -1912,7 +1988,16 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        if output_gate and return_layernorm_output:
+            raise ValueError("QKV output gates cannot be combined with a returned norm output.")
+        linear_qkv_output = apply_module(self.linear_qkv)(hidden_states)
+        qkv_layernorm_output = None
+        if return_layernorm_output:
+            if not isinstance(linear_qkv_output, (tuple, list)) or len(linear_qkv_output) != 3:
+                raise RuntimeError("QKV module did not return (output, bias, norm_output).")
+            mixed_qkv, _, qkv_layernorm_output = linear_qkv_output
+        else:
+            mixed_qkv, _ = linear_qkv_output
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -1980,6 +2065,8 @@ class SelfAttention(Attention):
 
             # Return unsplit mixed_qkv and split_arg_list
             if not split_qkv:
+                if return_layernorm_output:
+                    return mixed_qkv, split_arg_list, qkv_layernorm_output
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
@@ -2024,6 +2111,8 @@ class SelfAttention(Attention):
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
             return query, key, value, gate
 
+        if return_layernorm_output:
+            return query, key, value, qkv_layernorm_output
         return query, key, value
 
     def backward_dw(self) -> None:

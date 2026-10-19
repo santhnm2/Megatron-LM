@@ -621,6 +621,12 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
     return None
 
 
+def _is_dsa_spec(spec: list[str]) -> bool:
+    """Return whether a --spec names a DSA stack spec, which has no dense fallback."""
+    base_path, name = spec
+    return base_path.rsplit(".", 1)[-1] == "dsa_layer_specs" or "dsa" in name.split("_")
+
+
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
@@ -648,6 +654,12 @@ def hybrid_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    if transformer_cfg.dsa_min_memory_backend == "cute" and args.spec is None:
+        raise ValueError(
+            "dsa_min_memory_backend='cute' needs a DSA-over-GQA stack spec, e.g. --spec "
+            "megatron.core.transformer.experimental_attention_variant.dsa_layer_specs "
+            "gdp_dsa_stack_spec; the default hybrid stack spec has dense attention."
+        )
     if transformer_cfg.transformer_impl == "inference_optimized":
         assert (
             not transformer_cfg.inference_fuse_tp_communication
@@ -656,6 +668,12 @@ def hybrid_config_from_args(
             hybrid_stack_spec = _hybrid_inference_stack_spec(
                 args.spec, wide_residual=transformer_cfg.wide_residual is not None
             )
+            if hybrid_stack_spec is None and _is_dsa_spec(args.spec):
+                # The default inference stack has dense attention; falling back would
+                # silently serve a sparse-attention checkpoint densely.
+                raise ValueError(
+                    f"No inference_optimized counterpart of DSA --spec {args.spec}."
+                )
             if hybrid_stack_spec is None:
                 warnings.warn(
                     f"No inference_optimized counterpart of --spec {args.spec}; using the "

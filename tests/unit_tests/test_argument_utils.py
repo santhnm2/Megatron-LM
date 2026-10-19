@@ -432,7 +432,10 @@ class TestHybridConfigFromArgs:
     @staticmethod
     def _transformer_config():
         return types.SimpleNamespace(
-            transformer_impl="transformer_engine", inference_fuse_tp_communication=False
+            transformer_impl="transformer_engine",
+            inference_fuse_tp_communication=False,
+            dsa_min_memory_backend="reference",
+            wide_residual=None,
         )
 
     @patch("megatron.training.argument_utils.import_module")
@@ -454,6 +457,57 @@ class TestHybridConfigFromArgs:
             hybrid_config_from_args(self._args(), config=transformer_config)
 
         spec_factory.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "training_name, wide_residual, inference_name",
+        [
+            ("gdp_dsa_stack_spec", True, "wide_residual_gdp_dsa_inference_stack_spec"),
+            ("gdp_dsa_stack_spec", False, "gdp_dsa_inference_stack_spec"),
+            ("dsa_stack_spec", True, "wide_residual_dsa_inference_stack_spec"),
+            ("dsa_stack_spec", False, "dsa_inference_stack_spec"),
+            ("gdp_dsa_inference_stack_spec", True, "wide_residual_gdp_dsa_inference_stack_spec"),
+        ],
+    )
+    def test_resolves_dsa_inference_stack_specs(self, training_name, wide_residual, inference_name):
+        from megatron.core.transformer.experimental_attention_variant import dsa_layer_specs
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+            DSGroupedSelfAttention,
+        )
+        from megatron.training.argument_utils import _hybrid_inference_stack_spec
+
+        module_path = dsa_layer_specs.__name__
+        spec = _hybrid_inference_stack_spec([module_path, training_name], wide_residual)
+
+        assert spec is getattr(dsa_layer_specs, inference_name)
+        attention_specs = [spec.submodules.attention_layer.submodules.self_attention]
+        if wide_residual:
+            mtp_submodules = spec.submodules.mtp_stack_submodules
+            attention_specs.append(mtp_submodules.attention_layer.submodules.self_attention)
+        assert all(attention.module is DSGroupedSelfAttention for attention in attention_specs)
+
+    def test_dsa_spec_without_inference_counterpart_fails(self):
+        args = self._args()
+        args.spec = [
+            "megatron.core.transformer.experimental_attention_variant.dsa_layer_specs",
+            "gdp_dsa_stack_spec",
+        ]
+        config = self._transformer_config()
+        config.transformer_impl = "inference_optimized"
+
+        with patch(
+            "megatron.training.argument_utils._hybrid_inference_stack_spec", return_value=None
+        ):
+            with pytest.raises(ValueError, match="No inference_optimized counterpart of DSA"):
+                hybrid_config_from_args(args, config=config)
+
+    def test_cute_dsa_backend_requires_a_spec(self):
+        args = self._args()
+        args.spec = None
+        config = self._transformer_config()
+        config.dsa_min_memory_backend = "cute"
+
+        with pytest.raises(ValueError, match="DSA-over-GQA stack spec"):
+            hybrid_config_from_args(args, config=config)
 
 
 class TestArgumentGroupFactoryBasic:

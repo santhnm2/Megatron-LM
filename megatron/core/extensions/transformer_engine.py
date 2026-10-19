@@ -1502,6 +1502,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        return_layernorm_output: bool = False,
     ):
         """
         Args:
@@ -1641,7 +1642,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode="column",
-                return_layernorm_output=False,
+                return_layernorm_output=return_layernorm_output,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
@@ -1706,6 +1707,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
         self.is_first_microbatch = False
+
+        # TE orders the optional normalized activation last. Preserve MCore's
+        # (linear_output, bias, layernorm_output) convention for this opt-in path.
+        if self.return_layernorm_output:
+            if self.te_return_bias:
+                return out
+            linear_output, layernorm_output = out
+            return linear_output, None, layernorm_output
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two

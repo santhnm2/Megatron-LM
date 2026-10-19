@@ -148,6 +148,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        return_layernorm_output: bool = False,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -165,6 +166,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             tp_group=tp_group,
             name=name,
             pg_collection=pg_collection,
+            return_layernorm_output=return_layernorm_output,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -243,9 +245,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass.
+
+        Returns ``(output, None)``, or ``(output, None, normalized_input)`` when built with
+        ``return_layernorm_output``, matching TELayerNormColumnParallelLinear.
         """
         # Necessary conditions to ensure we are executing the fused rs-add-rmsnorm-ag
         # in the preceeding RowParallelLinear layer.
@@ -258,8 +263,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         if self.tp_size == 1:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
-            x = _apply_linear(x, self.weight, self.config)
-            return x, None
+            return self._outputs(_apply_linear(x, self.weight, self.config), x)
 
         symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
         is_in_fused_mode = (
@@ -273,9 +277,13 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)
 
-        x = _apply_linear(x, self.weight, self.config)
+        return self._outputs(_apply_linear(x, self.weight, self.config), x)
 
-        return x, None
+    def _outputs(self, output: torch.Tensor, normalized_input: torch.Tensor):
+        """Append the normalized input when built with ``return_layernorm_output``."""
+        if self.return_layernorm_output:
+            return output, None, normalized_input
+        return output, None
 
 
 class InferenceColumnParallelLinear(TEColumnParallelLinear):

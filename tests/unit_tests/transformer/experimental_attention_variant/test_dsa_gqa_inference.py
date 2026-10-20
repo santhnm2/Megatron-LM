@@ -30,13 +30,15 @@ from megatron.core.transformer.experimental_attention_variant import dsa_cute_ke
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
     _deep_select_decode_supported,
-    _sparse_decode,
+    _sparse_attention_rows,
     dynamic_sparse_attention,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_triton import (
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
     HAVE_TRITON,
-    dsa_gqa_decode_attention,
-    dsa_gqa_decode_indexer_score,
+    SCORE_ROW_BLOCK,
+    build_row_metadata,
+    dsa_gqa_indexer_scores,
+    dsa_gqa_sparse_attention,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -133,136 +135,228 @@ def test_speculative_decode_steps_are_rejected():
         )
 
 
+def _rows_with_padding(query_lengths, kv_lengths, padding_rows, device):
+    """Row metadata for requests plus empty padding rows and blocks, on ``device``."""
+    row_requests, row_lengths, block_starts, block_rows, block_requests = build_row_metadata(
+        torch.tensor(query_lengths), torch.tensor(kv_lengths)
+    )
+    pad = torch.zeros(padding_rows, dtype=torch.int32)
+    row_requests = torch.cat((row_requests, pad - 1))
+    row_lengths = torch.cat((row_lengths, pad))
+    block_pad = torch.zeros(2, dtype=torch.int32)
+    blocks = [
+        torch.cat((tensor, block_pad)) for tensor in (block_starts, block_rows, block_requests)
+    ]
+    return [tensor.to(device) for tensor in (row_requests, row_lengths, *blocks)]
+
+
+def _reference_scores(index_q, index_keys, table, row_requests, row_lengths, page_size):
+    """Float64 scores of each row over its request's keys [0, length)."""
+    scores = []
+    for row in range(index_q.size(0)):
+        length = int(row_lengths[row])
+        positions = torch.arange(length, device=index_q.device)
+        pages = table[max(int(row_requests[row]), 0), positions // page_size].long()
+        keys = index_keys[pages, positions % page_size].double()
+        scores.append(keys @ index_q[row].double())
+    return scores
+
+
+def _reference_attention(query, keys, values, table, row_requests, row_lengths, indices, scale):
+    """Per-row attention over its valid selected keys; probabilities rounded to BF16 like PV."""
+    page_size, groups = keys.size(1), keys.size(2)
+    heads_per_group = query.size(1) // groups
+    out = torch.zeros(query.shape, dtype=torch.float32, device=query.device)
+    for row in range(query.size(0)):
+        selected = indices[row]
+        selected = selected[(selected >= 0) & (selected < row_lengths[row])].long()
+        if selected.numel() == 0:
+            continue
+        pages = table[int(row_requests[row]), selected // page_size].long()
+        for head in range(query.size(1)):
+            group = head // heads_per_group
+            k = keys[pages, selected % page_size, group].float()
+            v = values[pages, selected % page_size, group].float()
+            probs = (query[row, head].float() @ k.T * scale).softmax(-1)
+            out[row, head] = probs @ v
+    return out
+
+
+def test_build_row_metadata():
+    rows = build_row_metadata(torch.tensor([1, 70, 1]), torch.tensor([9, 135, 4]), row_block=32)
+    row_requests, row_lengths, block_starts, block_rows, block_requests = rows
+    assert row_requests.tolist() == [0] + [1] * 70 + [2]
+    # Request 1 appends 70 tokens after 65 cached ones: lengths 66 .. 135.
+    assert row_lengths.tolist() == [9] + list(range(66, 136)) + [4]
+    assert block_starts.tolist() == [0, 1, 33, 65, 71]
+    assert block_rows.tolist() == [1, 32, 32, 6, 1]
+    assert block_requests.tolist() == [0, 1, 1, 1, 2]
+
+
 @pytest.mark.parametrize("head_dim", [128, 192, 256])
-def test_paged_decode_kernels_match_reference(head_dim):
+def test_inference_kernels_match_reference_on_mixed_rows(head_dim):
+    """Decode rows, a chunked-prefill block with a cached prefix, and padding rows."""
     torch.manual_seed(17)
     device = torch.device("cuda", torch.cuda.current_device())
-    batch, pages_per_request, page_size, heads = 4, 3, 64, 4
-    lengths = torch.tensor([3, 63, 65, 137], dtype=torch.int32, device=device)
-    block_table = (
-        torch.randperm(batch * pages_per_request, device=device)
-        .reshape(batch, pages_per_request)
-        .to(torch.int32)
+    page_size, max_pages, heads, topk = 64, 4, 4, 16
+    query_lengths, kv_lengths = [1, 70, 1], [3, 135, 137]
+    row_requests, row_lengths, block_starts, block_rows, block_requests = _rows_with_padding(
+        query_lengths, kv_lengths, padding_rows=3, device=device
     )
-    keys = torch.randn(
-        batch * pages_per_request, page_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    num_rows = row_requests.numel()
+    num_pages = len(query_lengths) * max_pages
+    table = torch.randperm(num_pages, device=device).view(-1, max_pages).to(torch.int32)
+    index_keys = torch.randn(num_pages, page_size, head_dim, device=device, dtype=torch.bfloat16)
+    index_q = torch.randn(num_rows, head_dim, device=device, dtype=torch.bfloat16)
+
+    scores = torch.empty(num_rows, 151, device=device, dtype=torch.float32)
+    dsa_gqa_indexer_scores(
+        index_q,
+        index_keys,
+        table,
+        row_lengths,
+        block_starts,
+        block_rows,
+        block_requests,
+        out=scores,
+        fill_invalid=True,
     )
-    values = torch.randn_like(keys)
-    index_q = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
-    scores = torch.empty(batch, 151, device=device, dtype=torch.float32)
-    dsa_gqa_decode_indexer_score(
-        index_q, keys[:, :, 0], block_table, lengths, out=scores, fill_invalid=True
-    )
-    expected_scores = torch.full_like(scores, -torch.inf)
-    for request, length in enumerate(lengths.tolist()):
-        positions = torch.arange(length, device=device)
-        k = keys[block_table[request, positions // page_size].long(), positions % page_size, 0]
-        expected_scores[request, :length] = k.float() @ index_q[request].float()
-    torch.testing.assert_close(scores, expected_scores, atol=2e-4, rtol=2e-4)
+    expected = _reference_scores(index_q, index_keys, table, row_requests, row_lengths, page_size)
+    # Padding rows belong to no score block, so neither mode writes them.
+    real_rows = int((row_requests >= 0).sum())
+    for row in range(real_rows):
+        length = int(row_lengths[row])
+        torch.testing.assert_close(
+            scores[row, :length].double(), expected[row], atol=2e-4, rtol=2e-4
+        )
+        assert bool(torch.isneginf(scores[row, length:]).all())
 
     # Without filling, positions past each length keep whatever the buffer held.
     unfilled = torch.full_like(scores, 7.0)
-    dsa_gqa_decode_indexer_score(
-        index_q, keys[:, :, 0], block_table, lengths, out=unfilled, fill_invalid=False
+    dsa_gqa_indexer_scores(
+        index_q,
+        index_keys,
+        table,
+        row_lengths,
+        block_starts,
+        block_rows,
+        block_requests,
+        out=unfilled,
+        fill_invalid=False,
     )
-    tail = torch.arange(scores.size(1), device=device)[None, :] >= lengths[:, None]
+    tail = torch.arange(scores.size(1), device=device)[None, :] >= row_lengths[:, None]
     assert bool((unfilled[tail] == 7.0).all())
-    torch.testing.assert_close(unfilled[~tail], expected_scores[~tail], atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(unfilled[~tail], scores[~tail])
 
-    indices = scores.topk(16, dim=-1).indices.to(torch.int32)
+    indices = scores.topk(topk, dim=-1).indices.to(torch.int32)
+    keys = torch.randn(num_pages, page_size, 1, head_dim, device=device, dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
     # Attention must accept a query view with the pitched token stride produced by QKV.
-    q = torch.randn(batch, heads + 2, head_dim, device=device, dtype=torch.bfloat16)[:, :heads]
-    output = torch.empty(batch, heads, head_dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(num_rows, heads + 2, head_dim, device=device, dtype=torch.bfloat16)
+    query = query[:, :heads]
+    output = torch.full((num_rows, heads, head_dim), 9.0, device=device, dtype=torch.bfloat16)
     scale = head_dim**-0.5
-    dsa_gqa_decode_attention(q, keys, values, block_table, indices, lengths, scale, out=output)
-    expected = torch.empty_like(output)
-    for request, length in enumerate(lengths.tolist()):
-        selected = indices[request, : min(length, indices.size(1))].long()
-        pages = block_table[request, selected // page_size].long()
-        k = keys[pages, selected % page_size, 0]
-        v = values[pages, selected % page_size, 0]
-        probs = (q[request].float() @ k.float().T * scale).softmax(-1).to(torch.bfloat16)
-        expected[request] = (probs.float() @ v.float()).to(torch.bfloat16)
-    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+    dsa_gqa_sparse_attention(
+        query, keys, values, table, row_requests, row_lengths, indices, scale, out=output
+    )
+    expected = _reference_attention(
+        query, keys, values, table, row_requests, row_lengths, indices, scale
+    )
+    torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+    assert torch.count_nonzero(output[row_lengths == 0]) == 0
 
 
-def test_decode_kernels_match_reference_across_batch_sizes():
-    """Changing decode batches, score widths, and query pitches must all match the reference."""
+def test_inference_kernels_match_reference_across_batches():
+    """Changing batches, prefill chunk sizes, score widths, and query pitches."""
     torch.manual_seed(23)
     device = torch.device("cuda", torch.cuda.current_device())
-    num_pages, page_size, max_pages, heads, topk = 32, 64, 4, NUM_HEADS, 16
-    keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    values = torch.randn_like(keys)
-    index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    page_size, max_pages, topk = 64, 8, 64
     scale = HEAD_DIM**-0.5
-    for batch in (1, 2, 5, 3, 8, 1):
-        table = (
-            torch.randperm(num_pages, device=device)[: batch * max_pages]
-            .view(batch, max_pages)
-            .to(torch.int32)
+    for query_lengths in ([1], [1, 1, 1, 1, 1], [90], [1, 1, 33], [1, 200, 1, 7], [1] * 8):
+        num_requests = len(query_lengths)
+        kv_lengths = [
+            int(torch.randint(q, max_pages * page_size + 1, ()).item()) for q in query_lengths
+        ]
+        row_requests, row_lengths, block_starts, block_rows, block_requests = _rows_with_padding(
+            query_lengths, kv_lengths, padding_rows=1, device=device
         )
-        lengths = torch.randint(1, max_pages * page_size + 1, (batch,), device=device)
-        lengths = lengths.to(torch.int32)
-        width = int(lengths.max().item())
-        index_q = torch.randn(batch, INDEX_DIM, device=device, dtype=torch.bfloat16)
-        scores = torch.empty(batch, width, device=device, dtype=torch.float32)
-        dsa_gqa_decode_indexer_score(
-            index_q, index_keys, table, lengths, out=scores, fill_invalid=True
+        num_rows = row_requests.numel()
+        num_pages = num_requests * max_pages
+        table = torch.randperm(num_pages, device=device).view(-1, max_pages).to(torch.int32)
+        index_keys = torch.randn(
+            num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16
         )
-        positions = torch.arange(width, device=device)
-        logical_keys = index_keys[table[:, positions // page_size].long(), positions % page_size]
-        expected_scores = torch.einsum("bd,bkd->bk", index_q.float(), logical_keys.float())
-        expected_scores.masked_fill_(positions[None, :] >= lengths[:, None], -torch.inf)
-        torch.testing.assert_close(scores, expected_scores, atol=2e-4, rtol=2e-4)
-
+        keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        values = torch.randn_like(keys)
+        index_q = torch.randn(num_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+        width = max(kv_lengths)
+        scores = torch.empty(num_rows, width, device=device, dtype=torch.float32)
+        dsa_gqa_indexer_scores(
+            index_q,
+            index_keys,
+            table,
+            row_lengths,
+            block_starts,
+            block_rows,
+            block_requests,
+            out=scores,
+            fill_invalid=True,
+        )
+        expected = _reference_scores(
+            index_q, index_keys, table, row_requests, row_lengths, page_size
+        )
+        for row in range(num_rows):
+            length = int(row_lengths[row])
+            torch.testing.assert_close(
+                scores[row, :length].double(), expected[row], atol=2e-4, rtol=2e-4
+            )
         indices = scores.topk(min(topk, width), dim=-1).indices
         indices = torch.nn.functional.pad(indices, (0, topk - indices.size(1)), value=-1)
         indices = indices.to(torch.int32).contiguous()
-        # Pitched query rows, as produced by slicing a fused QKV projection.
-        query = torch.randn(batch, heads + 3, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        query = query[:, :heads]
-        output = torch.empty(batch, heads, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        dsa_gqa_decode_attention(query, keys, values, table, indices, lengths, scale, out=output)
-        for request in range(batch):
-            selected = indices[request]
-            selected = selected[(selected >= 0) & (selected < lengths[request])].long()
-            pages = table[request, selected // page_size].long()
-            k = keys[pages, selected % page_size, 0].float()
-            v = values[pages, selected % page_size, 0].float()
-            probs = (query[request].float() @ k.T * scale).softmax(-1).to(torch.bfloat16)
-            torch.testing.assert_close(
-                output[request], (probs.float() @ v).to(torch.bfloat16), atol=2e-2, rtol=2e-2
-            )
+        query = torch.randn(num_rows, NUM_HEADS + 3, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        query = query[:, :NUM_HEADS]
+        output = torch.empty(num_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        dsa_gqa_sparse_attention(
+            query, keys, values, table, row_requests, row_lengths, indices, scale, out=output
+        )
+        expected = _reference_attention(
+            query, keys, values, table, row_requests, row_lengths, indices, scale
+        )
+        torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("deep_select_backend", [False, True])
-def test_sparse_decode_replays_in_cuda_graph(deep_select_backend, monkeypatch):
-    """Graph replays with new lengths and padded rows must match eager decode."""
+def test_sparse_attention_rows_replay_in_cuda_graph(deep_select_backend, monkeypatch):
+    """Graph replays with new mixed batches and padding must match eager runs."""
     device = torch.device("cuda", torch.cuda.current_device())
     if deep_select_backend and not _deep_select_decode_supported(device, 64):
         pytest.skip("DeepSelect is not installed or does not support this GPU")
     if not deep_select_backend:
         monkeypatch.setattr(dsa_gqa, "HAVE_DEEP_SELECT", False)
     torch.manual_seed(31)
-    num_pages, page_size, max_pages, batch, topk = 32, 64, 4, 4, 64
+    num_pages, page_size, max_pages, topk = 64, 64, 4, 64
+    max_requests, max_rows = 4, 48
+    num_blocks = max_requests + -(-max_rows // SCORE_ROW_BLOCK)
     graph_width = max_pages * page_size
     keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
     values = torch.randn_like(keys)
     index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
-    query = torch.zeros(batch, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    index_query = torch.zeros(batch, INDEX_DIM, device=device, dtype=torch.bfloat16)
-    block_table = torch.zeros(batch, max_pages, device=device, dtype=torch.int32)
-    kv_lengths = torch.ones(batch, device=device, dtype=torch.int32)
+    query = torch.zeros(max_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    index_query = torch.zeros(max_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    block_table = torch.zeros(max_requests, max_pages, device=device, dtype=torch.int32)
+    row_requests = torch.full((max_rows,), -1, device=device, dtype=torch.int32)
+    row_lengths = torch.zeros(max_rows, device=device, dtype=torch.int32)
+    blocks = [torch.zeros(num_blocks, device=device, dtype=torch.int32) for _ in range(3)]
 
-    def decode(width):
-        return _sparse_decode(
+    def attend(width):
+        return _sparse_attention_rows(
             query=query,
             key_cache=keys,
             value_cache=values,
             index_query=index_query,
             index_key_cache=index_keys,
             block_table=block_table,
-            kv_lengths=kv_lengths,
+            row_metadata=(row_requests, row_lengths, *blocks, num_blocks),
             max_context_length=width,
             index_topk=topk,
             softmax_scale=HEAD_DIM**-0.5,
@@ -271,99 +365,111 @@ def test_sparse_decode_replays_in_cuda_graph(deep_select_backend, monkeypatch):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        decode(graph_width)  # Compile outside capture, as engine warmup does.
+        attend(graph_width)  # Compile outside capture, as engine warmup does.
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_output = decode(graph_width)
+        graph_output = attend(graph_width)
 
-    for lengths in ([1, 256, 0, 0], [200, 17, 64, 0], [65, 3, 256, 129]):
+    # (query lengths, kv lengths): decode-only, mixed with a cached-prefix chunk, prefill-only.
+    for query_lengths, kv_lengths in (
+        ([1, 1, 1], [1, 256, 17]),
+        ([1, 40, 1], [200, 140, 64]),
+        ([45], [45]),
+    ):
+        metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
+        real_rows, real_blocks = metadata[0].numel(), metadata[2].numel()
+        row_requests.fill_(-1)
+        row_lengths.zero_()
+        for buffer in blocks:
+            buffer.zero_()
+        row_requests[:real_rows] = metadata[0].to(device)
+        row_lengths[:real_rows] = metadata[1].to(device)
+        for buffer, values_cpu in zip(blocks, metadata[2:]):
+            buffer[:real_blocks] = values_cpu.to(device)
         query.copy_(torch.randn_like(query))
         index_query.copy_(torch.randn_like(index_query))
         block_table.copy_(
-            torch.randperm(num_pages, device=device)[: batch * max_pages].view(batch, max_pages)
+            torch.randperm(num_pages, device=device)[: max_requests * max_pages].view(
+                max_requests, max_pages
+            )
         )
-        kv_lengths.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
         graph.replay()
-        eager = decode(max(lengths))
-        live = kv_lengths > 0
+        eager = attend(max(kv_lengths))
+        live = row_lengths > 0
         torch.testing.assert_close(graph_output[live], eager[live], atol=2e-2, rtol=2e-2)
         assert torch.count_nonzero(graph_output[~live]) == 0
 
 
 def test_decode_attention_splits_groups_and_skips_invalid_slots():
-    """Multi-slice, multi-group decode must match a reference over the valid selected keys.
+    """Multi-slice, multi-group rows must match a reference over the valid selected keys.
 
-    Selections hold padding (-1), positions past the length, and an all-padding request.
+    Selections hold padding (-1), positions past the length, and an all-padding row.
     """
     torch.manual_seed(37)
     device = torch.device("cuda", torch.cuda.current_device())
     batch, groups, heads, page_size, max_pages, topk = 5, 2, 8, 64, 8, 512
     lengths = torch.tensor([1, 70, 300, 512, 0], dtype=torch.int32, device=device)
+    requests = torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32, device=device)
     num_pages = batch * max_pages
     keys = torch.randn(num_pages, page_size, groups, HEAD_DIM, device=device, dtype=torch.bfloat16)
     values = torch.randn_like(keys)
     table = torch.randperm(num_pages, device=device).view(batch, max_pages).to(torch.int32)
     indices = torch.full((batch, topk), -1, dtype=torch.int32, device=device)
-    for request, length in enumerate(lengths.tolist()):
+    for row, length in enumerate(lengths.tolist()):
         chosen = torch.randperm(max(length, 1), device=device)[: min(length, topk - 8)]
-        indices[request, : chosen.numel()] = chosen.to(torch.int32)
+        indices[row, : chosen.numel()] = chosen.to(torch.int32)
         # Positions at or past the length must be ignored.
-        indices[request, -4:] = length + torch.arange(4, device=device, dtype=torch.int32)
+        indices[row, -4:] = length + torch.arange(4, device=device, dtype=torch.int32)
     query = torch.randn(batch, heads, HEAD_DIM, device=device, dtype=torch.bfloat16)
     output = torch.full((batch, heads, HEAD_DIM), 9.0, device=device, dtype=torch.bfloat16)
     scale = HEAD_DIM**-0.5
-    dsa_gqa_decode_attention(query, keys, values, table, indices, lengths, scale, out=output)
-    heads_per_group = heads // groups
-    for request, length in enumerate(lengths.tolist()):
-        selected = indices[request]
-        selected = selected[(selected >= 0) & (selected < length)].long()
-        if selected.numel() == 0:
-            assert torch.count_nonzero(output[request]) == 0
-        else:
-            pages = table[request, selected // page_size].long()
-            for head in range(heads):
-                group = head // heads_per_group
-                k = keys[pages, selected % page_size, group].float()
-                v = values[pages, selected % page_size, group].float()
-                probs = (query[request, head].float() @ k.T * scale).softmax(-1)
-                torch.testing.assert_close(
-                    output[request, head].float(), probs @ v, atol=2e-2, rtol=2e-2
-                )
+    dsa_gqa_sparse_attention(
+        query, keys, values, table, requests, lengths, indices, scale, out=output
+    )
+    expected = _reference_attention(
+        query, keys, values, table, requests.clamp(min=0), lengths, indices, scale
+    )
+    torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+    assert torch.count_nonzero(output[-1]) == 0
 
 
-def test_deep_select_decode_matches_torch_topk(monkeypatch):
+def test_deep_select_rows_match_torch_topk(monkeypatch):
     """DeepSelect over unfilled score tails must select what torch.topk selects."""
     device = torch.device("cuda", torch.cuda.current_device())
     if not _deep_select_decode_supported(device, TOPK):
         pytest.skip("DeepSelect is not installed or does not support this GPU")
     torch.manual_seed(41)
-    num_pages, page_size, max_pages, batch = 64, 64, 32, 6
+    num_pages, page_size, max_pages = 96, 64, 32
+    query_lengths, kv_lengths = [1, 1, 1, 1, 1, 100, 1], [1, 100, 511, 512, 513, 700, 2048]
+    metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
+    num_rows, num_blocks = metadata[0].numel(), metadata[2].numel()
+    row_metadata = (*[tensor.to(device) for tensor in metadata], num_blocks)
     keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
     values = torch.randn_like(keys)
     index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
-    query = torch.randn(batch, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    index_query = torch.randn(batch, INDEX_DIM, device=device, dtype=torch.bfloat16)
-    table = torch.randint(0, num_pages, (batch, max_pages), device=device, dtype=torch.int32)
-    lengths = torch.tensor([1, 100, 511, 512, 513, 2048], dtype=torch.int32, device=device)
+    query = torch.randn(num_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    index_query = torch.randn(num_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    table = torch.randint(0, num_pages, (len(query_lengths), max_pages), device=device)
+    table = table.to(torch.int32)
 
-    def decode():
-        return _sparse_decode(
+    def attend():
+        return _sparse_attention_rows(
             query=query,
             key_cache=keys,
             value_cache=values,
             index_query=index_query,
             index_key_cache=index_keys,
             block_table=table,
-            kv_lengths=lengths,
-            max_context_length=int(lengths.max().item()),
+            row_metadata=row_metadata,
+            max_context_length=max(kv_lengths),
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
         )
 
-    with_deep_select = decode()
+    with_deep_select = attend()
     monkeypatch.setattr(dsa_gqa, "HAVE_DEEP_SELECT", False)
-    torch.testing.assert_close(with_deep_select, decode(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(with_deep_select, attend(), atol=2e-2, rtol=2e-2)
 
 
 @requires_ssa

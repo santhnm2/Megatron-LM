@@ -401,6 +401,48 @@ def test_sparse_attention_rows_replay_in_cuda_graph(deep_select_backend, monkeyp
         assert torch.count_nonzero(graph_output[~live]) == 0
 
 
+@pytest.mark.parametrize("deep_select_backend", [False, True])
+def test_score_windows_match_one_window(deep_select_backend, monkeypatch):
+    """Scoring rows in small windows (not aligned to score blocks) must not change the output."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    if deep_select_backend and not _deep_select_decode_supported(device, 64):
+        pytest.skip("DeepSelect is not installed or does not support this GPU")
+    if not deep_select_backend:
+        monkeypatch.setattr(dsa_gqa, "HAVE_DEEP_SELECT", False)
+    torch.manual_seed(43)
+    page_size, max_pages, topk = 64, 8, 64
+    query_lengths, kv_lengths = [1, 70, 1, 45], [300, 400, 9, 120]
+    metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
+    row_metadata = (*[tensor.to(device) for tensor in metadata], metadata[2].numel())
+    num_rows, num_pages = metadata[0].numel(), len(query_lengths) * max_pages
+    table = torch.randperm(num_pages, device=device).view(-1, max_pages).to(torch.int32)
+    keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    query = torch.randn(num_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    index_query = torch.randn(num_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+
+    def attend():
+        return _sparse_attention_rows(
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query,
+            index_key_cache=index_keys,
+            block_table=table,
+            row_metadata=row_metadata,
+            max_context_length=max(kv_lengths),
+            index_topk=topk,
+            softmax_scale=HEAD_DIM**-0.5,
+        )
+
+    one_window = attend()
+    # A 28 KiB buffer holds 14-17 score rows at this width, so windows straddle the 32-row
+    # score blocks and the request boundaries.
+    monkeypatch.setattr(dsa_gqa, "SCORE_BUFFER_BYTES", 7 * 1024 * 4)
+    torch.testing.assert_close(attend(), one_window, atol=2e-2, rtol=2e-2)
+
+
 def test_decode_attention_splits_groups_and_skips_invalid_slots():
     """Multi-slice, multi-group rows must match a reference over the valid selected keys.
 

@@ -8,21 +8,31 @@ to the top-k keys, by unscaled indexer dot product, among the causal keys up to 
 including itself (all of them when there are at most k).
 
 Dynamic-batching inference keeps the indexer keys in a paged cache that shares the
-attention KV block table. Decode runs the paged CuTe kernels in
-``dsa_gqa_decode_kernel``; prefill runs the training kernels through
+attention KV block table. Decode scores the indexer keys and attends to the selected keys
+with the Triton kernels in ``dsa_gqa_decode_triton``, selecting the top-k with DeepSelect when
+it is installed (else ``torch.topk``); prefill runs the training kernels through
 ``dsa_cute_kernels``.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from dataclasses import dataclass
-from functools import partial
+from functools import cache, partial
 from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
+
+try:
+    import deep_select
+
+    HAVE_DEEP_SELECT = True
+except ImportError:
+    deep_select = None
+    HAVE_DEEP_SELECT = False
 
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.fp8_utils import get_fp8_disabled_context
@@ -34,6 +44,8 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -154,9 +166,7 @@ class SimplifiedDSACoreAttention(MegatronModule):
                 f"{expected_softmax_scale}, got {softmax_scale}."
             )
         self.softmax_scale = softmax_scale
-        self.indexer = build_module(
-            submodules.indexer, config=config, pg_collection=pg_collection
-        )
+        self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
 
     def forward(
         self,
@@ -301,7 +311,9 @@ class DSGroupedSelfAttention(SelfAttention):
     ) -> dict[str, object]:
         del hidden_states
         if qkv_layernorm_output is None:
-            raise RuntimeError("CuTe DSA requested the fused QKV norm output, but none was returned.")
+            raise RuntimeError(
+                "CuTe DSA requested the fused QKV norm output, but none was returned."
+            )
         no_rope = (
             self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
         )
@@ -333,7 +345,7 @@ class DSGroupedSelfAttention(SelfAttention):
     ) -> torch.Tensor:
         """Run sparse attention for a dynamic batch against the paged KV and indexer caches.
 
-        Decode requests use the paged CuTe decode kernels. Each prefill request runs the
+        Decode requests use the paged Triton decode kernels. Each prefill request runs the
         training CuTe sparse kernel over its cached prefix, which covers fresh prompts and
         chunked prefill.
         """
@@ -369,6 +381,28 @@ def _paged_cache_rows(
     return cache[physical_blocks, positions % block_size_tokens]
 
 
+@cache
+def _log_decode_topk_backend(use_deep_select: bool) -> None:
+    """Say once per backend which top-k decode uses, since the fallback is much slower."""
+    if use_deep_select:
+        logger.info("DSA decode selects its top-k with DeepSelect.")
+    else:
+        logger.warning(
+            "DSA decode selects its top-k with torch.topk over the whole score buffer; "
+            "install DeepSelect (SM100/SM103, top-k <= 4096) for decode cost that follows "
+            "the real context lengths."
+        )
+
+
+def _deep_select_decode_supported(device: torch.device, index_topk: int) -> bool:
+    """DeepSelect's CUDA build has SM100a/SM103a kernels for top-k up to 4096."""
+    return (
+        HAVE_DEEP_SELECT
+        and 0 < index_topk <= 4096
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+    )
+
+
 @torch.no_grad()
 def _sparse_decode(
     *,
@@ -385,33 +419,55 @@ def _sparse_decode(
 ) -> torch.Tensor:
     """Route each single-token decode query to its top-k cached keys and attend to them.
 
-    ``max_context_length`` must bound every entry of ``kv_lengths``; scores past a
-    request's length are negative infinity and their indices are masked by the kernel.
+    ``max_context_length`` must bound every entry of ``kv_lengths``. DeepSelect reads
+    each score row only up to its request's length, so the indexer skips the rest and
+    the cost follows the real lengths; ``torch.topk`` reads whole rows, so the indexer
+    fills positions past each length with negative infinity.
 
     Returns:
         Attention output ``[requests,Hq,Dv]``.
     """
-    from megatron.core.transformer.experimental_attention_variant import dsa_gqa_decode_kernel
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa_decode_triton
 
     num_requests, num_query_heads, _ = query.shape
     kv_lengths = kv_lengths.to(torch.int32).contiguous()
     block_table = block_table.to(torch.int32).contiguous()
-    scores = torch.empty(
-        (num_requests, max_context_length), dtype=torch.float32, device=query.device
+    use_deep_select = _deep_select_decode_supported(query.device, index_topk)
+    _log_decode_topk_backend(use_deep_select)
+    width = max_context_length
+    if use_deep_select:
+        # DeepSelect needs row strides aligned to its requirement and at least top-k
+        # columns; the indexer never writes past a row's length.
+        alignment = deep_select.get_stride_requirement()[0] // torch.float32.itemsize
+        width = -(-max(width, index_topk) // alignment) * alignment
+    scores = torch.empty((num_requests, width), dtype=torch.float32, device=query.device)
+    dsa_gqa_decode_triton.dsa_gqa_decode_indexer_score(
+        index_query.contiguous(),
+        index_key_cache,
+        block_table,
+        kv_lengths,
+        out=scores,
+        fill_invalid=not use_deep_select,
     )
-    dsa_gqa_decode_kernel.dsa_gqa_decode_indexer_score(
-        index_query.contiguous(), index_key_cache, block_table, kv_lengths, out=scores
-    )
-    topk_indices = scores.topk(min(index_topk, max_context_length), dim=-1).indices
-    # A fixed top-k width keeps the attention kernel's shared-memory layout constant.
-    topk_indices = F.pad(topk_indices, (0, index_topk - topk_indices.size(1)), value=-1)
+    if use_deep_select:
+        _, topk_indices = deep_select.topk(
+            scores,
+            index_topk,
+            end=kv_lengths,
+            indices_type=torch.int32,
+            return_value=False,
+            idx_oob_fill_value=-1,
+        )
+    else:
+        topk_indices = scores.topk(min(index_topk, width), dim=-1).indices.to(torch.int32)
+        topk_indices = F.pad(topk_indices, (0, index_topk - topk_indices.size(1)), value=-1)
     output = query.new_empty((num_requests, num_query_heads, value_cache.size(-1)))
-    dsa_gqa_decode_kernel.dsa_gqa_decode_attention(
-        query.contiguous(),
+    dsa_gqa_decode_triton.dsa_gqa_decode_attention(
+        query,
         key_cache,
         value_cache,
         block_table,
-        topk_indices.to(torch.int32).contiguous(),
+        topk_indices,
         kv_lengths,
         softmax_scale,
         out=output,

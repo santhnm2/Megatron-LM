@@ -5,7 +5,7 @@
 Prefill and uncached forwards run the training kernels from the optional
 ``simplified_sparse_attention`` package (SM103), so inference applies exactly the
 row layout and causal top-k routing the model was trained with. The package is
-imported on first use; decode uses the paged kernels in ``dsa_gqa_decode_kernel``.
+imported on first use; decode uses the paged kernels in ``dsa_gqa_decode_triton``.
 """
 
 from __future__ import annotations

@@ -398,7 +398,7 @@ class TransformerConfig(ModelParallelConfig):
     """Sparse attention implementation for DSA over GQA.
 
     Separate from ``dsa_kernel_backend``, which selects fused DSA-over-MLA kernels. ``cute``
-    uses the simplified-sparse-attention package for prefill and CuTe decode kernels, and
+    uses the simplified-sparse-attention package for prefill and Triton decode kernels, and
     requires the validated learned-Q/K, BF16, MQA configuration.
     """
 

@@ -26,12 +26,19 @@ from megatron.core.tensor_parallel.inference_layers import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_cute_kernels, dsa_gqa
+from megatron.core.transformer.experimental_attention_variant import (
+    dsa_cute_kernels,
+    dsa_gqa,
+    dsa_gqa_fused_select,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
     _deep_select_decode_supported,
     _sparse_attention_rows,
     dynamic_sparse_attention,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_filter_kernels import (
+    PREFILL_ROW_BLOCK,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
     HAVE_TRITON,
@@ -512,6 +519,254 @@ def test_deep_select_rows_match_torch_topk(monkeypatch):
     with_deep_select = attend()
     monkeypatch.setattr(dsa_gqa, "HAVE_DEEP_SELECT", False)
     torch.testing.assert_close(with_deep_select, attend(), atol=2e-2, rtol=2e-2)
+
+
+FUSED_PAGE_SIZE = 256
+
+
+def _fused_rows(query_lengths, kv_lengths, padding_rows, device):
+    """Rows, score blocks and filter blocks for requests plus padding rows and blocks."""
+    rows = _rows_with_padding(query_lengths, kv_lengths, padding_rows, device)
+    filter_blocks = build_row_metadata(
+        torch.tensor(query_lengths), torch.tensor(kv_lengths), PREFILL_ROW_BLOCK
+    )[2:]
+    block_pad = torch.zeros(2, dtype=torch.int32)
+    filter_blocks = tuple(torch.cat((tensor, block_pad)).to(device) for tensor in filter_blocks)
+    return rows[0], rows[1], tuple(rows[2:]), filter_blocks
+
+
+def _fused_select_case(query_lengths, kv_lengths, padding_rows, device, seed):
+    torch.manual_seed(seed)
+    max_pages = -(-max(kv_lengths) // FUSED_PAGE_SIZE)
+    num_pages = len(query_lengths) * max_pages
+    index_keys = torch.randn(
+        num_pages, FUSED_PAGE_SIZE, INDEX_DIM, device=device, dtype=torch.bfloat16
+    )
+    table = torch.randperm(num_pages, device=device).view(-1, max_pages).to(torch.int32)
+    row_requests, row_lengths, score_blocks, filter_blocks = _fused_rows(
+        query_lengths, kv_lengths, padding_rows, device
+    )
+    index_query = torch.randn(row_requests.numel(), INDEX_DIM, device=device, dtype=torch.bfloat16)
+    return index_query, index_keys, table, row_requests, row_lengths, score_blocks, filter_blocks
+
+
+def _assert_exact_topk(indices, index_query, index_keys, table, row_requests, row_lengths, topk):
+    """Each row selects keys whose scores are the row's top-k scores (ties may swap keys)."""
+    scores = _reference_scores(
+        index_query, index_keys, table, row_requests, row_lengths, FUSED_PAGE_SIZE
+    )
+    for row, row_scores in enumerate(scores):
+        length = row_scores.numel()
+        selected = indices[row]
+        valid = selected[selected >= 0].long()
+        assert valid.numel() == min(length, topk), row
+        assert valid.unique().numel() == valid.numel(), row
+        assert bool((valid < length).all()), row
+        if length > topk:
+            expected = row_scores.topk(topk).values.sort().values
+            torch.testing.assert_close(row_scores[valid].sort().values, expected, atol=1e-3, rtol=0)
+
+
+def _fused_select_supported(device, topk):
+    return dsa_gqa_fused_select.fused_select_supported(device, topk, INDEX_DIM, FUSED_PAGE_SIZE)
+
+
+@pytest.mark.parametrize(
+    "query_lengths,kv_lengths,decode_only",
+    [
+        # Decode rows from fewer than top-k keys to tens of thousands.
+        ([1, 1, 1, 1, 1], [300, 600, 5000, 20000, 33000], True),
+        # A chunk over a cached prefix (several filter blocks) with decode rows.
+        ([1, 300, 1], [9000, 20000, 513], False),
+    ],
+)
+def test_fused_select_matches_full_topk(query_lengths, kv_lengths, decode_only):
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not _fused_select_supported(device, TOPK):
+        pytest.skip("The fused selection needs DeepSelect, CuTe DSL and SM100/SM103")
+    inputs = _fused_select_case(query_lengths, kv_lengths, 3, device, seed=53)
+    index_query, index_keys, table, row_requests, row_lengths, score_blocks, filter_blocks = inputs
+    indices = dsa_gqa_fused_select.fused_select_topk(
+        index_query,
+        index_keys,
+        table,
+        row_requests,
+        row_lengths,
+        score_blocks,
+        filter_blocks,
+        width=max(kv_lengths),
+        index_topk=TOPK,
+        decode_only=decode_only,
+    )
+    _assert_exact_topk(indices, index_query, index_keys, table, row_requests, row_lengths, TOPK)
+    assert bool((indices[row_lengths == 0] == -1).all())
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        # Candidate buffers (DeepSelect needs rows of 256-multiples) too small for the ~1664
+        # keys each long row keeps: every long row overflows.
+        (39, 768),
+        # The largest sample as threshold: every long row keeps fewer than top-k keys.
+        (1, 4608),
+    ],
+)
+@pytest.mark.parametrize("decode_only", [True, False])
+def test_fused_select_fallback_is_exact(selector, decode_only, monkeypatch):
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not _fused_select_supported(device, TOPK):
+        pytest.skip("The fused selection needs DeepSelect, CuTe DSL and SM100/SM103")
+    monkeypatch.setitem(dsa_gqa_fused_select.SELECTOR, TOPK, selector)
+    if decode_only:
+        query_lengths, kv_lengths = [1, 1, 1], [400, 3000, 12000]
+    else:
+        query_lengths, kv_lengths = [140, 1], [6000, 2500]
+    inputs = _fused_select_case(query_lengths, kv_lengths, 2, device, seed=59)
+    index_query, index_keys, table, row_requests, row_lengths, score_blocks, filter_blocks = inputs
+    indices = dsa_gqa_fused_select.fused_select_topk(
+        index_query,
+        index_keys,
+        table,
+        row_requests,
+        row_lengths,
+        score_blocks,
+        filter_blocks,
+        width=max(kv_lengths),
+        index_topk=TOPK,
+        decode_only=decode_only,
+    )
+    _assert_exact_topk(indices, index_query, index_keys, table, row_requests, row_lengths, TOPK)
+
+
+@pytest.mark.parametrize("decode_only", [True, False])
+def test_fused_select_replays_in_cuda_graph(decode_only):
+    """Graph replays with new keys, queries, tables and lengths must match eager runs."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not _fused_select_supported(device, TOPK):
+        pytest.skip("The fused selection needs DeepSelect, CuTe DSL and SM100/SM103")
+    if decode_only:
+        batches = [([1, 1, 1], [700, 9000, 4000]), ([1, 1, 1], [9000, 513, 8000])]
+    else:
+        batches = [([200, 1, 1], [9000, 700, 3000]), ([1, 150, 30], [6000, 9000, 160])]
+    width = 9000
+    max_requests, max_pages = 3, -(-width // FUSED_PAGE_SIZE)
+    num_pages = max_requests * max_pages
+    max_rows = max(sum(query_lengths) for query_lengths, _ in batches)
+    torch.manual_seed(61)
+    index_keys = torch.randn(
+        num_pages, FUSED_PAGE_SIZE, INDEX_DIM, device=device, dtype=torch.bfloat16
+    )
+    table = torch.zeros(max_requests, max_pages, device=device, dtype=torch.int32)
+    index_query = torch.zeros(max_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    row_requests = torch.full((max_rows,), -1, device=device, dtype=torch.int32)
+    row_lengths = torch.zeros(max_rows, device=device, dtype=torch.int32)
+    score_blocks = tuple(
+        torch.zeros(
+            max_requests + -(-max_rows // SCORE_ROW_BLOCK), device=device, dtype=torch.int32
+        )
+        for _ in range(3)
+    )
+    filter_blocks = tuple(
+        torch.zeros(
+            max_requests + -(-max_rows // PREFILL_ROW_BLOCK), device=device, dtype=torch.int32
+        )
+        for _ in range(3)
+    )
+
+    def select():
+        return dsa_gqa_fused_select.fused_select_topk(
+            index_query,
+            index_keys,
+            table,
+            row_requests,
+            row_lengths,
+            score_blocks,
+            filter_blocks,
+            width=width,
+            index_topk=TOPK,
+            decode_only=decode_only,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        select()  # Compile outside capture, as engine warmup does.
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_indices = select()
+
+    for query_lengths, kv_lengths in batches:
+        score_metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
+        filter_metadata = build_row_metadata(
+            torch.tensor(query_lengths), torch.tensor(kv_lengths), PREFILL_ROW_BLOCK
+        )
+        rows = score_metadata[0].numel()
+        row_requests.fill_(-1)
+        row_lengths.zero_()
+        row_requests[:rows] = score_metadata[0].to(device)
+        row_lengths[:rows] = score_metadata[1].to(device)
+        for buffers, values in (
+            (score_blocks, score_metadata[2:]),
+            (filter_blocks, filter_metadata[2:]),
+        ):
+            for buffer, value in zip(buffers, values):
+                buffer.zero_()
+                buffer[: value.numel()] = value.to(device)
+        index_keys.copy_(torch.randn_like(index_keys))
+        index_query.copy_(torch.randn_like(index_query))
+        table.copy_(torch.randperm(num_pages, device=device).view(max_requests, max_pages))
+        graph.replay()
+        eager = select()
+        torch.testing.assert_close(graph_indices.sort(dim=1).values, eager.sort(dim=1).values)
+        _assert_exact_topk(
+            graph_indices[:rows],
+            index_query[:rows],
+            index_keys,
+            table,
+            row_requests[:rows],
+            row_lengths[:rows],
+            TOPK,
+        )
+
+
+def test_sparse_attention_rows_take_the_fused_selection_at_long_context():
+    """Past FUSED_MIN_CONTEXT, attention through the fused selection matches the materialized
+    selection."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not _fused_select_supported(device, TOPK):
+        pytest.skip("The fused selection needs DeepSelect, CuTe DSL and SM100/SM103")
+    width = dsa_gqa_fused_select.FUSED_MIN_CONTEXT + 1000
+    query_lengths, kv_lengths = [1, 40, 1], [width, width - 3000, 5000]
+    inputs = _fused_select_case(query_lengths, kv_lengths, 3, device, seed=67)
+    index_query, index_keys, table, row_requests, row_lengths, score_blocks, filter_blocks = inputs
+    keys = torch.randn(
+        index_keys.size(0), FUSED_PAGE_SIZE, 1, HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
+    values = torch.randn_like(keys)
+    query = torch.randn(
+        index_query.size(0), NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
+    row_metadata = (row_requests, row_lengths, *score_blocks, score_blocks[0].numel())
+
+    def attend(filter_blocks):
+        return _sparse_attention_rows(
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query,
+            index_key_cache=index_keys,
+            block_table=table,
+            row_metadata=row_metadata,
+            max_context_length=width,
+            index_topk=TOPK,
+            softmax_scale=HEAD_DIM**-0.5,
+            filter_blocks=filter_blocks,
+            decode_only=False,
+        )
+
+    torch.testing.assert_close(attend(filter_blocks), attend(None), atol=2e-2, rtol=2e-2)
 
 
 @requires_ssa

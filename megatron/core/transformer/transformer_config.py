@@ -394,6 +394,11 @@ class TransformerConfig(ModelParallelConfig):
     dsa_simplified_use_learned_k: bool = False
     """Whether the simplified DSA indexer uses a learned key projection."""
 
+    dsa_inference_backend: Literal["triton", "flashinfer"] = "triton"
+    """Kernels of DSA-over-GQA dynamic-batching inference: ``triton`` (Megatron's Triton and
+    CuTe DSL kernels) or ``flashinfer`` (FlashInfer's DSA kernels and FA4, as vLLM deploys them;
+    needs the FlashInfer build with DSA support and CuTe DSL 4.7 or newer)."""
+
     dsa_min_memory_backend: Literal["reference", "cute"] = "reference"
     """Sparse attention implementation for DSA over GQA.
 
@@ -2392,7 +2397,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_router_quantile_balancing_estimation_scope must be "
                     "'micro_batch' or 'global_batch'."
                 )
-            if self.num_moe_experts is None or not (0 < self.moe_router_topk < self.num_moe_experts):
+            if self.num_moe_experts is None or not (
+                0 < self.moe_router_topk < self.num_moe_experts
+            ):
                 raise ValueError(
                     "quantile_balancing requires 0 < moe_router_topk < num_moe_experts."
                 )

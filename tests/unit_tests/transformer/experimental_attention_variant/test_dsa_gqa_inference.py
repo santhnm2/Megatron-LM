@@ -6,6 +6,7 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -29,6 +30,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_cute_kernels,
     dsa_gqa,
+    dsa_gqa_flashinfer,
     dsa_gqa_fused_select,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
@@ -769,6 +771,149 @@ def test_sparse_attention_rows_take_the_fused_selection_at_long_context():
     torch.testing.assert_close(attend(filter_blocks), attend(None), atol=2e-2, rtol=2e-2)
 
 
+def _flashinfer_supported(topk=TOPK):
+    device = torch.device("cuda", torch.cuda.current_device())
+    return dsa_gqa_flashinfer.flashinfer_dsa_supported(device, topk, INDEX_DIM, 256, NUM_HEADS)
+
+
+def test_flashinfer_step_plan():
+    """Leading single-token requests take the decode path; the rest fill 128-row tiles whose
+    8-row groups are consecutive, gap-free union-core batches; sizes follow the padded batch."""
+    # Two decode requests, a 300-token chunk, a single-token request after it (prefill path),
+    # padded to 400 rows and 8 requests.
+    plan = dsa_gqa_flashinfer.build_step_plan(
+        [1, 1, 300, 1],
+        [50, 9000, 1300, 77],
+        padded_rows=400,
+        padded_requests=8,
+        decode_only=False,
+        heads=NUM_HEADS,
+    )
+    sizes = dsa_gqa_flashinfer.plan_sizes(400, 8, False)
+    assert sizes == {"decode_rows": 8, "tiles": 4 + 8, "prefill_requests": 8}
+    assert plan["decode_lengths"].tolist() == [50, 9000] + [0] * 6
+    assert plan["decode_requests"][:2].tolist() == [0, 1]
+    assert len(plan["query_rows"]) == 12 * 128 and len(plan["batch_starts"]) == 12 * 16 + 1
+    rows = plan["query_rows"][plan["query_rows"] >= 0]
+    assert rows.tolist() == list(range(2, 303))
+    # Request 2's rows end at keys 1001 .. 1300; request 3's single row at key 77.
+    ends = plan["row_ends"][plan["query_rows"] >= 0]
+    assert ends.tolist() == list(range(1001, 1301)) + [77]
+    assert plan["tile_requests"][:4].tolist() == [2, 2, 2, 3]
+    starts = plan["batch_starts"]
+    assert (np.diff(starts) >= 0).all() and starts[0] == 2 and starts[-1] == 303
+    assert plan["sample_ends"][:2].tolist() == [1300 // 128 * 3, 77 // 128 * 3]
+    decode_plan = dsa_gqa_flashinfer.build_step_plan(
+        [1] * 3, [10, 20, 30], padded_rows=4, padded_requests=4, decode_only=True, heads=NUM_HEADS
+    )
+    assert decode_plan["decode_lengths"].tolist() == [10, 20, 30, 0]
+    assert decode_plan["query_rows"].size == 0
+
+
+@pytest.mark.parametrize("decode_only", [True, False])
+def test_flashinfer_matches_triton_and_replays_in_cuda_graph(decode_only):
+    """A captured FlashInfer layer, replayed for new batches of one padded size (new keys,
+    queries, tables and lengths, plan buffers refilled in place), matches the Triton path, and
+    padding rows stay zero."""
+    if not _flashinfer_supported():
+        pytest.skip("FlashInfer's DSA kernels are not installed or not supported here")
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(71)
+    page_size, bound = 256, 9216
+    if decode_only:
+        padded_rows = padded_requests = 4
+        batches = [([1, 1, 1], [700, 9000, 2600]), ([1, 1, 1, 1], [9000, 513, 4000, 1])]
+    else:
+        padded_rows, padded_requests = 640, 4
+        batches = [([1, 1, 300, 37], [700, 9000, 3000, 37]), ([1, 520], [8000, 9000])]
+    max_pages = bound // page_size
+    num_pages = padded_requests * max_pages
+    keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    table = torch.zeros(padded_requests, max_pages, device=device, dtype=torch.int32)
+    query = torch.zeros(padded_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    index_query = torch.zeros(padded_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    sizes = dsa_gqa_flashinfer.plan_sizes(padded_rows, padded_requests, decode_only)
+    empty = dsa_gqa_flashinfer.build_step_plan(
+        [1],
+        [1],
+        padded_rows=padded_rows,
+        padded_requests=padded_requests,
+        decode_only=decode_only,
+        heads=NUM_HEADS,
+    )
+    buffers = {
+        name: torch.zeros(len(v), device=device, dtype=torch.int32) for name, v in empty.items()
+    }
+    plan = dsa_gqa_flashinfer.StepPlan(
+        decode_rows=sizes["decode_rows"], num_tiles=sizes["tiles"], max_context=bound, **buffers
+    )
+
+    def fill(query_lengths, kv_lengths):
+        arrays = dsa_gqa_flashinfer.build_step_plan(
+            query_lengths,
+            kv_lengths,
+            padded_rows=padded_rows,
+            padded_requests=padded_requests,
+            decode_only=decode_only,
+            heads=NUM_HEADS,
+        )
+        for name, values_np in arrays.items():
+            buffers[name].copy_(torch.from_numpy(values_np))
+        real = sum(query_lengths)
+        query.zero_()
+        index_query.zero_()
+        query[:real] = torch.randn(real, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        index_query[:real] = torch.randn(real, INDEX_DIM, device=device, dtype=torch.bfloat16)
+        keys.copy_(torch.randn_like(keys))
+        index_keys.copy_(torch.randn_like(index_keys))
+        table.copy_(torch.randperm(num_pages, device=device).view(padded_requests, max_pages))
+        return real
+
+    def attend():
+        return dsa_gqa_flashinfer.flashinfer_sparse_attention(
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query,
+            index_key_cache=index_keys,
+            block_table=table,
+            plan=plan,
+            index_topk=TOPK,
+            softmax_scale=HEAD_DIM**-0.5,
+        )
+
+    fill(*batches[0])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        attend()  # Compile outside capture, as engine warmup does.
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = attend()
+
+    for query_lengths, kv_lengths in batches:
+        real = fill(query_lengths, kv_lengths)
+        graph.replay()
+        metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
+        expected = _sparse_attention_rows(
+            query=query[:real],
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query[:real],
+            index_key_cache=index_keys,
+            block_table=table[: len(query_lengths)],
+            row_metadata=(*[t.to(device) for t in metadata], metadata[2].numel()),
+            max_context_length=bound,
+            index_topk=TOPK,
+            softmax_scale=HEAD_DIM**-0.5,
+        )
+        torch.testing.assert_close(graph_output[:real], expected, atol=2e-2, rtol=2e-2)
+        assert torch.count_nonzero(graph_output[real:]) == 0
+
+
 @requires_ssa
 @pytest.mark.parametrize("key_offset", [0, 1, 300, 777])
 def test_rectangular_prefill_matches_full_sequence_rows(key_offset):
@@ -863,13 +1008,19 @@ class TestDynamicSparseAttention:
         with pytest.raises(NotImplementedError, match="dynamic batching only"):
             attention(hidden_states=None, attention_mask=None, inference_context=context)
 
+    @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
     @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "inference_optimized"])
-    def test_mixed_prefill_and_decode_match_training_forward(self, transformer_impl):
-        """Cached decode and mixed batches must match uncached attention.
+    def test_mixed_prefill_and_decode_match_training_forward(self, transformer_impl, backend):
+        """Cached decode and mixed batches must match uncached attention, on both inference
+        backends.
 
         Prompts longer than the routing top-k make sparse selection matter.
         """
-        config = self._config(transformer_impl)
+        if backend == "flashinfer" and not _flashinfer_supported():
+            pytest.skip("FlashInfer's DSA kernels are not installed or not supported here")
+        config = TransformerConfig(
+            **_config_kwargs(transformer_impl=transformer_impl, dsa_inference_backend=backend)
+        )
         context = DynamicInferenceContext(
             model_config=config,
             inference_config=InferenceConfig(

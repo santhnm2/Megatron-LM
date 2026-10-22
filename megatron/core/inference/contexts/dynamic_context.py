@@ -56,6 +56,7 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
+from .attention_context.dsa_metadata import DSAMetadata
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
@@ -426,6 +427,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
+        )
+        # DSA layers read per-step facts from DSAMetadata. The FlashInfer backend also runs
+        # selection and sparse attention from its per-step plan for every step type, so it can
+        # run under CUDA graphs.
+        self.dsa_backend = inference_config.dsa_backend
+        self.dsa_flashinfer = self.cache_dsa_indexer_keys and self.dsa_backend == "flashinfer"
+        self.dsa_index_topk = model_config.dsa_indexer_topk if self.cache_dsa_indexer_keys else 0
+        self.dsa_query_heads = (
+            model_config.num_attention_heads // model_config.tensor_model_parallel_size
         )
         if self.cache_mla_latent:
             assert (
@@ -1651,6 +1661,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
+        self.dsa_metadata = None
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata = DSAMetadata(
+                backend=self.dsa_backend,
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                max_kv_blocks=self.max_kv_block_count,
+                block_size_tokens=self.block_size_tokens,
+                max_sequence_length=self.max_sequence_length,
+                query_heads=self.dsa_query_heads,
+                index_topk=self.dsa_index_topk,
+            )
+
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
         # we fix the underlying storage so views are reusable across steps. The number of entries
@@ -2046,9 +2069,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             assert key.size(1) == 1
             key = key.squeeze(1)
 
-        self.dsa_memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = key[
-            : self.padded_active_token_count
-        ]
+        # One Triton launch, safe under CUDA graphs.
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        dsa_gqa_flashinfer.write_paged_rows(
+            key[: self.padded_active_token_count],
+            self.dsa_memory_buffer[attention_layer_number],
+            block_idx,
+            local_kv_seq_idx,
+        )
 
     def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Return a layer's learned indexer-key cache and active block table."""
@@ -2846,6 +2875,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             max_seqlen_k=max_seqlen_k,
         )
 
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata.update(
+                self._cpu_mha_query_lengths[:real_bs].tolist(),
+                self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
+                num_decode_requests=attn_dimensions.decode_req_count,
+                padded_tokens=self.padded_active_token_count,
+                padded_requests=padded_bs,
+                decode_only=self.is_decode_only(),
+            )
+
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
             # because it writes to GPU buffers. Store the parameters here.
@@ -3021,6 +3060,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
+
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata.transfer(
+                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+                non_blocking=record_done_event,
+            )
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:

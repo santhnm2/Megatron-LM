@@ -493,13 +493,13 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         """Apply indexer RoPE using each dynamic token's absolute request position."""
         if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
             return q
+        if inference_context.using_cuda_graph_this_step():
+            raise NotImplementedError(
+                "DSA indexer RoPE in dynamic batching does not yet support CUDA graphs."
+            )
         active_tokens = inference_context.active_token_count
-        rotary_seq_len = (
-            1
-            if active_tokens == 0
-            else int(inference_context.token_to_position_in_request[:active_tokens].max().item())
-            + 1
-        )
+        # Every active token's position is below its request's key count.
+        rotary_seq_len = max(1, inference_context.dsa_metadata.step().max_kv_length)
         if _dsa_rope_setting(self.config, "rope_type") == "rope":
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
         else:
@@ -819,12 +819,12 @@ class DSGQACoreAttention(MegatronModule):
         use_indexer_rope: bool = False,
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
-        """Run mixed dynamic inference with training prefill and paged CuTe decode."""
-        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_kernel import (
-            dsa_gqa_decode_attention,
-            dsa_gqa_decode_indexer_score,
-        )
+        """Run DSA over the paged caches for a decode, prefill, or mixed dynamic batch.
 
+        With the FlashInfer backend (the default), every row routes through FlashInfer's DSA
+        kernels from the step's plan (``DSAMetadata``), CUDA-graph safe. With the CuTe backend,
+        decode rows use the paged CuTe kernels and each prefill request runs the training path.
+        """
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         if self.config.dsa_fwd_use_dense_attn:
             raise NotImplementedError("Dynamic DSA-GQA requires sparse indexer routing.")
@@ -837,16 +837,27 @@ class DSGQACoreAttention(MegatronModule):
 
         total_tokens, batch_size, num_query_heads, _ = query.shape
         assert batch_size == 1, "Dynamic DSA-GQA expects packed tokens with batch=1."
+        if inference_context.dsa_flashinfer:
+            # Same launches for every batch that fits the step's padded shape (CUDA graphs).
+            index_q, index_key_cache, _ = self._cache_dynamic_index_keys(
+                hidden_states,
+                inference_context,
+                provider_layer_number,
+                use_indexer_rope,
+                indexer_input_norm,
+            )
+            return self._forward_dynamic_flashinfer(
+                query, key_cache, value_cache, index_q, index_key_cache, inference_context
+            )
+
         output = value_cache.new_zeros((total_tokens, 1, num_query_heads * value_cache.size(-1)))
         request_count = inference_context.get_active_request_count()
         if request_count == 0:
             return output
 
+        step = inference_context.dsa_metadata.step()
         state_data = inference_context.active_attn_metadata["mha_metadata"].state_data
-        query_lengths = state_data["query_lengths"][:request_count].to(torch.long)
         kv_lengths = state_data["kv_seq_lengths"][:request_count].to(torch.long)
-        query_offsets, _ = inference_context.cu_query_lengths()
-        query_offsets = query_offsets[: request_count + 1].to(torch.long)
         active_tokens = inference_context.active_token_count
         # The inference engine carries packing metadata in its dynamic context;
         # ordinary model wrappers need not also construct PackedSeqParams.
@@ -860,26 +871,26 @@ class DSGQACoreAttention(MegatronModule):
                 f"but the inference context has {active_tokens}."
             )
 
-        indexer_hidden_states = hidden_states.detach()
-        if _simplified_indexer_uses_main_input_norm(self.config):
-            indexer_hidden_states = _normalized_indexer_input(
-                indexer_hidden_states, indexer_input_norm
-            )
-
-        index_q, current_index_key = self.indexer.forward_qk_dynamic(
-            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+        index_q, index_key_cache, index_block_table = self._cache_dynamic_index_keys(
+            hidden_states,
+            inference_context,
+            provider_layer_number,
+            use_indexer_rope,
+            indexer_input_norm,
         )
-        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
-        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
 
-        num_decode_requests = inference_context.num_decode_requests
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_kernel import (
+            dsa_gqa_decode_attention,
+            dsa_gqa_decode_indexer_score,
+        )
+
+        num_decode_requests = step.num_decode_requests
         if num_decode_requests:
-            decode_lengths = query_lengths[:num_decode_requests]
-            if not bool((decode_lengths == 1).all().item()):
+            if step.max_decode_query_length != 1:
                 raise NotImplementedError(
                     "The CuTe decode indexer currently supports one query token per request."
                 )
-            max_context_length = int(kv_lengths[:num_decode_requests].max().item())
+            max_context_length = step.max_decode_kv_length
             if _deepselect_decode_supported(query.device, self.indexer.index_topk):
                 # Write DeepSelect's row alignment padding in the score kernel, avoiding
                 # a full score-buffer copy between the indexer and TopK.
@@ -917,18 +928,10 @@ class DSGQACoreAttention(MegatronModule):
             )
             output[:num_decode_requests, 0] = decode_output.flatten(1)
 
-        request_kv_offsets = inference_context.gpu_view.request_kv_length_offsets[
-            :request_count
-        ].to(torch.long)
-        for prefill_request_idx in range(num_decode_requests, request_count):
-            query_start = int(query_offsets[prefill_request_idx].item())
-            query_end = int(query_offsets[prefill_request_idx + 1].item())
-            query_length = query_end - query_start
-            kv_length = int(kv_lengths[prefill_request_idx].item())
-            if (
-                int(request_kv_offsets[prefill_request_idx].item()) != 0
-                or query_length != kv_length
-            ):
+        for span in step.prefill_spans:
+            prefill_request_idx = span.request
+            query_start, query_end, kv_length = span.query_start, span.query_end, span.kv_length
+            if query_end - query_start != kv_length:
                 raise NotImplementedError(
                     "Training-path prefill reuse currently requires an uncached full prompt."
                 )
@@ -960,6 +963,84 @@ class DSGQACoreAttention(MegatronModule):
         if is_using_quantization_scales(self.config):
             output[inference_context.padding_slice] = 0.0
         return output
+
+    def _cache_dynamic_index_keys(
+        self,
+        hidden_states: torch.Tensor,
+        inference_context: DynamicInferenceContext,
+        provider_layer_number: int,
+        use_indexer_rope: bool,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project the step's indexer Q/K, append K to the paged indexer cache, and return the
+        indexer queries, that layer's indexer-key cache, and the step's block table."""
+        indexer_hidden_states = hidden_states.detach()
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            indexer_hidden_states = _normalized_indexer_input(
+                indexer_hidden_states, indexer_input_norm
+            )
+        index_q, current_index_key = self.indexer.forward_qk_dynamic(
+            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+        )
+        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
+        return index_q, index_key_cache, index_block_table
+
+    @torch.no_grad()
+    def _forward_dynamic_flashinfer(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        index_query: torch.Tensor,
+        index_key_cache: torch.Tensor,
+        inference_context: DynamicInferenceContext,
+    ) -> torch.Tensor:
+        """Every step row through FlashInfer's DSA kernels; padding rows come back zero.
+
+        Args:
+            query: Queries ``[T,1,Hq,D]`` of the padded active tokens.
+            key_cache: Paged keys ``[blocks,block_size,G,D]``, holding this step's keys.
+            value_cache: Paged values ``[blocks,block_size,G,Dv]``, holding this step's values.
+            index_query: Indexer queries ``[T,1,1,Di]``.
+            index_key_cache: Paged indexer keys ``[blocks,block_size,Di]``, holding this step's.
+            inference_context: Dynamic context with this step's ``dsa_metadata`` plan.
+
+        Returns:
+            Attention output ``[T,1,Hq*Dv]``.
+        """
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        dsa_gqa_flashinfer.require_flashinfer_dsa()
+        if inference_context.num_speculative_tokens:
+            raise NotImplementedError(
+                "FlashInfer DSA inference decodes one token per request; speculative decoding "
+                "is not supported."
+            )
+        num_tokens, _, num_query_heads, _ = query.shape
+        if not dsa_gqa_flashinfer.flashinfer_dsa_supported(
+            query.device,
+            self.indexer.index_topk,
+            index_query.size(-1),
+            key_cache.size(1),
+            num_query_heads,
+        ):
+            raise RuntimeError(
+                "FlashInfer DSA inference needs SM100/SM103, top-k 512/1024/2048, indexer dim "
+                "128, at most 128 query heads per rank, and a KV block size that is a multiple "
+                "of 64."
+            )
+        output = dsa_gqa_flashinfer.flashinfer_sparse_attention(
+            query=query[:, 0],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_query.reshape(num_tokens, -1),
+            index_key_cache=index_key_cache,
+            plan=inference_context.dsa_metadata.plan(),
+            index_topk=self.indexer.index_topk,
+            softmax_scale=self.softmax_scale,
+        )
+        return output.view(num_tokens, 1, num_query_heads * value_cache.size(-1))
 
     def _forward_min_memory(
         self,
@@ -1191,8 +1272,10 @@ class DSGroupedSelfAttention(SelfAttention):
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         """Dispatch dynamic batching to the mixed prefill/decode DSA path."""
-        if inference_context.using_cuda_graph_this_step():
-            raise NotImplementedError("Dynamic DSA-GQA does not yet support CUDA graphs.")
+        if not inference_context.dsa_flashinfer and inference_context.using_cuda_graph_this_step():
+            raise NotImplementedError(
+                "The CuTe DSA backend does not support CUDA graphs; use dsa_backend='flashinfer'."
+            )
 
         provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
         return self.core_attention.forward_dynamic(

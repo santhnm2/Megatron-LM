@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,10 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.dsa_metadata import (
+    DSAMetadata,
+    DSAPrefillSpan,
+)
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
@@ -25,6 +30,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_gqa_decode_kernel as decode_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQACoreAttention,
@@ -1239,6 +1245,7 @@ class TestDSGQADynamicInference:
         context = DynamicInferenceContext(
             model_config=config,
             inference_config=InferenceConfig(
+                dsa_backend="cute",
                 max_sequence_length=128,
                 max_requests=1,
                 max_tokens=64,
@@ -1358,6 +1365,7 @@ class TestDSGQADynamicInference:
         inference_context = DynamicInferenceContext(
             model_config=config,
             inference_config=InferenceConfig(
+                dsa_backend="cute",
                 max_sequence_length=128,
                 max_requests=3,
                 max_tokens=64,
@@ -1600,6 +1608,7 @@ class TestDSGQADynamicInference:
         context = DynamicInferenceContext(
             model_config=config,
             inference_config=InferenceConfig(
+                dsa_backend="cute",
                 max_sequence_length=640,
                 max_requests=3,
                 max_tokens=1024,
@@ -1694,3 +1703,471 @@ class TestDSGQADynamicInference:
         # Keep the aggregate error budget in addition to the elementwise checks above.
         mean_abs_error = torch.stack(errors).mean().item()
         assert mean_abs_error <= 2e-3, f"Mean logprob error: {mean_abs_error} nats"
+
+
+# ---------------------------------------------------------------------------------------------
+# Dynamic-batching DSA metadata and the FlashInfer backend.
+# ---------------------------------------------------------------------------------------------
+
+NUM_HEADS = 16
+HEAD_DIM = 256
+INDEX_DIM = 128
+TOPK = 512
+
+
+def test_dsa_metadata_records_step_facts_on_the_host():
+    """Both backends read decode counts, longest contexts and prefill spans from DSAMetadata."""
+    metadata = DSAMetadata(
+        backend="cute",
+        max_requests=8,
+        max_tokens=512,
+        max_kv_blocks=16,
+        block_size_tokens=64,
+        max_sequence_length=1024,
+        query_heads=NUM_HEADS,
+        index_topk=TOPK,
+    )
+    metadata.update(
+        [1, 1, 300, 7],
+        [50, 900, 1000, 7],
+        num_decode_requests=2,
+        padded_tokens=320,
+        padded_requests=4,
+        decode_only=False,
+    )
+    step = metadata.step()
+    assert step.num_decode_requests == 2
+    assert step.max_decode_query_length == 1
+    assert step.max_decode_kv_length == 900
+    assert step.max_kv_length == 1000
+    assert step.prefill_spans == (
+        DSAPrefillSpan(request=2, query_start=2, query_end=302, kv_length=1000),
+        DSAPrefillSpan(request=3, query_start=302, query_end=309, kv_length=7),
+    )
+    with pytest.raises(RuntimeError, match="FlashInfer backend"):
+        metadata.plan()
+    metadata.reset()
+    assert metadata.step().prefill_spans == () and metadata.step().max_kv_length == 0
+
+
+def test_flashinfer_backend_without_its_kernels_fails_clearly(monkeypatch):
+    """Requesting the FlashInfer backend without FlashInfer's DSA kernels raises at setup."""
+    monkeypatch.setattr(dsa_gqa_flashinfer, "HAVE_FLASHINFER_DSA", False)
+    with pytest.raises(ImportError, match="flashinfer.sdsa"):
+        DSAMetadata(
+            backend="flashinfer",
+            max_requests=4,
+            max_tokens=256,
+            max_kv_blocks=8,
+            block_size_tokens=64,
+            max_sequence_length=512,
+            query_heads=NUM_HEADS,
+            index_topk=TOPK,
+        )
+
+
+def test_dsa_metadata_rejects_unknown_backends():
+    with pytest.raises(ValueError, match="Unknown DSA backend"):
+        DSAMetadata(
+            backend="triton",
+            max_requests=4,
+            max_tokens=256,
+            max_kv_blocks=8,
+            block_size_tokens=64,
+            max_sequence_length=512,
+            query_heads=NUM_HEADS,
+            index_topk=TOPK,
+        )
+
+
+def _reference_scores(index_q, index_keys, table, row_requests, row_lengths, page_size):
+    """Float64 scores of each row over its request's keys [0, length)."""
+    scores = []
+    for row in range(index_q.size(0)):
+        length = int(row_lengths[row])
+        positions = torch.arange(length, device=index_q.device)
+        pages = table[max(int(row_requests[row]), 0), positions // page_size].long()
+        keys = index_keys[pages, positions % page_size].double()
+        scores.append(keys @ index_q[row].double())
+    return scores
+
+
+def _reference_attention(query, keys, values, table, row_requests, row_lengths, indices, scale):
+    """Per-row attention over its valid selected keys; probabilities rounded to BF16 like PV."""
+    page_size, groups = keys.size(1), keys.size(2)
+    heads_per_group = query.size(1) // groups
+    out = torch.zeros(query.shape, dtype=torch.float32, device=query.device)
+    for row in range(query.size(0)):
+        selected = indices[row]
+        selected = selected[(selected >= 0) & (selected < row_lengths[row])].long()
+        if selected.numel() == 0:
+            continue
+        pages = table[int(row_requests[row]), selected // page_size].long()
+        for head in range(query.size(1)):
+            group = head // heads_per_group
+            k = keys[pages, selected % page_size, group].float()
+            v = values[pages, selected % page_size, group].float()
+            probs = (query[row, head].float() @ k.T * scale).softmax(-1)
+            out[row, head] = probs @ v
+    return out
+
+
+def _flashinfer_supported(topk=TOPK, page_size=256):
+    """Whether FlashInfer's DSA kernels are installed and support this device and shape."""
+    if not (
+        dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA
+        and dsa_gqa_flashinfer.HAVE_DEEP_SELECT
+        and dsa_gqa_flashinfer.HAVE_TRITON
+    ):
+        return False
+    device = torch.device("cuda", torch.cuda.current_device())
+    return dsa_gqa_flashinfer.flashinfer_dsa_supported(
+        device, topk, INDEX_DIM, page_size, NUM_HEADS
+    )
+
+
+def test_flashinfer_step_plan():
+    """Leading single-token requests take the decode path; the rest fill 128-row tiles whose
+    8-row groups are consecutive, gap-free union-core batches; sizes follow the padded batch."""
+    # Two decode requests, a 300-token chunk, a single-token request after it (prefill path),
+    # padded to 400 rows and 8 requests.
+    plan = dsa_gqa_flashinfer.build_step_plan(
+        [1, 1, 300, 1],
+        [50, 9000, 1300, 77],
+        padded_rows=400,
+        padded_requests=8,
+        decode_only=False,
+        heads=NUM_HEADS,
+    )
+    sizes = dsa_gqa_flashinfer.plan_sizes(400, 8, False)
+    assert sizes == {"decode_rows": 8, "tiles": 4 + 8, "prefill_requests": 8}
+    assert plan["decode_lengths"].tolist() == [50, 9000] + [0] * 6
+    assert plan["decode_requests"][:2].tolist() == [0, 1]
+    assert len(plan["query_rows"]) == 12 * 128 and len(plan["batch_starts"]) == 12 * 16 + 1
+    rows = plan["query_rows"][plan["query_rows"] >= 0]
+    assert rows.tolist() == list(range(2, 303))
+    # Request 2's rows end at keys 1001 .. 1300; request 3's single row at key 77.
+    ends = plan["row_ends"][plan["query_rows"] >= 0]
+    assert ends.tolist() == list(range(1001, 1301)) + [77]
+    assert plan["tile_requests"][:4].tolist() == [2, 2, 2, 3]
+    starts = plan["batch_starts"]
+    assert (np.diff(starts) >= 0).all() and starts[0] == 2 and starts[-1] == 303
+    assert plan["sample_ends"][:2].tolist() == [1300 // 128 * 3, 77 // 128 * 3]
+    decode_plan = dsa_gqa_flashinfer.build_step_plan(
+        [1] * 3, [10, 20, 30], padded_rows=4, padded_requests=4, decode_only=True, heads=NUM_HEADS
+    )
+    assert decode_plan["decode_lengths"].tolist() == [10, 20, 30, 0]
+    assert decode_plan["query_rows"].size == 0
+
+
+def _rows_of(query_lengths, kv_lengths):
+    """Each step row's request and causal key count."""
+    requests, lengths = [], []
+    for request, (q_len, kv_len) in enumerate(zip(query_lengths, kv_lengths)):
+        requests += [request] * q_len
+        lengths += list(range(kv_len - q_len + 1, kv_len + 1))
+    return requests, lengths
+
+
+def _reference_rows(query, index_query, keys, values, index_keys, table, requests, lengths):
+    """Exact float64 top-k selection, then attention over the selected keys."""
+    device = query.device
+    row_requests = torch.tensor(requests, device=device)
+    row_lengths = torch.tensor(lengths, device=device)
+    scores = _reference_scores(
+        index_query, index_keys, table, row_requests, row_lengths, index_keys.size(1)
+    )
+    indices = torch.full((len(requests), TOPK), -1, dtype=torch.int64, device=device)
+    for row, row_scores in enumerate(scores):
+        top = row_scores.topk(min(TOPK, row_scores.numel())).indices
+        indices[row, : top.numel()] = top
+    return _reference_attention(
+        query, keys, values, table, row_requests, row_lengths, indices, HEAD_DIM**-0.5
+    )
+
+
+@pytest.mark.parametrize("index_dim", [INDEX_DIM, 192])
+def test_write_paged_rows_and_page_table(index_dim):
+    """Token rows land at their (block, position) slots, padding tokens write nothing, and the
+    page table splits each block into 64-key pages."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    cache = torch.zeros(6, 256, index_dim, device=device, dtype=torch.bfloat16)
+    rows = torch.randn(5, index_dim, device=device, dtype=torch.bfloat16)
+    blocks = torch.tensor([3, 3, 0, -1, 5], device=device, dtype=torch.int64)
+    positions = torch.tensor([0, 255, 7, 9, 128], device=device, dtype=torch.int32)
+    dsa_gqa_flashinfer.write_paged_rows(rows, cache, blocks, positions)
+    expected = torch.zeros_like(cache)
+    for t in (0, 1, 2, 4):
+        expected[blocks[t], positions[t]] = rows[t]
+    assert torch.equal(cache, expected)
+    table = torch.tensor([[2, 0], [5, 1]], device=device, dtype=torch.int32)
+    pages = torch.full((3, 10), -7, device=device, dtype=torch.int32)
+    dsa_gqa_flashinfer.fill_page_table(table, 256, pages)
+    assert pages[:2, :8].tolist() == [[8, 9, 10, 11, 0, 1, 2, 3], [20, 21, 22, 23, 4, 5, 6, 7]]
+    assert (pages[:, 8:] == -7).all() and (pages[2] == -7).all()
+
+
+@pytest.mark.parametrize("decode_only", [True, False])
+def test_flashinfer_replays_in_cuda_graph(decode_only):
+    """A captured layer, replayed for new batches of one padded size (new keys, queries, tables
+    and lengths, plan buffers refilled in place), matches an exact PyTorch reference, and
+    padding rows stay zero."""
+    if not _flashinfer_supported():
+        pytest.skip("FlashInfer's DSA kernels are not installed or not supported here")
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(71)
+    page_size, bound = 256, 9216
+    if decode_only:
+        padded_rows = padded_requests = 4
+        batches = [([1, 1, 1], [700, 9000, 2600]), ([1, 1, 1, 1], [9000, 513, 4000, 1])]
+    else:
+        padded_rows, padded_requests = 640, 4
+        batches = [([1, 1, 300, 37], [700, 9000, 3000, 37]), ([1, 520], [8000, 9000])]
+    max_pages = bound // page_size
+    num_pages = padded_requests * max_pages
+    keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    table = torch.zeros(padded_requests, max_pages, device=device, dtype=torch.int32)
+    query = torch.zeros(padded_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    index_query = torch.zeros(padded_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    sizes = dsa_gqa_flashinfer.plan_sizes(padded_rows, padded_requests, decode_only)
+    empty = dsa_gqa_flashinfer.build_step_plan(
+        [1],
+        [1],
+        padded_rows=padded_rows,
+        padded_requests=padded_requests,
+        decode_only=decode_only,
+        heads=NUM_HEADS,
+    )
+    buffers = {
+        name: torch.zeros(len(v), device=device, dtype=torch.int32) for name, v in empty.items()
+    }
+    page_table = torch.zeros(
+        padded_requests,
+        dsa_gqa_flashinfer.page_table_columns(max_pages, page_size, bound, TOPK),
+        device=device,
+        dtype=torch.int32,
+    )
+    plan = dsa_gqa_flashinfer.StepPlan(
+        decode_rows=sizes["decode_rows"],
+        num_tiles=sizes["tiles"],
+        max_context=bound,
+        page_table=page_table,
+        **buffers,
+    )
+
+    def fill(query_lengths, kv_lengths):
+        arrays = dsa_gqa_flashinfer.build_step_plan(
+            query_lengths,
+            kv_lengths,
+            padded_rows=padded_rows,
+            padded_requests=padded_requests,
+            decode_only=decode_only,
+            heads=NUM_HEADS,
+        )
+        for name, values_np in arrays.items():
+            buffers[name].copy_(torch.from_numpy(values_np))
+        real = sum(query_lengths)
+        query.zero_()
+        index_query.zero_()
+        query[:real] = torch.randn(real, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        index_query[:real] = torch.randn(real, INDEX_DIM, device=device, dtype=torch.bfloat16)
+        keys.copy_(torch.randn_like(keys))
+        index_keys.copy_(torch.randn_like(index_keys))
+        table.copy_(torch.randperm(num_pages, device=device).view(padded_requests, max_pages))
+        dsa_gqa_flashinfer.fill_page_table(table, page_size, page_table)
+        return real
+
+    def attend():
+        return dsa_gqa_flashinfer.flashinfer_sparse_attention(
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query,
+            index_key_cache=index_keys,
+            plan=plan,
+            index_topk=TOPK,
+            softmax_scale=HEAD_DIM**-0.5,
+        )
+
+    fill(*batches[0])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        attend()  # Compile outside capture, as engine warmup does.
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = attend()
+
+    for query_lengths, kv_lengths in batches:
+        real = fill(query_lengths, kv_lengths)
+        graph.replay()
+        requests, lengths = _rows_of(query_lengths, kv_lengths)
+        expected = _reference_rows(
+            query[:real], index_query[:real], keys, values, index_keys, table, requests, lengths
+        )
+        torch.testing.assert_close(graph_output[:real].float(), expected, atol=2e-2, rtol=2e-2)
+        assert torch.count_nonzero(graph_output[real:]) == 0
+
+
+class TestDSGQAFlashInferDynamicInference:
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("use_rope", [False, True])
+    def test_mixed_prefill_and_decode_match_training(self, use_rope):
+        """Mixed prefill/decode and all-decode steps through the FlashInfer backend match the
+        training forward over each request's full prefix."""
+        if not _flashinfer_supported(page_size=64):
+            pytest.skip("FlashInfer's DSA kernels are not installed or not supported here")
+        dtype = torch.bfloat16
+        hidden_size = 4096
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            ffn_hidden_size=16384,
+            num_attention_heads=NUM_HEADS,
+            num_query_groups=1,
+            kv_channels=HEAD_DIM,
+            params_dtype=dtype,
+            bf16=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_kernel_backend="reference",
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=INDEX_DIM,
+            dsa_indexer_topk=TOPK,
+            dsa_indexer_loss_coeff=0.1,
+            tensor_model_parallel_size=1,
+            sequence_parallel=False,
+        )
+        inference_context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                dsa_backend="flashinfer",
+                max_sequence_length=1024,
+                max_requests=4,
+                max_tokens=256,
+                block_size_tokens=64,
+                buffer_size_gb=0.1,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+        prompt_lengths = (130, 9)
+        token_offset = 0
+        for request_id, prompt_length in enumerate(prompt_lengths):
+            inference_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        token_offset, token_offset + prompt_length, dtype=torch.long, device="cpu"
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=3),
+                )
+            )
+            token_offset += prompt_length
+        inference_context.initialize_attention_state()
+
+        attention = DSGroupedSelfAttention(
+            config=config,
+            submodules=dsa_stack_spec.submodules.attention_layer.submodules.self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.eval()
+        rope = RotaryEmbedding(
+            config.kv_channels, rotary_percent=1.0, cp_group=attention.pg_collection.cp
+        )
+
+        def rotary(seq_len):
+            return rope(seq_len) if use_rope else None
+
+        def run_step() -> tuple[torch.Tensor, torch.Tensor]:
+            hidden_states = torch.randn(
+                inference_context.padded_active_token_count,
+                1,
+                hidden_size,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+            )
+            with torch.inference_mode(), InferenceMode.active():
+                output, bias = attention(
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary(1024),
+                )
+            assert bias is None
+            return output, hidden_states
+
+        def expect_matches_training(output, request_idx, prefix):
+            with torch.inference_mode():
+                expected, _ = attention(
+                    hidden_states=prefix, attention_mask=None, rotary_pos_emb=rotary(prefix.size(0))
+                )
+            torch.testing.assert_close(output, expected[-1], rtol=2e-2, atol=2e-2)
+
+        prompt_output, prompt_hidden_states = run_step()
+        real_tokens = sum(prompt_lengths)
+        assert torch.count_nonzero(prompt_output[real_tokens:]) == 0
+
+        # Two decode requests and a fresh 5-token prompt in one step.
+        inference_context.update_requests(
+            active_requests_mask=torch.ones(2, dtype=torch.int32),
+            new_tokens=torch.tensor([100, 101], dtype=torch.long),
+        )
+        inference_context.add_request(
+            DynamicInferenceRequest(
+                request_id=2,
+                prompt_tokens=torch.arange(
+                    token_offset, token_offset + 5, dtype=torch.long, device="cpu"
+                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=2),
+            )
+        )
+        inference_context.initialize_attention_state()
+        assert inference_context.num_decode_requests == 2
+        assert inference_context.num_prefill_requests == 1
+        mixed_output, mixed_hidden_states = run_step()
+        histories = []
+        prompt_start = 0
+        for request_idx, prompt_length in enumerate(prompt_lengths):
+            history = torch.cat(
+                (
+                    prompt_hidden_states[prompt_start : prompt_start + prompt_length],
+                    mixed_hidden_states[request_idx : request_idx + 1],
+                )
+            )
+            expect_matches_training(mixed_output[request_idx], request_idx, history)
+            histories.append(history)
+            prompt_start += prompt_length
+        new_prompt = mixed_hidden_states[2:7]
+        with torch.inference_mode():
+            expected, _ = attention(
+                hidden_states=new_prompt, attention_mask=None, rotary_pos_emb=rotary(5)
+            )
+        torch.testing.assert_close(mixed_output[2:7], expected, rtol=2e-2, atol=2e-2)
+        histories.append(new_prompt)
+
+        # All three requests decode, reading the caches written by both earlier steps.
+        inference_context.update_requests(
+            active_requests_mask=torch.ones(3, dtype=torch.int32),
+            new_tokens=torch.tensor([102, 103, 104], dtype=torch.long),
+        )
+        inference_context.initialize_attention_state()
+        assert inference_context.num_decode_requests == 3
+        decode_output, decode_hidden_states = run_step()
+        for request_idx, history in enumerate(histories):
+            prefix = torch.cat((history, decode_hidden_states[request_idx : request_idx + 1]))
+            expect_matches_training(decode_output[request_idx], request_idx, prefix)

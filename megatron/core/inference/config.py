@@ -791,6 +791,13 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    dsa_backend: Literal['flashinfer', 'cute'] = 'flashinfer'
+    """Kernels for DSA-over-GQA (simplified indexer) attention in dynamic batching.
+    "flashinfer" runs selection and sparse attention for decode, prefill and mixed steps from a
+    per-step plan, under CUDA graphs; it needs FlashInfer's DSA kernels and DeepSelect, and raises
+    if they are missing. "cute" decodes with the CuTe kernels and prefills each request through
+    the training path, without CUDA graphs."""
+
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""

@@ -2246,6 +2246,13 @@ def _add_inference_args(parser):
                             '"exponential" halves from cuda_graph_max_tokens down to tp_size, '
                             'giving a log-spaced distribution with bounded relative padding. '
                             '"linear" uses varying linear strides across the range.')
+    group.add_argument('--inference-dynamic-batching-dsa-backend',
+                       type=str, default='flashinfer',
+                       choices=['flashinfer', 'cute'],
+                       help='Kernels for DSA-over-GQA attention in dynamic batching. '
+                            '"flashinfer" handles decode, prefill and mixed steps under CUDA '
+                            'graphs and needs FlashInfer\'s DSA kernels; "cute" uses CuTe '
+                            'decode kernels and training-path prefill.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
                        choices=['torch', 'flashinfer'],

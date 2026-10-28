@@ -675,6 +675,80 @@ class DSGQACoreAttention(MegatronModule):
             query, key, value, topk_indices, self.softmax_scale, mask=sparse_attention_mask
         )
 
+    def forward_dynamic(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inference_context,
+        packed_seq_params: Optional[PackedSeqParams],
+        provider_layer_number: int,
+        block_table: torch.Tensor,
+        use_indexer_rope: bool = False,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Sparse attention for a dynamic batch against the paged KV and indexer-key caches.
+
+        Appends the step's indexer keys to the context's paged cache, then routes every token,
+        decode or prefill, to the top-k keys of its causal prefix
+        (``dsa_gqa_inference.dynamic_sparse_attention``).
+
+        Args:
+            query: Queries ``[T,1,Hq,D]`` (or ``[T,Hq,D]``) for the step's padded active tokens.
+            key_cache: The layer's paged keys ``[blocks,block_size,1,D]``.
+            value_cache: The layer's paged values ``[blocks,block_size,1,Dv]``.
+            hidden_states: The attention layer's input ``[T,1,H]``.
+            inference_context: The step's dynamic inference context.
+            packed_seq_params: Unused; dynamic batching packs requests itself.
+            provider_layer_number: Layer number within this pipeline stage.
+            block_table: Per-request physical block ids ``[requests,max_blocks]``.
+            use_indexer_rope: Whether the indexer applies RoPE (not supported here).
+            indexer_input_norm: The norm fused into the main QKV projection, if any.
+
+        Returns:
+            Attention output ``[T,1,Hq*Dv]``.
+        """
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
+            dynamic_sparse_attention,
+        )
+
+        del packed_seq_params
+        assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
+        if getattr(self.config, "dsa_fwd_use_dense_attn", False):
+            raise NotImplementedError("Dynamic DSA-GQA inference requires sparse indexer routing.")
+        if use_indexer_rope and self.indexer.rotary_pos_emb is not None:
+            raise NotImplementedError(
+                "Dynamic DSA-GQA inference supports a NoPE indexer only; use "
+                "position_embedding_type='none' or disable RoPE on attention layers."
+            )
+        if query.dim() == 3:
+            query = query.unsqueeze(1)
+        assert (
+            query.dim() == 4 and query.size(1) == 1
+        ), f"Dynamic DSA-GQA expects packed tokens [T,1,Hq,D], got {tuple(query.shape)}."
+
+        indexer_hidden_states = hidden_states.detach()
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            indexer_hidden_states = _normalized_indexer_input(
+                indexer_hidden_states, indexer_input_norm
+            )
+        with torch.no_grad():
+            index_query, index_key = self.indexer.forward_qk(indexer_hidden_states, use_rope=False)
+        inference_context.append_dsa_key_cache(provider_layer_number, index_key)
+        index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
+        return dynamic_sparse_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_query,
+            index_key_cache=index_key_cache,
+            block_table=block_table,
+            inference_context=inference_context,
+            index_topk=self.indexer.index_topk,
+            softmax_scale=self.softmax_scale,
+        )
+
     def _forward_min_memory(
         self,
         query: torch.Tensor,
@@ -888,3 +962,40 @@ class DSGroupedSelfAttention(SelfAttention):
             ),
             "indexer_input_norm": indexer_input_norm,
         }
+
+    def _dynamic_core_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context,
+        block_table: torch.Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Dispatch dynamic batching to the paged DSA path (decode, prefill, and mixed steps).
+
+        ``key`` and ``value`` are this layer's paged caches, which already hold the step's
+        keys and values.
+        """
+        del attention_mask, attn_mask_type
+        if attention_bias is not None:
+            raise NotImplementedError("Dynamic DSA-GQA inference does not support attention bias.")
+        provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
+        return self.core_attention.forward_dynamic(
+            query=query,
+            key_cache=key,
+            value_cache=value,
+            hidden_states=hidden_states,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            provider_layer_number=provider_layer_number,
+            block_table=block_table,
+            use_indexer_rope=use_indexer_rope,
+            indexer_input_norm=indexer_input_norm,
+        )

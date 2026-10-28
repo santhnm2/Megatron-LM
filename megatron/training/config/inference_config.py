@@ -143,6 +143,10 @@ class InferenceSetupConfig:
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
+    inference_dynamic_batching_dsa_backend: Literal["flashinfer"] = "flashinfer"
+    """Kernels for DSA-over-GQA attention in dynamic batching: "flashinfer" (decode, prefill and
+    mixed steps, CUDA-graph safe; needs FlashInfer's DSA kernels and DeepSelect)."""
+
     inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
     """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
     "torch" with a warning if the flashinfer package is not installed."""
@@ -464,6 +468,7 @@ class InferenceSetupConfig:
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
+            dsa_backend=self.inference_dynamic_batching_dsa_backend,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),

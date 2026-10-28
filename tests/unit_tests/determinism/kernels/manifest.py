@@ -981,6 +981,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
     ),
+    # ---------------------------------------------------------------- DSA-over-GQA inference
+    KernelEntry(
+        name="dsa_gqa_flashinfer",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_gqa_flashinfer.py",),
+        tests=(K + "test_dsa_gqa_flashinfer.py",),
+        kind="triton",
+        training_path=False,
+        notes="Paged indexer-key writer and candidate-score gather (Triton), and the FlashInfer "
+        "DSA indexer scoring, selection and sparse attention of a mixed decode + prefill step. "
+        "Decode is bit-exact only in batch-invariant mode, which sorts each row's selected keys.",
+    ),
+    KernelEntry(
+        name="dsa_gqa_inference_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",),
+        tests=(K + "test_dsa_gqa_flashinfer.py",),
+        kind="dispatch",
+        training_path=False,
+        notes="Selects the DSA inference backend; FlashInfer calls are replayed in "
+        "test_dsa_gqa_flashinfer.",
+    ),
     # ---------------------------------------------------------------- DSA min-memory backends
     KernelEntry(
         name="dsa_min_memory_triton",

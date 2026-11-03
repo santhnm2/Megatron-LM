@@ -30,6 +30,9 @@ from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
     MTPControllerMixin,
 )
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    mtp_commit_step_metadata,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -814,7 +817,9 @@ class TestGraphedCommitPass:
         context.padded_batch_dimensions = SimpleNamespace(prefill_req_count=prefill_req_count)
         # Main-forward rows for PADDED requests of (1 + NUM_SPEC) tokens; row i holds value i.
         context.mtp_decoder_hidden_states = _hidden(self.PADDED * (self.NUM_SPEC + 1))
-        context._mtp_setup_commit_graphed = mock.Mock()
+        # The commit-metadata launch also gathers the commit pass's inputs (`gather`); run the
+        # real kernel against scratch metadata buffers so the input layout is checked for real.
+        context._mtp_setup_commit_graphed = mock.Mock(side_effect=self._commit_metadata_launch)
         controller._accepted_token_counts_per_request[: self.NUM_DECODE] = torch.tensor(
             [2, 0, 1], device=DEVICE
         )
@@ -827,6 +832,39 @@ class TestGraphedCommitPass:
         model.compute_mtp_kv_write = compute_mtp_kv_write
         model.kv_write_calls = kv_writes
         return controller, model, context
+
+    def _commit_metadata_launch(
+        self, active_request_count, padded_count, *, accepted_counts, base_positions, **kwargs
+    ):
+        num_tokens = padded_count * self.NUM_SPEC
+
+        def scratch(n, dtype=torch.int32):
+            return torch.zeros(n, dtype=dtype, device=DEVICE)
+
+        gpu_view = SimpleNamespace(
+            token_to_block_idx=scratch(num_tokens, torch.int64),
+            token_to_local_position_within_kv_block=scratch(num_tokens),
+            token_to_request_idx=scratch(num_tokens),
+            token_to_position_in_request=scratch(num_tokens),
+            token_to_pos_ids=scratch(num_tokens, torch.int64),
+            mha_query_lengths=scratch(padded_count),
+            mha_cu_query_seq_lengths=scratch(padded_count + 1),
+            mha_kv_seq_lengths=scratch(padded_count),
+            mha_cu_kv_seq_lengths=scratch(padded_count + 1),
+            mha_block_table=torch.zeros((padded_count, 4), dtype=torch.int32, device=DEVICE),
+        )
+        mtp_commit_step_metadata(
+            gpu_view=gpu_view,
+            accepted_counts=accepted_counts,
+            base_positions=base_positions,
+            block_table=torch.zeros((padded_count, 4), dtype=torch.int32, device=DEVICE),
+            active_request_count=active_request_count,
+            padded_count=padded_count,
+            num_slots=self.NUM_SPEC,
+            block_size_tokens=16,
+            dummy_block_idx=0,
+            gather=kwargs.get("gather"),
+        )
 
     def _run(self, controller):
         base_position = torch.tensor([10, 20, 30], dtype=torch.int64, device=DEVICE)
@@ -861,6 +899,8 @@ class TestGraphedCommitPass:
         assert args == (self.NUM_DECODE, self.PADDED)
         assert kwargs["accepted_counts"] is controller._accepted_token_counts_per_request
         assert kwargs["base_positions"] is base_position
+        # The inputs above were gathered by that same metadata launch.
+        assert kwargs["gather"] is not None
 
     def test_mixed_step_takes_eager_commit(self):
         controller, model, context = self._setup(prefill_req_count=1)

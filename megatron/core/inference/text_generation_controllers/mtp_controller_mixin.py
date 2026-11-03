@@ -17,14 +17,17 @@ the model -- including the chunked-prefill boundary carry, which lives on the co
 
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.inference.text_generation_controllers.mtp_utils_triton import HAVE_TRITON
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    HAVE_TRITON,
+    MTPCommitGather,
+)
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -71,7 +74,10 @@ class MTPControllerMixin:
         Addresses must be stable across steps for CUDA graph capture.
         """
         self._mtp_resolved_padded_count = None
+        self._mtp_base_position = None
+        self._draft_sampling_params = None
         if not self.num_speculative_tokens:
+            self._mtp_base_position_buf = None
             self._sampled_mtp_tokens_cuda = None
             self._accepted_tokens_per_request = None
             self._last_accepted_seq_indices = None
@@ -103,6 +109,8 @@ class MTPControllerMixin:
             max_requests, dtype=torch.int64, device=device
         )
         self._last_accepted_seq_indices = None
+        # Next draft's base position per request, written by the verify kernel.
+        self._mtp_base_position_buf = torch.empty(max_requests, dtype=torch.int64, device=device)
         self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
@@ -170,19 +178,32 @@ class MTPControllerMixin:
             and context.padded_batch_dimensions.prefill_req_count == 0
         )
 
-    def _mtp_commit_row_indices(self, padded_count: int) -> Tensor:
-        """[padded_count * num_speculative_tokens] main-forward rows feeding the graphed commit.
+    def _mtp_commit_gather_buffers(
+        self, num_requests: int, hidden_size: int, hidden_dtype: torch.dtype, device
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Persistent outputs of the fused commit gather, grown (to a power of two) on demand.
 
-        Request r's slot j reads the main hidden at r * (num_spec + 1) + j (base, then drafts),
-        and pairs it with the input token one row later.
+        Returns:
+            (commit_hidden [R*S, 1, H], commit_tokens [R*S], draft_hidden [R, 1, H]) with
+            R >= num_requests.
         """
-        cache = self.__dict__.setdefault("_mtp_commit_row_index_cache", {})
-        if padded_count not in cache:
-            stride = self.num_speculative_tokens + 1
-            requests = torch.arange(padded_count, device=torch.cuda.current_device())
-            slots = torch.arange(self.num_speculative_tokens, device=requests.device)
-            cache[padded_count] = (requests[:, None] * stride + slots[None, :]).reshape(-1)
-        return cache[padded_count]
+        bufs = self.__dict__.get("_mtp_commit_gather_bufs")
+        if (
+            bufs is None
+            or bufs[0].shape[-1] != hidden_size
+            or bufs[0].dtype != hidden_dtype
+            or bufs[0].device != device
+            or bufs[2].shape[0] < num_requests
+        ):
+            capacity = 1 << max(num_requests - 1, 0).bit_length()
+            slots = self.num_speculative_tokens
+            bufs = (
+                torch.empty((capacity * slots, 1, hidden_size), dtype=hidden_dtype, device=device),
+                torch.empty(capacity * slots, dtype=torch.int64, device=device),
+                torch.empty((capacity, 1, hidden_size), dtype=hidden_dtype, device=device),
+            )
+            self._mtp_commit_gather_bufs = bufs
+        return bufs
 
     def _mtp_commit_pass_graphed(
         self,
@@ -192,7 +213,7 @@ class MTPControllerMixin:
         active_request_count: int,
         padded_count: int,
         base_position,
-    ) -> None:
+    ) -> Tensor:
         """Commit pass for a graphed decode-only step, replayed from a CUDA graph.
 
         Same KV writes as `_mtp_commit_pass` on a decode-only step: request r's accepted drafts
@@ -201,20 +222,30 @@ class MTPControllerMixin:
         `num_speculative_tokens` rows whose unused tail writes the dummy block, so the forward's
         shape depends only on `padded_count`, needs no host sync, and replays the
         ("mtp_commit", padded_count) graph.
+
+        The commit metadata launch also gathers the commit pass's hidden / token rows (zero past
+        the real requests) and the first draft depth's hidden input (each request's last
+        accepted main hidden, zero-padded to `padded_count`), which it returns.
+
+        Returns:
+            Tensor: [padded_count, 1, H] hidden input for draft depth 0.
         """
         num_slots = self.num_speculative_tokens
         real_rows = active_request_count * num_slots
-        rows = self._mtp_commit_row_indices(padded_count)
-        hidden = gathered_hidden.index_select(0, rows.clamp(max=gathered_hidden.shape[0] - 1))
-        input_ids = context.gpu_view.token_to_input_ids
-        tokens = input_ids.index_select(0, (rows + 1).clamp(max=input_ids.shape[0] - 1))
-        # Rows past the real requests read padding (or clamped) main-forward rows.
-        hidden[real_rows:] = 0
-        tokens[real_rows:] = 0
-        if self._sp_enabled:
-            hidden = scatter_to_sequence_parallel_region(
-                hidden, group=self.inference_wrapped_model.tp_group
-            )
+        commit_hidden, commit_tokens, draft_hidden = self._mtp_commit_gather_buffers(
+            padded_count, gathered_hidden.shape[-1], gathered_hidden.dtype, gathered_hidden.device
+        )
+        hidden = commit_hidden[: padded_count * num_slots]
+        tokens = commit_tokens[: padded_count * num_slots]
+        draft_hidden = draft_hidden[:padded_count]
+        gather = MTPCommitGather(
+            main_hidden=gathered_hidden,
+            input_ids=context.gpu_view.token_to_input_ids,
+            last_accepted_rows=self._last_accepted_seq_indices,
+            commit_hidden_out=hidden,
+            commit_tokens_out=tokens,
+            draft_hidden_out=draft_hidden,
+        )
 
         # A graphed decode-only step has no in-flight chunked prefill to carry a boundary for.
         context.mtp_metadata.invalidate_chunk_boundary()
@@ -225,7 +256,12 @@ class MTPControllerMixin:
             accepted_counts=self._accepted_token_counts_per_request,
             base_positions=base_position,
             block_table_src=context.request_to_kv_block_ids[active_slice],
+            gather=gather,
         )
+        if self._sp_enabled:
+            hidden = scatter_to_sequence_parallel_region(
+                hidden, group=self.inference_wrapped_model.tp_group
+            )
         if context._nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(real_rows)
 
@@ -235,12 +271,21 @@ class MTPControllerMixin:
             next_token_ids=token_ids,
             # Positions are unused for attention (no RoPE); the write positions come from the
             # metadata.
-            position_ids=torch.zeros_like(token_ids),
+            position_ids=self._mtp_zero_position_ids(token_ids.shape[1], token_ids.device),
             eager=False,
             cache_key=("mtp_commit", padded_count),
             mtp_inference_context=context,
         )
         context.mtp_metadata.end_forward()
+        return draft_hidden
+
+    def _mtp_zero_position_ids(self, num_tokens: int, device) -> Tensor:
+        """A cached, never-written `[1, num_tokens]` int64 zero tensor."""
+        zeros = self.__dict__.get("_mtp_zero_position_ids_buf")
+        if zeros is None or zeros.numel() < num_tokens or zeros.device != device:
+            zeros = torch.zeros(max(num_tokens, 1), dtype=torch.long, device=device)
+            self._mtp_zero_position_ids_buf = zeros
+        return zeros[:num_tokens].view(1, -1)
 
     def _mtp_commit_pass(
         self,
@@ -633,10 +678,18 @@ class MTPControllerMixin:
                 hidden_states = gather_from_sequence_parallel_region(
                     hidden_states, group=self.inference_wrapped_model.tp_group
                 )
-            last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
+
+        # The graphed commit pass gathers draft depth 0's hidden input in its metadata launch;
+        # every other path gathers it here, before any MTP forward of this step runs.
+        fused_commit_gather = (
+            has_mtp
+            and getattr(context, "enable_mtp_kv_cache", False)
+            and self._mtp_commit_graphed_this_step(context)
+        )
+        last_accepted_hidden = None
+        if has_mtp and not fused_commit_gather:
             # Shape: [active_request_count, 1, hidden_size]
-        else:
-            last_accepted_hidden = None
+            last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
 
         if base_position is None:
             # Legacy scheduling derives positions from post-rewind CPU state.
@@ -674,9 +727,11 @@ class MTPControllerMixin:
         # last PP stage, where the gathered decoder hidden states exist. EP consistency: every
         # rank runs exactly one commit-pass forward per step (graphed, eager, or the dummy below)
         # so the MoE collectives stay count-matched.
+        # The graphed commit pass also gathers draft depth 0's (padded) hidden input.
+        draft_hidden = None
         if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            if self._mtp_commit_graphed_this_step(context):
-                self._mtp_commit_pass_graphed(
+            if fused_commit_gather:
+                draft_hidden = self._mtp_commit_pass_graphed(
                     context,
                     unwrapped_model,
                     hidden_states,
@@ -694,13 +749,18 @@ class MTPControllerMixin:
             ):
                 self._mtp_dummy_prefill_forward(context, unwrapped_model)
 
-        # Start with the freshly sampled base token.
-        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
-        current_hidden = last_accepted_hidden if has_mtp else None
+        # Start with the freshly sampled base token. The draft loop only reads it (it is copied
+        # into `token_ids_buf`), and nothing writes `_sampled_tokens_cuda` before then.
+        next_token_ids = self._sampled_tokens_cuda[:active_request_count]
+        current_hidden = None
 
-        # Pad hidden states and scatter for sequence parallelism.
+        # Decoder hidden states at the last accepted positions, padded to `padded_count`, then
+        # scattered for sequence parallelism.
         if has_mtp:
-            current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+            if fused_commit_gather:
+                current_hidden = draft_hidden
+            else:
+                current_hidden = F.pad(last_accepted_hidden, (0, 0, 0, 0, 0, pad_count))
             if self._sp_enabled:
                 current_hidden = scatter_to_sequence_parallel_region(
                     current_hidden, group=self.inference_wrapped_model.tp_group
@@ -759,11 +819,15 @@ class MTPControllerMixin:
                 num_mtp_draft_requests, padded_count, base_position - 1, graphed=mtp_graphed
             )
 
+        # Per-request sampling parameters are built on the first depth's sample and shared by
+        # every depth of this step (see `_sample_from_logits_2d`).
+        self._draft_sampling_params = None
+
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
             token_ids_buf[0, :active_request_count] = next_token_ids
-            position_ids_buf[0, :active_request_count] = base_position + depth
+            torch.add(base_position, depth, out=position_ids_buf[0, :active_request_count])
 
             mtp_logits_2d = None
             if has_mtp:
@@ -822,8 +886,10 @@ class MTPControllerMixin:
             self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/sample")
 
-            # Use sampled token as input for the next depth.
-            next_token_ids = spec_tokens
+            # Use sampled token as input for the next depth. Read it back from the int64 slot just
+            # written (the sampler may return int32), so the next depth's copy into
+            # `token_ids_buf` stays a same-dtype memcpy.
+            next_token_ids = self._sampled_mtp_tokens_cuda[depth, :active_request_count]
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
 
         # The final sampled token needs no additional MTP forward. On the next step, its

@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     HAVE_TRITON,
+    MTPCommitGather,
     mtp_commit_step_metadata,
     mtp_draft_step_metadata,
 )
@@ -362,6 +363,7 @@ class MTPMetadata:
         accepted_counts: Tensor,
         base_positions: Tensor,
         num_slots: int,
+        gather: Optional[MTPCommitGather] = None,
     ) -> None:
         """Write the token maps and MHA metadata for a CUDA-graphed commit pass.
 
@@ -371,6 +373,8 @@ class MTPMetadata:
             base_positions (Tensor): [>=active_request_count] position of each request's next
                 draft, one past its last committed token.
             num_slots (int): Commit rows per request (`num_speculative_tokens`).
+            gather (Optional[MTPCommitGather]): Also gather the commit pass's hidden / token
+                inputs and the first draft depth's hidden input in the same launch.
         """
         assert HAVE_TRITON, "the CUDA-graphed MTP commit pass requires Triton"
         mtp_commit_step_metadata(
@@ -383,6 +387,7 @@ class MTPMetadata:
             num_slots=num_slots,
             block_size_tokens=self.block_size_tokens,
             dummy_block_idx=self.dummy_block_idx,
+            gather=gather,
         )
 
     def advance_decode_step(self) -> None:

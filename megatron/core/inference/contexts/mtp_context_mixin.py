@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import MTPCommitGather
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 
@@ -423,6 +424,7 @@ class MTPContextMixin:
         accepted_counts: Optional[Tensor] = None,
         base_positions: Optional[Tensor] = None,
         block_table_src: Optional[Tensor] = None,
+        gather: Optional[MTPCommitGather] = None,
     ) -> None:
         """Publish the metadata for a CUDA-graphed (fixed-shape) commit pass.
 
@@ -439,6 +441,8 @@ class MTPContextMixin:
                 request's next draft, one past its last committed token.
             block_table_src (Optional[Tensor]): [>=active_request_count, max_kv_block_count]
                 block ids per request.
+            gather (Optional[MTPCommitGather]): Also gather the commit pass's inputs and the
+                first draft depth's hidden input in the same launch (real steps only).
         """
         assert self.enable_mtp_kv_cache
         mtp = self.mtp_metadata
@@ -448,9 +452,10 @@ class MTPContextMixin:
             base_positions = mtp.capture_base_positions
             block_table_src = None
             active_request_count = padded_count
+            gather = None
         mtp.begin_commit_graphed(active_request_count, padded_count, block_table_src)
         mtp.write_commit_step_metadata(
-            self.gpu_view, accepted_counts, base_positions, num_slots=num_slots
+            self.gpu_view, accepted_counts, base_positions, num_slots=num_slots, gather=gather
         )
         # Fixed capture-time KV bound, as in the graphed draft loop: kv_length = start + slots
         # never exceeds the draft loop's own last kv_length.

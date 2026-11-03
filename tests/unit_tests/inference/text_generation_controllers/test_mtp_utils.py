@@ -26,11 +26,13 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch impor
     verify_speculative_tokens as verify_speculative_tokens_pytorch,
 )
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    MTPCommitGather,
     mamba_state_selective_copy,
     mtp_commit_step_metadata,
     mtp_draft_step_metadata,
     prepare_next_forward_pass,
     rewind_kv_cache,
+    verify_and_prepare_next_forward_pass,
     verify_speculative_tokens,
 )
 
@@ -558,6 +560,131 @@ class TestPrepareNextForwardPass:
         )
 
 
+class TestVerifyAndPrepareNextForwardPass:
+    """The fused verify + prepare-next kernel must match the two-step path it replaces.
+
+    The reference is the previous controller code: gather the required rows' input tokens
+    through `required_logit_indices` (and the async survivor map), run
+    `verify_speculative_tokens` on int64 sampled tokens, then `prepare_next_forward_pass`, then
+    `base_position = token_to_pos_ids[last_accepted_seq] + 1`.
+    """
+
+    def _scenario(self, num_decode, num_prefill, num_spec, *, padded_extra, with_map, seed):
+        g = torch.Generator(device=DEVICE).manual_seed(seed)
+        stride = num_spec + 1
+        n_required = num_decode * stride + num_prefill
+        storage = 4 * (n_required + padded_extra) + 8
+        input_ids = torch.randint(1, 50, (storage,), device=DEVICE, generator=g)
+        pos_ids = torch.randint(0, 10_000, (storage,), device=DEVICE, generator=g)
+        # Packed rows (int32, padded like `active_logit_idxs` under CUDA graphs).
+        required = torch.randperm(storage // 2, device=DEVICE, generator=g)[
+            : n_required + padded_extra
+        ].to(torch.int32)
+        token_row = None
+        if with_map:
+            token_row = torch.randperm(storage, device=DEVICE, generator=g)
+        rows = required[:n_required].long()
+        if token_row is not None:
+            rows = token_row[rows]
+        # Sampled tokens: copy the next draft for a random-length accepted prefix.
+        output = torch.randint(1, 50, (n_required,), device=DEVICE, generator=g)
+        for r in range(num_decode):
+            k = int(torch.randint(0, stride, (1,), generator=g, device=DEVICE))
+            for j in range(k):
+                output[r * stride + j] = input_ids[rows[r * stride + j + 1]]
+        return input_ids, pos_ids, required, token_row, output.to(torch.int32)
+
+    def _reference(self, input_ids, pos_ids, required, token_row, output, nd, npf, ns):
+        active = nd + npf
+        n_required = nd * (ns + 1) + npf
+        rows = required
+        if token_row is not None:
+            rows = token_row[required[: active * (ns + 1)].long()]
+        inp = input_ids[rows]
+        out64 = output.long()
+        last, mask, inp = verify_speculative_tokens(inp, out64, nd, npf, ns)
+        bufs = self._buffers(active, ns)
+        prepare_next_forward_pass(nd, out64, rows, last, mask, inp, *bufs[:4], ns)
+        bufs[4][:active] = pos_ids[bufs[1][:active]] + 1
+        assert n_required <= rows.numel()
+        return bufs
+
+    @staticmethod
+    def _buffers(active, ns):
+        return (
+            torch.full((active + 2,), -9, dtype=torch.int64, device=DEVICE),
+            torch.full((active + 2,), -9, dtype=torch.int64, device=DEVICE),
+            torch.full((active + 2, ns), -9, dtype=torch.int64, device=DEVICE),
+            torch.full((active + 2,), -9, dtype=torch.int64, device=DEVICE),
+            torch.full((active + 2,), -9, dtype=torch.int64, device=DEVICE),
+        )
+
+    @pytest.mark.parametrize("num_spec", [1, 2, 3, 4])
+    @pytest.mark.parametrize("num_decode,num_prefill", [(1, 0), (6, 0), (4, 3), (0, 3), (17, 1)])
+    @pytest.mark.parametrize("with_map", [False, True])
+    @pytest.mark.parametrize("padded_extra", [0, 5])
+    def test_matches_unfused(self, num_spec, num_decode, num_prefill, with_map, padded_extra):
+        input_ids, pos_ids, required, token_row, output = self._scenario(
+            num_decode,
+            num_prefill,
+            num_spec,
+            padded_extra=padded_extra,
+            with_map=with_map,
+            seed=num_spec * 100 + num_decode * 10 + num_prefill,
+        )
+        ref = self._reference(
+            input_ids, pos_ids, required, token_row, output, num_decode, num_prefill, num_spec
+        )
+        got = self._buffers(num_decode + num_prefill, num_spec)
+        verify_and_prepare_next_forward_pass(
+            output_tokens=output,
+            required_rows=required,
+            input_ids=input_ids.unsqueeze(0),
+            num_decode_requests=num_decode,
+            num_prefill_requests=num_prefill,
+            num_speculative_tokens=num_spec,
+            sampled_tokens_buf=got[0],
+            last_accepted_seq_buf=got[1],
+            accepted_tokens_per_request=got[2],
+            accepted_token_counts=got[3],
+            token_row_indices=token_row,
+            pos_ids=pos_ids,
+            base_position_buf=got[4],
+        )
+        names = ["sampled", "last_accepted_seq", "accepted_tokens", "accepted_counts", "base_pos"]
+        for name, a, b in zip(names, got, ref):
+            assert torch.equal(a, b), name
+        # Some decode request must actually accept drafts for the test to mean anything.
+        if num_decode > 4:
+            assert (got[3][:num_decode] > 0).any()
+
+    def test_int64_tokens_and_no_positions(self):
+        input_ids, pos_ids, required, token_row, output = self._scenario(
+            5, 2, 3, padded_extra=0, with_map=False, seed=1
+        )
+        ref = self._reference(input_ids, pos_ids, required, token_row, output, 5, 2, 3)
+        got = self._buffers(7, 3)
+        verify_and_prepare_next_forward_pass(
+            output.long(), required.long(), input_ids, 5, 2, 3, *got[:4]
+        )
+        for a, b in zip(got[:4], ref[:4]):
+            assert torch.equal(a, b)
+        assert (got[4] == -9).all()
+
+    def test_empty(self):
+        got = self._buffers(0, 2)
+        verify_and_prepare_next_forward_pass(
+            torch.empty(0, dtype=torch.int32, device=DEVICE),
+            torch.empty(0, dtype=torch.int32, device=DEVICE),
+            torch.empty(4, dtype=torch.int64, device=DEVICE),
+            0,
+            0,
+            2,
+            *got[:4],
+        )
+        assert all((b == -9).all() for b in got)
+
+
 class TestMambaStateSelectiveCopy:
     """Tests for the mamba_state_selective_copy Triton kernel."""
 
@@ -994,6 +1121,87 @@ class TestMtpCommitStepMetadata:
         accepted = torch.zeros(self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
         base = torch.ones(self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
         self._check(16, 16, 12, 16, 8, accepted, base)
+
+    @pytest.mark.parametrize(
+        "active_request_count, padded_count", [(1, 1), (5, 8), (8, 8), (13, 16)]
+    )
+    @pytest.mark.parametrize("num_slots", [1, 3, 4])
+    @pytest.mark.parametrize("hidden_size", [64, 1536])
+    def test_fused_gather_matches_eager(
+        self, active_request_count, padded_count, num_slots, hidden_size
+    ):
+        """The GATHER launch writes the same metadata plus the eager commit / draft inputs."""
+        n, padded, slots = active_request_count, padded_count, num_slots
+        torch.manual_seed(n * 10 + slots)
+        accepted = torch.randint(0, slots + 1, (self.MAX_REQUESTS,), device=DEVICE)
+        base = torch.randint(slots + 1, 16 * 33 - slots, (self.MAX_REQUESTS,), device=DEVICE)
+        block_table = torch.randint(
+            0, 500, (self.MAX_REQUESTS, 33), dtype=torch.int32, device=DEVICE
+        )
+        # Main-forward hiddens: padded * (slots + 1) rows (block-scope graph prefix), as a
+        # strided view, plus input-token storage and last accepted rows.
+        main_rows = padded * (slots + 1)
+        storage = torch.randn(main_rows, 1, hidden_size + 8, device=DEVICE).to(torch.bfloat16)
+        main_hidden = storage[..., :hidden_size]
+        input_ids = torch.randint(0, 1000, (main_rows + 3,), device=DEVICE)
+        last_rows = torch.randint(0, main_rows, (self.MAX_REQUESTS,), device=DEVICE)
+
+        # Eager reference (the previous `_mtp_commit_pass_graphed` / draft-loop code).
+        stride = slots + 1
+        rows = (
+            torch.arange(padded, device=DEVICE)[:, None] * stride
+            + torch.arange(slots, device=DEVICE)[None, :]
+        ).reshape(-1)
+        ref_hidden = main_hidden.index_select(0, rows.clamp(max=main_hidden.shape[0] - 1))
+        ref_tokens = input_ids.index_select(0, (rows + 1).clamp(max=input_ids.shape[0] - 1))
+        ref_hidden[n * slots :] = 0
+        ref_tokens[n * slots :] = 0
+        ref_draft = torch.nn.functional.pad(
+            main_hidden[last_rows[:n], :, :], (0, 0, 0, 0, 0, padded - n)
+        )
+
+        num_tokens = self.MAX_REQUESTS * slots
+        ref_view = self._make_gpu_view(num_tokens, 33)
+        tri_view = self._make_gpu_view(num_tokens, 33)
+        mtp_commit_step_metadata(
+            ref_view, accepted, base, block_table, n, padded, slots, 16, self.DUMMY_BLOCK
+        )
+        out_hidden = torch.full((self.MAX_REQUESTS * slots, 1, hidden_size), 7.0, device=DEVICE).to(
+            torch.bfloat16
+        )
+        out_tokens = torch.full((self.MAX_REQUESTS * slots,), -5, device=DEVICE)
+        out_draft = torch.full((self.MAX_REQUESTS, 1, hidden_size), 7.0, device=DEVICE).to(
+            torch.bfloat16
+        )
+        gather = MTPCommitGather(
+            main_hidden=main_hidden,
+            input_ids=input_ids,
+            last_accepted_rows=last_rows,
+            commit_hidden_out=out_hidden[: padded * slots],
+            commit_tokens_out=out_tokens[: padded * slots],
+            draft_hidden_out=out_draft[:padded],
+        )
+        mtp_commit_step_metadata(
+            tri_view,
+            accepted,
+            base,
+            block_table,
+            n,
+            padded,
+            slots,
+            16,
+            self.DUMMY_BLOCK,
+            gather=gather,
+        )
+        for name, ref in vars(ref_view).items():
+            assert torch.equal(getattr(tri_view, name), ref), name
+        assert torch.equal(out_hidden[: padded * slots], ref_hidden)
+        assert torch.equal(out_tokens[: padded * slots], ref_tokens)
+        assert torch.equal(out_draft[:padded], ref_draft)
+        # Nothing past the padded rows is written.
+        assert (out_tokens[padded * slots :] == -5).all()
+        assert (out_hidden[padded * slots :] == 7.0).all()
+        assert (out_draft[padded:] == 7.0).all()
 
     def test_padding_count_zero_is_noop(self):
         view = self._make_gpu_view(self.MAX_REQUESTS, 8)

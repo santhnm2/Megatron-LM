@@ -484,20 +484,17 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
 
         model.compute_mtp_single_step = observed_mtp
 
-    real_verify = controller._verify_speculative_tokens
+    # Verification and next-pass preparation run as one fused launch.
+    real_verify_and_prepare = controller._verify_and_prepare_speculative_tokens
 
-    def observed_verify(*args, **kwargs):
-        result = real_verify(*args, **kwargs)
+    def observed_verify_and_prepare(
+        output_tokens, required_logit_indices, input_ids, num_decode_requests, *args, **kwargs
+    ):
+        result = real_verify_and_prepare(
+            output_tokens, required_logit_indices, input_ids, num_decode_requests, *args, **kwargs
+        )
         runtime["mtp-verifier-calls"] += 1
-        runtime["mtp-verified-slots"] += int(result[1].numel())
-        return result
-
-    controller._verify_speculative_tokens = observed_verify
-
-    real_prepare = controller._prepare_speculative_tokens_for_next_forward_pass
-
-    def observed_prepare(num_decode_requests, *args, **kwargs):
-        result = real_prepare(num_decode_requests, *args, **kwargs)
+        runtime["mtp-verified-slots"] += int(output_tokens.numel())
         request_ids = _active_request_ids(context)[:num_decode_requests]
         counts = controller._accepted_token_counts_per_request[:num_decode_requests].tolist()
         batch = {request_id: int(count) for request_id, count in zip(request_ids, counts)}
@@ -508,7 +505,7 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
         runtime["mtp-prepare-calls"] += 1
         return result
 
-    controller._prepare_speculative_tokens_for_next_forward_pass = observed_prepare
+    controller._verify_and_prepare_speculative_tokens = observed_verify_and_prepare
 
     real_rewind = controller._rewind_kv_cache
 

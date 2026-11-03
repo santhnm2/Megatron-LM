@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -356,6 +357,162 @@ def prepare_next_forward_pass(
 
 
 # ---------------------------------------------------------------------------
+# Kernel 3b: Verify + prepare-next in one launch, reading tokens through the row maps
+# ---------------------------------------------------------------------------
+@triton.jit
+def _verify_and_prepare_next_kernel(
+    # Sampled tokens (any integer width), one per required row.
+    OUTPUT_TOKENS_PTR,
+    # Required row -> packed input row (`speculative_required_logit_indices`).
+    REQUIRED_ROWS_PTR,
+    # Optional packed input row -> original input-storage row (async survivor compaction).
+    TOKEN_ROW_PTR,
+    # Input-token storage, indexed by (mapped) input row.
+    INPUT_IDS_PTR,
+    # Optional position ids, indexed like INPUT_IDS_PTR.
+    POS_IDS_PTR,
+    # Outputs
+    SAMPLED_TOKENS_OUT_PTR,
+    LAST_ACCEPTED_SEQ_OUT_PTR,
+    ACCEPTED_TOKENS_OUT_PTR,
+    ACCEPTED_COUNTS_OUT_PTR,
+    BASE_POSITION_OUT_PTR,
+    # Strides
+    accepted_tokens_out_stride,
+    # Runtime scalars
+    num_decode_requests,
+    decode_len,
+    # Compile-time constants
+    STRIDE: tl.constexpr,  # num_speculative_tokens + 1
+    NUM_SPEC_TOKENS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # next_power_of_2(STRIDE)
+    HAS_TOKEN_ROW: tl.constexpr,
+    HAS_POS_IDS: tl.constexpr,
+):
+    """Verify one request's drafts and write its next-step state.
+
+    Grid: (active_request_count,). Fuses `_verify_speculative_tokens_kernel` and
+    `_prepare_next_forward_pass_kernel`: both work per request on that request's own rows, so the
+    accepted mask and last-accepted index stay in registers. The input tokens are read through
+    the row maps rather than from a pre-gathered copy, and the next draft's base position
+    (`pos_ids[last accepted row] + 1`) is written alongside.
+    """
+    pid = tl.program_id(0)
+    spec_offsets = tl.arange(0, BLOCK_SIZE)
+    spec_valid = spec_offsets < NUM_SPEC_TOKENS
+    out_base = pid.to(tl.int64) * accepted_tokens_out_stride
+
+    if pid < num_decode_requests:
+        base = pid * STRIDE
+        offsets = tl.arange(0, BLOCK_SIZE)
+        valid = offsets < STRIDE
+
+        rows = tl.load(REQUIRED_ROWS_PTR + base + offsets, mask=valid, other=0).to(tl.int64)
+        if HAS_TOKEN_ROW:
+            rows = tl.load(TOKEN_ROW_PTR + rows, mask=valid, other=0).to(tl.int64)
+        input_toks = tl.load(INPUT_IDS_PTR + rows, mask=valid, other=0).to(tl.int64)
+
+        # shifted[i] = output[i-1]; position 0 is always accepted.
+        safe_shifted = tl.where(offsets > 0, offsets - 1, 0)
+        shifted_output = tl.load(OUTPUT_TOKENS_PTR + base + safe_shifted, mask=valid, other=0)
+        match = tl.where(offsets == 0, 1, (input_toks == shifted_output.to(tl.int64)).to(tl.int32))
+        match = tl.where(valid, match, 0)
+        # accepted[i] iff every row up to i matched.
+        cumsum = tl.cumsum(match, axis=0)
+        accepted = (cumsum == (offsets + 1)) & valid
+        accepted_count = tl.sum(accepted.to(tl.int32))
+        last = base + accepted_count - 1
+
+        # Accepted drafts: rows 1..NUM_SPEC of this request, -1 where rejected.
+        is_spec = (offsets >= 1) & valid
+        draft_tokens = tl.where(accepted & is_spec, input_toks, -1)
+        tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + offsets - 1, draft_tokens, mask=is_spec)
+        tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, (accepted_count - 1).to(tl.int64))
+    else:
+        last = decode_len + (pid - num_decode_requests)
+        tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + spec_offsets, -1, mask=spec_valid)
+        tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, 0)
+
+    # Final sampled token and the input row of the last accepted token.
+    tl.store(SAMPLED_TOKENS_OUT_PTR + pid, tl.load(OUTPUT_TOKENS_PTR + last).to(tl.int64))
+    last_row = tl.load(REQUIRED_ROWS_PTR + last).to(tl.int64)
+    if HAS_TOKEN_ROW:
+        last_row = tl.load(TOKEN_ROW_PTR + last_row).to(tl.int64)
+    tl.store(LAST_ACCEPTED_SEQ_OUT_PTR + pid, last_row)
+    if HAS_POS_IDS:
+        tl.store(BASE_POSITION_OUT_PTR + pid, tl.load(POS_IDS_PTR + last_row).to(tl.int64) + 1)
+
+
+def verify_and_prepare_next_forward_pass(
+    output_tokens,
+    required_rows,
+    input_ids,
+    num_decode_requests,
+    num_prefill_requests,
+    num_speculative_tokens,
+    sampled_tokens_buf,
+    last_accepted_seq_buf,
+    accepted_tokens_per_request,
+    accepted_token_counts,
+    token_row_indices=None,
+    pos_ids=None,
+    base_position_buf=None,
+):
+    """Verify drafts and prepare the next forward pass in one launch.
+
+    Equivalent to::
+
+        rows = required_rows if token_row_indices is None else token_row_indices[required_rows]
+        last, mask, inp = verify_speculative_tokens(input_ids[rows], output_tokens, ...)
+        prepare_next_forward_pass(..., output_tokens, rows, last, mask, inp, <buffers>)
+        base_position_buf[:active] = pos_ids[last_accepted_seq_buf[:active]] + 1
+
+    without materializing `rows`, `inp`, the accepted mask or the last-accepted indices.
+
+    Args:
+        output_tokens: Sampled ids (any integer dtype), one per required row.
+        required_rows: Packed input row per required row (int32 or int64).
+        input_ids: 1-D input-token storage.
+        num_decode_requests, num_prefill_requests: Request counts.
+        num_speculative_tokens: Drafts per decode request.
+        sampled_tokens_buf, last_accepted_seq_buf, accepted_tokens_per_request,
+            accepted_token_counts: Output buffers, as for `prepare_next_forward_pass`.
+        token_row_indices: Optional packed -> storage row map.
+        pos_ids: Optional position ids indexed like `input_ids`; requires `base_position_buf`.
+        base_position_buf: Receives `pos_ids[last accepted row] + 1` per request.
+    """
+    active_request_count = num_decode_requests + num_prefill_requests
+    if active_request_count == 0:
+        return
+    if input_ids.ndim == 2:
+        input_ids = input_ids.squeeze(0)
+    stride = num_speculative_tokens + 1
+    has_pos = pos_ids is not None
+    assert not has_pos or base_position_buf is not None
+    has_token_row = token_row_indices is not None
+    _verify_and_prepare_next_kernel[(active_request_count,)](
+        output_tokens,
+        required_rows,
+        token_row_indices if has_token_row else required_rows,
+        input_ids,
+        pos_ids if has_pos else input_ids,
+        sampled_tokens_buf,
+        last_accepted_seq_buf,
+        accepted_tokens_per_request,
+        accepted_token_counts,
+        base_position_buf if has_pos else sampled_tokens_buf,
+        accepted_tokens_out_stride=accepted_tokens_per_request.stride(0),
+        num_decode_requests=num_decode_requests,
+        decode_len=num_decode_requests * stride,
+        STRIDE=stride,
+        NUM_SPEC_TOKENS=num_speculative_tokens,
+        BLOCK_SIZE=triton.next_power_of_2(stride),
+        HAS_TOKEN_ROW=has_token_row,
+        HAS_POS_IDS=has_pos,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Kernel 4: Mamba state selective copy (eliminates temporary allocations)
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -622,6 +779,29 @@ def mtp_draft_step_metadata(
 # ---------------------------------------------------------------------------
 # Kernel 6: Attention metadata for the CUDA-graphed MTP commit pass
 # ---------------------------------------------------------------------------
+@dataclass
+class MTPCommitGather:
+    """Inputs gathered by the commit-metadata launch (see `_mtp_commit_step_metadata_kernel`).
+
+    Args:
+        main_hidden (Tensor): [T, 1, H] main-forward hidden states (`num_slots + 1` rows per
+            decode request), last dim contiguous.
+        input_ids (Tensor): [>=T] 1-D input-token storage.
+        last_accepted_rows (Tensor): [>=active] main-forward row of each request's last
+            accepted token.
+        commit_hidden_out (Tensor): [>=padded * num_slots, 1, H] contiguous, main_hidden dtype.
+        commit_tokens_out (Tensor): [>=padded * num_slots] contiguous, input_ids dtype.
+        draft_hidden_out (Tensor): [>=padded, 1, H] contiguous, main_hidden dtype.
+    """
+
+    main_hidden: torch.Tensor
+    input_ids: torch.Tensor
+    last_accepted_rows: torch.Tensor
+    commit_hidden_out: torch.Tensor
+    commit_tokens_out: torch.Tensor
+    draft_hidden_out: torch.Tensor
+
+
 @triton.jit
 def _mtp_commit_step_metadata_kernel(
     # Per-request input (read-only)
@@ -647,25 +827,84 @@ def _mtp_commit_step_metadata_kernel(
     active_request_count,
     padded_count,
     dummy_block_idx,
+    # Optional commit-pass / draft-input gathers (GATHER only)
+    MAIN_HIDDEN_PTR,
+    INPUT_IDS_PTR,
+    LAST_ACCEPTED_ROWS_PTR,
+    COMMIT_HIDDEN_OUT_PTR,
+    COMMIT_TOKENS_OUT_PTR,
+    DRAFT_HIDDEN_OUT_PTR,
+    main_hidden_stride,
+    max_main_hidden_row,
+    max_input_row,
+    hidden_size,
     # Compile-time constants
     SLOTS: tl.constexpr,  # num_speculative_tokens: commit rows per request
     BLOCK_SIZE_TOKENS: tl.constexpr,
     BLOCK_R: tl.constexpr,  # next_power_of_2(padded_count)
     BLOCK_S: tl.constexpr,  # next_power_of_2(SLOTS)
     BLOCK_C: tl.constexpr,  # block-table columns copied per iteration
+    GATHER: tl.constexpr = False,
+    BLOCK_H: tl.constexpr = 1024,  # hidden elements copied per iteration
 ):
     """Write the fixed-shape commit-pass metadata for a decode-only step.
 
-    Grid: (1,). Request r owns token rows r*SLOTS .. r*SLOTS+SLOTS-1. Request r accepted a_r
+    With GATHER, the same launch also builds the commit pass's inputs and the first draft
+    depth's hidden input (each request has `SLOTS + 1` main-forward rows):
+      * tokens:  row r*SLOTS+j = input_ids[min(r*(SLOTS+1)+j+1, max_input_row)], 0 past the
+        real requests;
+      * hidden:  row r*SLOTS+j = main_hidden[min(r*(SLOTS+1)+j, max_main_hidden_row)], 0 past
+        the real requests;
+      * draft hidden: row r = main_hidden[last_accepted_rows[r]], 0 for padding requests.
+    Program 0 writes the metadata and tokens; programs 1.. copy one hidden row each.
+
+    Grid: (1,), or (1 + padded_count * (SLOTS + 1),) with GATHER. Request r owns token rows
+    r*SLOTS .. r*SLOTS+SLOTS-1. Request r accepted a_r
     drafts, so its refreshed run starts at MTP position `start_r = base_r - 1 - a_r`; slot j
     writes position start_r + j when j < a_r and the dummy block otherwise. Every real request
     attends with SLOTS query rows over `start_r + SLOTS` keys, so causal (bottom-right aligned)
     masking lets slot j see keys up to start_r + j. Requests at or past active_request_count are
     padding: dummy-block writes, zero lengths, and a -1 block table.
     """
+    if GATHER:
+        pid = tl.program_id(0)
+        if pid > 0:
+            # Hidden-row copies: commit rows first, then the draft rows.
+            out_row = pid - 1
+            num_commit_rows = padded_count * SLOTS
+            if out_row < num_commit_rows:
+                is_real = out_row < active_request_count * SLOTS
+                req = out_row // SLOTS
+                src_row = tl.minimum(req * (SLOTS + 1) + out_row % SLOTS, max_main_hidden_row).to(
+                    tl.int64
+                )
+                dst = COMMIT_HIDDEN_OUT_PTR + out_row.to(tl.int64) * hidden_size
+            else:
+                req = out_row - num_commit_rows
+                is_real = req < active_request_count
+                src_row = tl.load(LAST_ACCEPTED_ROWS_PTR + req, mask=is_real, other=0).to(tl.int64)
+                dst = DRAFT_HIDDEN_OUT_PTR + req.to(tl.int64) * hidden_size
+            src = MAIN_HIDDEN_PTR + src_row * main_hidden_stride
+            for h_start in range(0, hidden_size, BLOCK_H):
+                h = h_start + tl.arange(0, BLOCK_H)
+                h_mask = h < hidden_size
+                values = tl.load(src + h, mask=h_mask & is_real, other=0.0)
+                tl.store(dst + h, values, mask=h_mask)
+            return
+
     rows = tl.arange(0, BLOCK_R)
     real = rows < active_request_count
     padded = rows < padded_count
+
+    if GATHER:
+        # Commit tokens: the input token one main-forward row after each commit hidden row.
+        g_slots = tl.arange(0, BLOCK_S)
+        g_tokens = rows[:, None] * SLOTS + g_slots[None, :]
+        g_in_range = padded[:, None] & (g_slots < SLOTS)[None, :]
+        g_real = real[:, None] & (g_slots < SLOTS)[None, :]
+        g_src = tl.minimum(rows[:, None] * (SLOTS + 1) + g_slots[None, :] + 1, max_input_row)
+        g_values = tl.load(INPUT_IDS_PTR + g_src.to(tl.int64), mask=g_real, other=0)
+        tl.store(COMMIT_TOKENS_OUT_PTR + g_tokens, g_values, mask=g_in_range)
 
     accepted = tl.load(ACCEPTED_COUNTS_PTR + rows, mask=real, other=0).to(tl.int32)
     base = tl.load(BASE_POSITIONS_PTR + rows, mask=real, other=1).to(tl.int32)
@@ -733,6 +972,7 @@ def mtp_commit_step_metadata(
     num_slots,
     block_size_tokens,
     dummy_block_idx,
+    gather=None,
 ):
     """Launch the graphed commit-pass metadata kernel.
 
@@ -750,6 +990,8 @@ def mtp_commit_step_metadata(
         num_slots: Commit rows per request (`num_speculative_tokens`).
         block_size_tokens: KV block size, in tokens.
         dummy_block_idx: Scratch block that unused and padding rows write to.
+        gather (Optional[MTPCommitGather]): Also build the commit pass's hidden / token inputs
+            and the first draft depth's hidden input in the same launch.
     """
     if padded_count == 0:
         return
@@ -757,7 +999,46 @@ def mtp_commit_step_metadata(
     num_block_columns = gpu_view.mha_block_table.shape[1]
     assert block_table.shape[1] == num_block_columns
 
-    _mtp_commit_step_metadata_kernel[(1,)](
+    if gather is not None:
+        main_hidden = gather.main_hidden
+        hidden_size = main_hidden.shape[-1]
+        assert main_hidden.stride(-1) == 1 and main_hidden[0].numel() == hidden_size
+        assert gather.commit_hidden_out.is_contiguous()
+        assert gather.draft_hidden_out.is_contiguous()
+        assert gather.commit_hidden_out.numel() >= padded_count * num_slots * hidden_size
+        assert gather.draft_hidden_out.numel() >= padded_count * hidden_size
+        assert gather.commit_tokens_out.numel() >= padded_count * num_slots
+        grid = (1 + padded_count * (num_slots + 1),)
+        gather_args = dict(
+            MAIN_HIDDEN_PTR=main_hidden,
+            INPUT_IDS_PTR=gather.input_ids,
+            LAST_ACCEPTED_ROWS_PTR=gather.last_accepted_rows,
+            COMMIT_HIDDEN_OUT_PTR=gather.commit_hidden_out,
+            COMMIT_TOKENS_OUT_PTR=gather.commit_tokens_out,
+            DRAFT_HIDDEN_OUT_PTR=gather.draft_hidden_out,
+            main_hidden_stride=main_hidden.stride(0),
+            max_main_hidden_row=main_hidden.shape[0] - 1,
+            max_input_row=gather.input_ids.shape[0] - 1,
+            hidden_size=hidden_size,
+            GATHER=True,
+            BLOCK_H=min(triton.next_power_of_2(hidden_size), 1024),
+        )
+    else:
+        grid = (1,)
+        gather_args = dict(
+            MAIN_HIDDEN_PTR=accepted_counts,
+            INPUT_IDS_PTR=accepted_counts,
+            LAST_ACCEPTED_ROWS_PTR=accepted_counts,
+            COMMIT_HIDDEN_OUT_PTR=accepted_counts,
+            COMMIT_TOKENS_OUT_PTR=accepted_counts,
+            DRAFT_HIDDEN_OUT_PTR=accepted_counts,
+            main_hidden_stride=0,
+            max_main_hidden_row=0,
+            max_input_row=0,
+            hidden_size=0,
+        )
+
+    _mtp_commit_step_metadata_kernel[grid](
         accepted_counts,
         base_positions,
         block_table,
@@ -777,6 +1058,7 @@ def mtp_commit_step_metadata(
         active_request_count=active_request_count,
         padded_count=padded_count,
         dummy_block_idx=dummy_block_idx,
+        **gather_args,
         SLOTS=num_slots,
         BLOCK_SIZE_TOKENS=block_size_tokens,
         BLOCK_R=triton.next_power_of_2(padded_count),

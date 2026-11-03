@@ -69,8 +69,7 @@ from megatron.core.inference.sampling import FlashInferSampling, Sampling, Torch
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
-    prepare_next_forward_pass,
-    verify_speculative_tokens,
+    verify_and_prepare_next_forward_pass,
 )
 
 
@@ -1082,35 +1081,28 @@ class TextGenerationController(MTPControllerMixin):
         return blocks_to_release, remove_mask
 
     def _sample_from_logits_2d(self, logits_2d: Tensor) -> Tensor:
-        """Sample tokens from 2D logits using existing sampling parameters.
+        """Sample one MTP draft depth from 2D logits using existing sampling parameters.
+
+        The per-request sampling parameters (`Sampling.prepare_draft_sampling_params`) are built
+        on the step's first draft depth and reused by the later depths.
 
         Args:
             logits_2d (Tensor): Logits of shape [num_requests, vocab_size].
 
         Returns:
-            Tensor: Sampled tokens of shape [num_requests].
+            Tensor: Sampled token ids of shape [num_requests] (integer; the backend's native
+            width).
         """
         context = self.inference_wrapped_model.inference_context
         no_top_k, no_top_p = context.active_sampling_filter_flags()
-        return self._sampling.sample_kernel(
-            logits_2d, logits_2d.shape[0], context, no_top_k=no_top_k, no_top_p=no_top_p, eager=True
-        )
-
-    def _verify_speculative_tokens(
-        self,
-        output_tokens: Tensor,
-        input_tokens_required: Tensor,
-        num_decode_requests: int,
-        num_prefill_requests: int,
-        active_request_count: int,
-    ) -> tuple:
-        """Verify speculative tokens against input tokens (Triton kernel)."""
-        return verify_speculative_tokens(
-            input_tokens=input_tokens_required,
-            output_tokens=output_tokens,
-            num_decode_requests=num_decode_requests,
-            num_prefill_requests=num_prefill_requests,
-            num_speculative_tokens=self.num_speculative_tokens,
+        n = logits_2d.shape[0]
+        # The draft loop resets this once per step; the first depth builds it.
+        prepared = getattr(self, "_draft_sampling_params", None)
+        if prepared is None:
+            prepared = self._sampling.prepare_draft_sampling_params(context, n)
+            self._draft_sampling_params = prepared
+        return self._sampling.sample_draft(
+            logits_2d, n, context, prepared=prepared, no_top_k=no_top_k, no_top_p=no_top_p
         )
 
     def _dynamic_step_sample_logits_and_verify_tokens(
@@ -1172,70 +1164,70 @@ class TextGenerationController(MTPControllerMixin):
         num_prefill_requests = context.num_prefill_requests
         num_decode_requests = active_request_count - num_prefill_requests
 
-        # Verify speculative tokens against input tokens.
-        nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
-        input_row_indices = required_logit_indices
-        if token_row_indices is not None:
-            actual_required_count = active_request_count * (self.num_speculative_tokens + 1)
-            input_row_indices = token_row_indices[
-                required_logit_indices[:actual_required_count].long()
-            ]
-        input_tokens_required = input_ids[0, input_row_indices]
-        last_one_indices, accepted_tokens_mask, input_tokens_required = (
-            self._verify_speculative_tokens(
-                output_tokens,
-                input_tokens_required,
-                num_decode_requests,
-                num_prefill_requests,
-                active_request_count,
-            )
-        )
-        nvtx_range_pop("mtp-spec-decoding/verify/verify-tokens")
-
-        nvtx_range_push("mtp-spec-decoding/verify/prepare-next")
-        self._prepare_speculative_tokens_for_next_forward_pass(
-            num_decode_requests,
+        # Verify the drafts and prepare the next forward pass in one launch. The kernel reads
+        # each required row's input token through `required_logit_indices` (and the survivor
+        # map), so no gathered copy of the input tokens is built.
+        nvtx_range_push("mtp-spec-decoding/verify/verify-and-prepare")
+        self._verify_and_prepare_speculative_tokens(
             output_tokens,
-            input_row_indices,
-            last_one_indices,
-            accepted_tokens_mask,
-            input_tokens_required,
+            required_logit_indices,
+            input_ids,
+            num_decode_requests,
+            num_prefill_requests,
+            token_row_indices=token_row_indices,
         )
-        nvtx_range_pop("mtp-spec-decoding/verify/prepare-next")
+        nvtx_range_pop("mtp-spec-decoding/verify/verify-and-prepare")
 
-    def _prepare_speculative_tokens_for_next_forward_pass(
+    def _verify_and_prepare_speculative_tokens(
         self,
+        output_tokens: Tensor,
+        required_logit_indices: Tensor,
+        input_ids: Tensor,
         num_decode_requests: int,
-        output_tokens: torch.Tensor,
-        required_logit_indices: torch.Tensor,
-        last_one_indices: torch.Tensor,
-        accepted_tokens_mask: torch.Tensor,
-        input_tokens_required: torch.Tensor,
-    ):
-        """Prepare accepted speculative tokens for the next forward pass (Triton kernel).
+        num_prefill_requests: int,
+        token_row_indices: Optional[Tensor] = None,
+    ) -> None:
+        """Verify drafts against the sampled tokens and prepare the next forward pass.
+
+        One Triton launch writes the final sampled token, the last accepted row, the accepted
+        drafts and their count per request, and the next draft's base position
+        (`token_to_pos_ids[last accepted row] + 1`, consumed by the async MTP path).
 
         Example:
-          input_tokens_required:  [ a5  a6s  a7s |  b3   b4s  b5s  |  c6  c7s  c8s  |  d2  |  e4  ]
-          Accepted tokens mask    [  1   1    0  |  1     1    1   |   1   0    0   |   1  |   1  ]
-          Accepted tokens         [ [a6s  -1] | [b4s  b5s] | [-1  -1] ]  (decode only; prefill → -1)
-          Accepted token counts   [     1     |      2     |     0    ]  (prefill defaults to 0)
+          input tokens (required rows):  [ a5  a6s  a7s |  b3   b4s  b5s  |  c6  c7s  c8s  |  d2 ]
+          Accepted tokens mask            [  1   1    0  |  1     1    1   |   1   0    0   |   1 ]
+          Accepted tokens                 [ [a6s  -1] | [b4s  b5s] | [-1  -1] | [-1 -1] ]
+          Accepted token counts           [     1     |      2     |     0    |    0    ]
+
+        Args:
+            output_tokens (Tensor): Sampled ids, one per required row.
+            required_logit_indices (Tensor): Packed input row of each required row.
+            input_ids (Tensor): `[1, T]` or `[T]` input-token storage of the pending forward.
+            num_decode_requests (int): Decode requests.
+            num_prefill_requests (int): Prefill requests.
+            token_row_indices (Optional[Tensor]): Storage row of each packed row after async
+                survivor compaction.
         """
-        active_request_count = last_one_indices.shape[0]
-        prepare_next_forward_pass(
-            num_decode_requests=num_decode_requests,
+        active_request_count = num_decode_requests + num_prefill_requests
+        context = self.inference_wrapped_model.inference_context
+        verify_and_prepare_next_forward_pass(
             output_tokens=output_tokens,
-            required_logit_indices=required_logit_indices,
-            last_one_indices=last_one_indices,
-            accepted_tokens_mask=accepted_tokens_mask,
-            input_tokens=input_tokens_required,
+            required_rows=required_logit_indices,
+            input_ids=input_ids,
+            num_decode_requests=num_decode_requests,
+            num_prefill_requests=num_prefill_requests,
+            num_speculative_tokens=self.num_speculative_tokens,
             sampled_tokens_buf=self._sampled_tokens_cuda,
             last_accepted_seq_buf=self._last_accepted_seq_indices_buf,
             accepted_tokens_per_request=self._accepted_tokens_per_request,
             accepted_token_counts=self._accepted_token_counts_per_request,
-            num_speculative_tokens=self.num_speculative_tokens,
+            token_row_indices=token_row_indices,
+            pos_ids=context.gpu_view.token_to_pos_ids,
+            base_position_buf=self._mtp_base_position_buf,
         )
-        # Expose the active slice so downstream code sees the right length.
+        # Expose the active slices so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
+        self._mtp_base_position = self._mtp_base_position_buf[:active_request_count]
 
     def _dynamic_step_sample_logits(self, sequence_lengths: Optional[Tensor] = None):
         """Sample tokens from logits for dynamic batching."""
@@ -2413,10 +2405,8 @@ class TextGenerationController(MTPControllerMixin):
             self._copy_async_sched_accepted_counts_to_cpu(accepted_counts_gpu)
         )
 
-        base_position = (context.gpu_view.token_to_pos_ids[self._last_accepted_seq_indices] + 1).to(
-            torch.int64
-        )
-        self._compute_serial_mtp_and_sample(base_position=base_position)
+        # Written by the verify kernel: token_to_pos_ids[last accepted row] + 1.
+        self._compute_serial_mtp_and_sample(base_position=self._mtp_base_position)
         self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]

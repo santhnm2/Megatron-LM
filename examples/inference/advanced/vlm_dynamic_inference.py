@@ -192,6 +192,19 @@ def _checkpoint_tensor_keys(args, checkpoint_dir=None):
     return dist_checkpointing.load_tensors_metadata(checkpoint_dir).keys()
 
 
+def _checkpoint_uses_legacy_residual_keys(args):
+    """Whether the checkpoint stores wide-residual maps under the pre-split `residual_connection*`
+    module names. Reads the tracker file (all-reduces), so every rank must call it."""
+    if args.ckpt_step is not None:
+        iteration, release = args.ckpt_step, False
+    else:
+        iteration, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+    checkpoint_dir = get_checkpoint_name(args.load, iteration, release, return_base_dir=True)
+    return any(
+        ".residual_connection" in key for key in _checkpoint_tensor_keys(args, checkpoint_dir)
+    )
+
+
 def _mimo_checkpoint_prefix_map(args):
     """Map LLaVAModel key prefixes to the MIMO checkpoint prefixes they load from.
 
@@ -479,6 +492,7 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
     is_mimo = getattr(args, 'mimo_checkpoint_prefix_map', None) is not None
     if is_vlm and is_mimo:
+        args.mimo_legacy_residual_keys = _checkpoint_uses_legacy_residual_keys(args)
         from mimo_checkpoint_model import model_provider  # examples/multimodal
 
         model = _get_model(model_provider, wrap_with_ddp=False)

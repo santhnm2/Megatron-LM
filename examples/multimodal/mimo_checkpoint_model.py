@@ -8,6 +8,7 @@ given, followed by a two-layer MLP projection at the language model width. The m
 state dict uses the checkpoint's MIMO key names, so it loads with the standard checkpoint loader.
 """
 
+import re
 from dataclasses import replace
 
 import torch
@@ -48,6 +49,14 @@ def _unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
 _PROJECTION_ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "fast_gelu": _unfused_fast_gelu}
 
 
+# Wide-residual parameter keys after the read/write split, and the pre-split names they load from:
+# residual_{read,write}{,_self_attn,_mlp}.{read_map,write_map,retention}. ->
+# residual_connection{,_self_attn,_mlp}.{read_map,write_map,retention}.
+_LEGACY_RESIDUAL_KEY = re.compile(
+    r"\.residual_(read|write)(_self_attn|_mlp|)\.(read_map|write_map|retention)\."
+)
+
+
 class MimoCheckpointLLaVAModel(LLaVAModel):
     """LLaVAModel whose sharded state dict uses a MIMO checkpoint's key names.
 
@@ -56,9 +65,12 @@ class MimoCheckpointLLaVAModel(LLaVAModel):
             vision_projection.) to the MIMO checkpoint prefixes they load from.
     """
 
-    def __init__(self, *args, checkpoint_prefix_map: dict, **kwargs):
+    def __init__(
+        self, *args, checkpoint_prefix_map: dict, legacy_residual_keys: bool = False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.checkpoint_prefix_map = checkpoint_prefix_map
+        self.legacy_residual_keys = legacy_residual_keys
         # Checkpoint tensor keys of the latest sharded state dict, i.e. the ones the last load
         # requested (built with that checkpoint's metadata).
         self.sharded_checkpoint_keys = None
@@ -70,6 +82,13 @@ class MimoCheckpointLLaVAModel(LLaVAModel):
             sharded_state_dict,
             {f'{prefix}{key}': value for key, value in self.checkpoint_prefix_map.items()},
         )
+        if self.legacy_residual_keys:
+            # Checkpoints saved before the wide-residual read/write split store each layer's
+            # maps under one `residual_connection*` module. `load_residual_state` remaps those
+            # names for torch state dicts only, so remap the sharded keys for dist checkpoints.
+            for value in nested_values(sharded_state_dict):
+                if isinstance(value, (ShardedTensor, ShardedTensorFactory)):
+                    value.key = _LEGACY_RESIDUAL_KEY.sub(r".residual_connection\2.\3.", value.key)
         self.sharded_checkpoint_keys = {
             value.key
             for value in nested_values(sharded_state_dict)
@@ -160,6 +179,7 @@ def model_provider(
 
     return MimoCheckpointLLaVAModel(
         checkpoint_prefix_map=args.mimo_checkpoint_prefix_map,
+        legacy_residual_keys=getattr(args, 'mimo_legacy_residual_keys', False),
         language_transformer_config=language_config,
         language_transformer_layer_spec=resolve_hybrid_stack_spec(language_model_config),
         language_vocab_size=args.padded_vocab_size,

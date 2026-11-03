@@ -862,6 +862,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "scalar/batched launches, including under side-stream contention.",
     ),
     KernelEntry(
+        name="inference_sampling_params",
+        sources=("megatron/core/inference/sampling/sampling_params_triton.py",),
+        tests=("tests/unit_tests/inference/sampling/test_fused_sampling_prelude.py",),
+        kind="triton",
+        training_path=False,
+        notes="Per-row sampler parameter gather (clamp / sentinel selects, no rounding) checked "
+        "bit-exact against the torch ops it replaces and across repeated launches.",
+    ),
+    KernelEntry(
         name="inference_flashinfer_sampling",
         sources=("megatron/core/inference/sampling/flashinfer_sampling.py",),
         kind="dispatch",

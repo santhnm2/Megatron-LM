@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -85,7 +85,8 @@ class Sampling(ABC):
             cache_key: CUDA graph lookup key.
 
         Returns:
-            Sampled token IDs for all required base and speculative rows.
+            Sampled token IDs for all required base and speculative rows, as an integer tensor
+            (int64 here; backends may return their native id width, e.g. int32 for FlashInfer).
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -103,13 +104,7 @@ class Sampling(ABC):
                 torch.arange(num_decode, num_decode + num_prefill, device=device),
             ]
         )
-        # Batch-level dispatch flags, required by `sample_kernel`. Read from the same
-        # pinned CPU sampling metadata as the controller's filter flags (sync-free): a
-        # filter is absent only when NO active request uses it.
-        active_request_count = context.total_request_count - context.paused_request_count
-        md = context.active_request_metadata
-        no_top_k = bool((md["top_k"][:active_request_count] == 0).all())
-        no_top_p = bool((md["top_p"][:active_request_count] == 0.0).all())
+        no_top_k, no_top_p = self._speculative_filter_flags(context)
         return self.sample_kernel(
             required_logits,
             num_tokens,
@@ -119,6 +114,59 @@ class Sampling(ABC):
             gather_indices=gather_indices,
             token_to_request_index=token_to_request_index,
             eager=True,
+        )
+
+    @staticmethod
+    def _speculative_filter_flags(context) -> Tuple[bool, bool]:
+        """Batch-level `(no_top_k, no_top_p)` dispatch flags for the speculative-verify path.
+
+        Read from the same pinned CPU sampling metadata as the controller's filter flags
+        (sync-free): a filter is absent only when NO active request uses it.
+        """
+        active_request_count = context.total_request_count - context.paused_request_count
+        md = context.active_request_metadata
+        no_top_k = bool((md["top_k"][:active_request_count] == 0).all())
+        no_top_p = bool((md["top_p"][:active_request_count] == 0.0).all())
+        return no_top_k, no_top_p
+
+    def prepare_draft_sampling_params(self, context, n: int) -> Optional[Any]:
+        """Precompute per-request sampling state shared by every MTP draft depth of a step.
+
+        Called once per step before the draft loop; the result is passed to `sample_draft`.
+        Backends without such state return None.
+
+        Args:
+            context: The active DynamicInferenceContext.
+            n: Number of active requests that sample a draft token per depth.
+        """
+        del context, n
+        return None
+
+    def sample_draft(
+        self,
+        logits: Tensor,
+        n: int,
+        context,
+        *,
+        prepared: Optional[Any],
+        no_top_k: bool,
+        no_top_p: bool,
+    ) -> Tensor:
+        """Sample one MTP draft depth (one row per request).
+
+        Args:
+            logits: `[>=n, vocab_size]` draft logits.
+            n: Number of rows to sample.
+            context: The active DynamicInferenceContext.
+            prepared: The value `prepare_draft_sampling_params` returned for this step.
+            no_top_k, no_top_p: Batch-level dispatch flags.
+
+        Returns:
+            `[n]` sampled token ids (integer; the backend's native width).
+        """
+        del prepared
+        return self.sample_kernel(
+            logits, n, context, no_top_k=no_top_k, no_top_p=no_top_p, eager=True
         )
 
     @abstractmethod

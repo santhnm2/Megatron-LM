@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -10,7 +10,16 @@ try:
 except ImportError:
     flashinfer = None
 
+# Fused temperature softmax (`softmax(logits, temperature=...)`).
+_HAVE_FI_SOFTMAX = flashinfer is not None and hasattr(
+    getattr(flashinfer, "sampling", None), "softmax"
+)
+
 from megatron.core.inference.sampling.base import Sampling
+from megatron.core.inference.sampling.sampling_params_triton import (
+    HAVE_TRITON,
+    gather_sampling_params,
+)
 from megatron.core.inference.sampling_params import (
     MIN_SAMPLING_TEMPERATURE,
     is_no_op_top_k,
@@ -43,6 +52,149 @@ class FlashInferSampling(Sampling):
         del config, enable_cuda_graph
         self._vocab_size = vocab_size
         self._rng = rng
+        self._param_bufs = {}
+
+    # ------------------------------------------------------------------
+    # Fused sampling prelude.
+    # ------------------------------------------------------------------
+    def _param_buffers(self, slot: str, num_rows: int, device) -> Tuple[Tensor, Tensor, Tensor]:
+        """Persistent per-row (temperature, top_k, top_p) buffers, grown on demand.
+
+        One buffer set per `slot`, so parameters prepared for the draft depths survive the
+        verify-path sample of the same step.
+        """
+        bufs = self._param_bufs.get(slot)
+        if bufs is None or bufs[0].numel() < num_rows or bufs[0].device != device:
+            capacity = max(num_rows, 64)
+            bufs = (
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity, dtype=torch.int32, device=device),
+                torch.empty(capacity, dtype=torch.float32, device=device),
+            )
+            self._param_bufs[slot] = bufs
+        return tuple(b[:num_rows] for b in bufs)
+
+    def _row_params(
+        self,
+        context,
+        num_rows: int,
+        device,
+        *,
+        slot: str,
+        token_to_request_index: Optional[Tensor] = None,
+        num_decode_requests: Optional[int] = None,
+        rows_per_decode_request: int = 1,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Per-row sampler parameters, built in one launch (see `gather_sampling_params`).
+
+        Returns the clamped temperature and the top-k / top-p with their no-op sentinels
+        replaced, exactly as the unfused gather / clamp / masked_fill ops produced them.
+        """
+        temperature, top_k, top_p = self._param_buffers(slot, num_rows, device)
+        gv = context.gpu_view
+        if HAVE_TRITON and device.type == "cuda":
+            gather_sampling_params(
+                gv.temperature,
+                gv.top_k,
+                gv.top_p,
+                temperature,
+                top_k,
+                top_p,
+                num_rows,
+                vocab_size=self._vocab_size,
+                min_temperature=MIN_SAMPLING_TEMPERATURE,
+                num_decode_requests=num_decode_requests,
+                rows_per_decode_request=rows_per_decode_request,
+                row_to_request=token_to_request_index,
+            )
+            return temperature, top_k, top_p
+        # Reference path (no Triton).
+        if token_to_request_index is None:
+            if num_decode_requests is None:
+                num_decode_requests = -(-num_rows // rows_per_decode_request)
+            num_decode_rows = min(num_decode_requests * rows_per_decode_request, num_rows)
+            token_to_request_index = torch.cat(
+                [
+                    torch.arange(num_decode_requests, device=device).repeat_interleave(
+                        rows_per_decode_request
+                    )[:num_decode_rows],
+                    torch.arange(
+                        num_decode_requests,
+                        num_decode_requests + num_rows - num_decode_rows,
+                        device=device,
+                    ),
+                ]
+            )
+        t = gv.temperature[token_to_request_index].clamp(min=MIN_SAMPLING_TEMPERATURE)
+        k = gv.top_k[token_to_request_index]
+        p = gv.top_p[token_to_request_index]
+        temperature.copy_(t)
+        top_k.copy_(k.masked_fill(is_no_op_top_k(k), self._vocab_size))
+        top_p.copy_(p.masked_fill(is_no_op_top_p(p), 1.0))
+        return temperature, top_k, top_p
+
+    @staticmethod
+    def _temperature_softmax(rows: Tensor, temperature: Tensor) -> Tensor:
+        """fp32 `softmax(rows / temperature)` in one FlashInfer launch.
+
+        Deterministic and RNG-free. FlashInfer upcasts non-fp32 logits before its kernel; with
+        fp32 logits this is a single fused launch.
+        """
+        if _HAVE_FI_SOFTMAX:
+            return flashinfer.sampling.softmax(rows.contiguous(), temperature=temperature)
+        return torch.softmax(rows / temperature.unsqueeze(1), dim=-1)
+
+    def _sample_rows(
+        self,
+        logits: Tensor,
+        n: int,
+        params: Tuple[Tensor, Tensor, Tensor],
+        *,
+        no_top_k: bool,
+        no_top_p: bool,
+        gather_indices: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Sample `n` rows with prepared per-row parameters. Returns FlashInfer's int32 ids.
+
+        The FlashInfer sampling call itself, its arguments, and the generator it advances are
+        unchanged from the unfused path; it always runs eagerly.
+        """
+        temperature, top_k, top_p = params
+        rows = logits[:n] if gather_indices is None else logits[gather_indices[:n], :]
+
+        # `no_top_k` / `no_top_p` are the caller-supplied batch-level dispatch flags:
+        # a filter is absent only when NO active request uses it. Per-row sentinels
+        # disable a filter for a row (top_k=vocab keeps all tokens, top_p=1.0 keeps
+        # the full mass). Every kernel gets `self._rng` so sampling is seeded and its
+        # philox offset advances per launch.
+        if no_top_k and no_top_p:
+            # No filtering: sample the temperature-scaled dist with the Gumbel-race logits
+            # kernel. `bf16 logits / fp32 temperature` promotes to fp32 -- the sampling math
+            # must run in fp32; the assert pins that guarantee.
+            scaled = rows / temperature.unsqueeze(1)
+            assert scaled.dtype == torch.float32, f"sampling math must be fp32, got {scaled.dtype}"
+            return flashinfer.sampling.sampling_from_logits(
+                scaled, deterministic=True, generator=self._rng
+            )
+        if no_top_k:
+            # Top-p only -> dedicated exact nucleus kernel on fp32 probs.
+            probs = self._temperature_softmax(rows, temperature)
+            return flashinfer.sampling.top_p_sampling_from_probs(
+                probs, top_p, deterministic=True, generator=self._rng
+            )
+        if no_top_p:
+            # Top-k only -> dedicated exact top-k kernel on fp32 probs.
+            probs = self._temperature_softmax(rows, temperature)
+            return flashinfer.sampling.top_k_sampling_from_probs(
+                probs, top_k, deterministic=True, generator=self._rng
+            )
+        # Mixed batch (some top-k, some top-p, or requests using both) -> joint
+        # kernel, fed the fp32 temperature-scaled logits.
+        scaled = rows / temperature.unsqueeze(1)
+        assert scaled.dtype == torch.float32, f"sampling math must be fp32, got {scaled.dtype}"
+        return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            scaled, top_k, top_p, deterministic=True, generator=self._rng
+        )
 
     def sample_kernel(
         self,
@@ -58,6 +210,10 @@ class FlashInferSampling(Sampling):
         sequence_lengths: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
+        num_decode_requests: Optional[int] = None,
+        rows_per_decode_request: int = 1,
+        row_params: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+        return_int64: bool = True,
     ) -> Tensor:
         """Sample tokens, dispatching top-p-only / top-k-only / joint by filter flags.
 
@@ -74,72 +230,107 @@ class FlashInferSampling(Sampling):
                 per-token rather than per-request (speculative decoding path).
             output: Optional caller-owned destination tensor of shape `[n]`.
             eager, cache_key: Accepted for API symmetry; ignored (no CUDA graph).
+            num_decode_requests, rows_per_decode_request: Speculative row layout, as an
+                alternative to `token_to_request_index`: `rows_per_decode_request` rows per
+                decode request, then one row per remaining request. The map is computed
+                in-kernel.
+            row_params: Per-row (temperature, top_k, top_p) already prepared for these rows
+                (see `prepare_draft_sampling_params`); skips the parameter launch.
+            return_int64: When False and `output` is None, return FlashInfer's int32 ids
+                without the int64 widening copy.
 
         Returns:
             Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
         del eager, cache_key
-
-        # Per-row sampling params (GPU) for the kernel. gpu_view mirrors the pinned
-        # CPU `active_request_metadata` via the per-step coalesced H2D.
-        gv = context.gpu_view
-        if token_to_request_index is None:
-            temperature = gv.temperature[:n]
-            top_k = gv.top_k[:n]
-            top_p = gv.top_p[:n]
-        else:
-            temperature = gv.temperature[token_to_request_index]
-            top_k = gv.top_k[token_to_request_index]
-            top_p = gv.top_p[token_to_request_index]
-
-        # Temperature scale. `temperature` is a float32 tensor, so `bf16 logits /
-        # temperature` promotes `scaled` to fp32 -- the softmax / nucleus math must
-        # run in fp32 (a bf16 softmax over the vocab loses precision in exactly the
-        # tail region top-p depends on). The assert pins that guarantee.
-        temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
-        if gather_indices is None:
-            scaled = logits[:n] / temperature.unsqueeze(1)
-        else:
-            scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
-        assert scaled.dtype == torch.float32, f"sampling math must be fp32, got {scaled.dtype}"
-
-        # `no_top_k` / `no_top_p` are the caller-supplied batch-level dispatch flags:
-        # a filter is absent only when NO active request uses it. Per-row sentinels
-        # disable a filter for a row (top_k=vocab keeps all tokens, top_p=1.0 keeps
-        # the full mass). Every kernel gets `self._rng` so sampling is seeded and its
-        # philox offset advances per launch.
-        if no_top_k and no_top_p:
-            # No filtering: sample the temperature-scaled dist with the Gumbel-race logits kernel.
-            sampled_tokens = flashinfer.sampling.sampling_from_logits(
-                scaled, deterministic=True, generator=self._rng
-            ).long()
-        elif no_top_k:
-            # Top-p only -> dedicated exact nucleus kernel.
-            probs = torch.softmax(scaled, dim=-1)
-            top_p_safe = top_p.masked_fill(is_no_op_top_p(top_p), 1.0)
-            sampled_tokens = flashinfer.sampling.top_p_sampling_from_probs(
-                probs, top_p_safe, deterministic=True, generator=self._rng
-            ).long()
-        elif no_top_p:
-            # Top-k only -> dedicated exact top-k kernel.
-            probs = torch.softmax(scaled, dim=-1)
-            top_k_safe = top_k.masked_fill(is_no_op_top_k(top_k), self._vocab_size)
-            sampled_tokens = flashinfer.sampling.top_k_sampling_from_probs(
-                probs, top_k_safe, deterministic=True, generator=self._rng
-            ).long()
-        else:
-            # Mixed batch (some top-k, some top-p, or requests using both) -> joint
-            # kernel, fed the temperature-scaled logits.
-            top_k_safe = top_k.masked_fill(is_no_op_top_k(top_k), self._vocab_size)
-            top_p_safe = top_p.masked_fill(is_no_op_top_p(top_p), 1.0)
-            sampled_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                scaled, top_k_safe, top_p_safe, deterministic=True, generator=self._rng
-            ).long()
-
+        if row_params is None:
+            slot = "rows" if num_decode_requests is None else "speculative"
+            row_params = self._row_params(
+                context,
+                n,
+                logits.device,
+                slot=slot,
+                token_to_request_index=token_to_request_index,
+                num_decode_requests=num_decode_requests,
+                rows_per_decode_request=rows_per_decode_request,
+            )
+        sampled_tokens = self._sample_rows(
+            logits,
+            n,
+            row_params,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
+            gather_indices=gather_indices,
+        )
         if output is None:
-            return sampled_tokens
+            return sampled_tokens.long() if return_int64 else sampled_tokens
         output.copy_(sampled_tokens)
         return output
+
+    def sample_speculative(
+        self,
+        required_logits: Tensor,
+        num_decode: int,
+        num_prefill: int,
+        num_speculative_tokens: int,
+        context,
+        *,
+        gather_indices: Optional[Tensor] = None,
+        eager: bool = False,
+        cache_key: Any = None,
+    ) -> Tensor:
+        """Speculative-verify sampling with the token -> request map computed in-kernel.
+
+        Same rows, parameters, dispatch and sampler call as `Sampling.sample_speculative`, but
+        the per-token parameter prelude is a single launch and the result is FlashInfer's int32
+        token ids (no int64 widening copy; the verify kernel reads either width).
+        """
+        del eager, cache_key
+        stride = 1 + num_speculative_tokens
+        no_top_k, no_top_p = self._speculative_filter_flags(context)
+        return self.sample_kernel(
+            required_logits,
+            num_decode * stride + num_prefill,
+            context,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
+            gather_indices=gather_indices,
+            eager=True,
+            num_decode_requests=num_decode,
+            rows_per_decode_request=stride,
+            return_int64=False,
+        )
+
+    def prepare_draft_sampling_params(self, context, n: int) -> Optional[Any]:
+        """Build the per-request parameters once for every MTP draft depth of this step."""
+        if n <= 0:
+            return None
+        device = torch.device("cuda", torch.cuda.current_device())
+        return self._row_params(context, n, device, slot="draft")
+
+    def sample_draft(
+        self,
+        logits: Tensor,
+        n: int,
+        context,
+        *,
+        prepared: Optional[Any],
+        no_top_k: bool,
+        no_top_p: bool,
+    ) -> Tensor:
+        """Sample one draft depth with `prepare_draft_sampling_params`; returns int32 ids."""
+        if prepared is not None and prepared[0].shape[0] != n:
+            prepared = None
+        return self.sample_kernel(
+            logits,
+            n,
+            context,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
+            eager=True,
+            row_params=prepared,
+            return_int64=False,
+        )
 
     def log_probs_kernel(
         self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None

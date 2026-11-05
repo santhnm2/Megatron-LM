@@ -2128,6 +2128,13 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--inference-mtp-verification', type=str, default='rejection',
+                       choices=['exact_match', 'rejection'],
+                       help='How MTP draft tokens are verified. "rejection" uses speculative '
+                       '(rejection) sampling: accept draft x with probability min(1, p(x)/q(x)) '
+                       'and resample from max(0, p - q) on rejection. "exact_match" accepts a '
+                       'draft only if it equals an independently sampled target token. Both are '
+                       'identical for greedy requests.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,

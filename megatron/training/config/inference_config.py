@@ -185,6 +185,10 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
+    inference_mtp_verification: Literal["exact_match", "rejection"] = "rejection"
+    """How MTP draft tokens are verified: "rejection" (speculative rejection sampling) or
+    "exact_match" (accept a draft only if it equals an independent target sample)."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -463,6 +467,7 @@ class InferenceSetupConfig:
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
+            mtp_verification=self.inference_mtp_verification,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,

@@ -189,6 +189,10 @@ class InferenceSetupConfig:
     """How MTP draft tokens are verified: "rejection" (speculative rejection sampling) or
     "exact_match" (accept a draft only if it equals an independent target sample)."""
 
+    inference_mtp_draft_sample_method: Literal["greedy", "probabilistic"] = "greedy"
+    """How MTP draft tokens are chosen: "greedy" (argmax, one-hot draft distribution) or
+    "probabilistic" (sampled from the filtered draft distribution, kept for verification)."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -254,7 +258,6 @@ class InferenceSetupConfig:
     inference_use_synchronous_zmq_collectives: bool = False
     """Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for
     MoEs."""
-
 
     inference_shards: str | None = None
     """Partition the world using comma-separated ``key=value`` fields per shard, with
@@ -468,6 +471,7 @@ class InferenceSetupConfig:
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
             mtp_verification=self.inference_mtp_verification,
+            mtp_draft_sample_method=self.inference_mtp_draft_sample_method,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,

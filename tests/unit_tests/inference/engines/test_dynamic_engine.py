@@ -1445,6 +1445,7 @@ class DynamicEngineTestConfig:
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
     mtp_verification: str = 'rejection'
+    mtp_draft_sample_method: str = 'greedy'
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
@@ -1627,6 +1628,7 @@ class DynamicInferenceEngineTestBase:
                 track_paused_request_events=test_config.track_paused_request_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 mtp_verification=test_config.mtp_verification,
+                mtp_draft_sample_method=test_config.mtp_draft_sample_method,
                 sampling_backend=test_config.sampling_backend,
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,

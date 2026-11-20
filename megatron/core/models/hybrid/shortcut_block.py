@@ -57,6 +57,18 @@ def _get_offloading_interface():
     return FineGrainedActivationOffloadingInterface
 
 
+def _record_stream_tree(value, stream: torch.cuda.Stream) -> None:
+    """Mark every tensor in a (nested) tuple/list/dict as used on ``stream``."""
+    if isinstance(value, torch.Tensor):
+        value.record_stream(stream)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _record_stream_tree(item, stream)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _record_stream_tree(item, stream)
+
+
 def group_layers_into_shortcut_blocks(
     layers: torch.nn.ModuleList,
     layer_config_list: Sequence[TransformerConfig],
@@ -238,17 +250,21 @@ class ShortcutMoEBlock(MegatronModule):
             else IdentityOp()
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+        self.mixer_done_event = torch.cuda.Event() if self.overlap_mode else None
 
     def setup_inference_overlap(self) -> None:
         """Create synchronization state and check stream ownership before graph capture.
 
         The shortcut stream must not issue any collective (see `_forward_inference_overlap`).
-        It runs only the routed experts. At TP>1 require the inference grouped experts, which
+        At TP=1 it runs the mixer and the shared expert, which are local compute; at TP>1 it runs
+        only the routed experts. At TP>1 require the inference grouped experts, which
         communicate only through the NVLS dispatcher on the main stream, rather than trusting
         a custom spec.
         """
         if self.route_ready_event is None:
             self.route_ready_event = torch.cuda.Event()
+        if getattr(self, "mixer_done_event", None) is None:
+            self.mixer_done_event = torch.cuda.Event()
         if get_pg_size(self.tp_group) > 1 and not isinstance(
             getattr(self.moe_layer.mlp, "experts", None), InferenceGroupedMLP
         ):
@@ -524,11 +540,30 @@ class ShortcutMoEBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 recompute_context=None,
             )
+        if get_pg_size(self.tp_group) == 1:
+            return self._overlap_mixer_on_shortcut_stream(
+                hidden_states,
+                route_input,
+                route_probs,
+                main_stream=main_stream,
+                shortcut_stream=shortcut_stream,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                quant_context_factory=quant_context_factory,
+            )
+
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
             dispatched_input, dispatched_probs = self._launch_dispatch(
                 route_input, route_probs, async_op=False
             )
 
-        # Fork after the dispatch: only the experts' local compute runs on the shortcut stream.
+        # TP>1: the mixer and the shared expert issue TP / sequence-parallel collectives, so they
+        # stay on the main stream with every other collective. Fork after the dispatch: only the
+        # experts' local compute runs on the shortcut stream.
         self.route_ready_event.record(main_stream)
         shortcut_stream.wait_event(self.route_ready_event)
         dispatched_input.record_stream(shortcut_stream)
@@ -559,6 +594,80 @@ class ShortcutMoEBlock(MegatronModule):
             )
             routed_output = self._wait_combine(routed_output)
             combined_output = self._launch_combine(routed_output, async_op=False)
+            return self._postprocess(
+                residual=residual,
+                combined_output=combined_output,
+                shared_expert_output=shared_expert_output,
+                mlp_state=mlp_state,
+                packed_seq_params=packed_seq_params,
+                moe_unflatten_mbs=moe_unflatten_mbs,
+                recompute_context=None,
+            )
+
+    def _overlap_mixer_on_shortcut_stream(
+        self,
+        hidden_states,
+        route_input,
+        route_probs,
+        *,
+        main_stream,
+        shortcut_stream,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+        quant_context_factory,
+    ):
+        """TP=1 overlap: the mixer and the shared expert run on the shortcut stream.
+
+        At TP=1 the mixer and the shared expert are local compute: they issue no collective. So
+        the whole routed branch -- dispatch, routed experts and combine, whose collectives
+        spin-wait on their EP peers -- stays on the main stream with every other collective, in
+        the same program order on every rank, and the mixer overlaps all of it (dispatch and
+        combine included) from the shortcut stream.
+
+        Fork after the shortcut read and the router, which read the residual stream the mixer may
+        update; join before the residual write.
+        """
+        self.route_ready_event.record(main_stream)
+        shortcut_stream.wait_event(self.route_ready_event)
+        hidden_states.record_stream(shortcut_stream)
+        with torch.cuda.stream(shortcut_stream):
+            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+                compute_output = self._forward_compute_atomic(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+                shared_expert_output, moe_unflatten_mbs, residual, mlp_state = (
+                    self._moe_shared_experts(
+                        hidden_states=compute_output,
+                        padding_mask=padding_mask,
+                        packed_seq_params=packed_seq_params,
+                        recompute_context=None,
+                    )
+                )
+        self.mixer_done_event.record(shortcut_stream)
+
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+            dispatched_input, dispatched_probs = self._launch_dispatch(
+                route_input, route_probs, async_op=False
+            )
+            routed_output, _ = self.moe_layer.mlp.routed_experts_compute(
+                dispatched_input, dispatched_probs
+            )
+            combined_output = self._launch_combine(routed_output, async_op=False)
+
+        main_stream.wait_event(self.mixer_done_event)
+        _record_stream_tree((shared_expert_output, residual, mlp_state), main_stream)
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
             return self._postprocess(
                 residual=residual,
                 combined_output=combined_output,

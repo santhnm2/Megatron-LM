@@ -227,9 +227,11 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch):
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch, tp_size):
     """Dispatch and combine spin-wait on EP peers, so they must share one stream with every other
-    collective; only the routed experts' local compute may run on the shortcut stream."""
+    collective. At TP=1 the mixer and the shared expert (local compute) run on the shortcut
+    stream; at TP>1 they issue TP collectives, so only the routed experts' local compute may."""
     config = _shortcut_config()
     config.transformer_impl = "inference_optimized"
     config.mlp_chunks_for_prefill = 1
@@ -251,6 +253,7 @@ def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch):
     monkeypatch.setattr(shortcut_module, "NVLSAllGatherVDispatcher", Dispatcher)
     block = ShortcutMoEBlock(Compute(config), _FakeMoE(config), overlap_a2a=False).eval().cuda()
     block.setup_inference_overlap()
+    monkeypatch.setattr(shortcut_module, "get_pg_size", lambda group: tp_size)
     block.moe_layer.mlp.token_dispatcher = Dispatcher()
     side = torch.cuda.Stream()
     monkeypatch.setattr(ShortcutMoEBlock, "_parallel_stream", side)
@@ -301,6 +304,11 @@ def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch):
             quant_context_factory=lambda *args: nullcontext(),
         )
     torch.cuda.synchronize()
-    for name in ("router", "dispatch", "mixer", "shared", "combine"):
+    if tp_size == 1:
+        on_main, on_side = ("router", "dispatch", "experts", "combine"), ("mixer", "shared")
+    else:
+        on_main, on_side = ("router", "dispatch", "mixer", "shared", "combine"), ("experts",)
+    for name in on_main:
         assert streams[name] == main, name
-    assert streams["experts"] == side
+    for name in on_side:
+        assert streams[name] == side, name

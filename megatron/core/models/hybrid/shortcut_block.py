@@ -57,18 +57,6 @@ def _get_offloading_interface():
     return FineGrainedActivationOffloadingInterface
 
 
-def _record_stream_tree(value, stream: torch.cuda.Stream) -> None:
-    """Mark every tensor in a (nested) tuple/list/dict as used on ``stream``."""
-    if isinstance(value, torch.Tensor):
-        value.record_stream(stream)
-    elif isinstance(value, (tuple, list)):
-        for item in value:
-            _record_stream_tree(item, stream)
-    elif isinstance(value, dict):
-        for item in value.values():
-            _record_stream_tree(item, stream)
-
-
 def group_layers_into_shortcut_blocks(
     layers: torch.nn.ModuleList,
     layer_config_list: Sequence[TransformerConfig],
@@ -630,10 +618,28 @@ class ShortcutMoEBlock(MegatronModule):
 
         Fork after the shortcut read and the router, which read the residual stream the mixer may
         update; join before the residual write.
+
+        Allocator safety without ``record_stream``: under CUDA-graph capture a block whose tensor
+        was ``record_stream``'d cannot be reused until no capture is underway, so every layer's
+        cross-stream tensors would stay reserved for the rest of each capture. Instead, lifetimes
+        are ordered by the fork and join events, eagerly and in a captured graph alike:
+
+        - The main-stream tensor the shortcut stream reads (the layer input) is held until after
+          the join is enqueued.
+          Once freed, only main-stream allocations may reuse their blocks, and those run after
+          ``main_stream.wait_event(mixer_done_event)``, i.e. after every shortcut-stream read.
+        - Shortcut-stream tensors the main stream reads (the shared expert's output and the
+          residual state) return, when freed, to the shortcut stream's blocks. The next
+          shortcut-stream work, which is the only work that may reuse them, is enqueued after a
+          ``wait_event`` on a fork event that the main stream records later than every consumer
+          enqueued before the free. While the host enqueues shortcut-stream work, it enqueues
+          nothing on the main stream, so no main-stream consumer can fall between a fork event
+          and a reuse.
         """
+        # Held until the join: the main-stream tensor the shortcut stream reads (see above).
+        shortcut_stream_inputs = hidden_states
         self.route_ready_event.record(main_stream)
         shortcut_stream.wait_event(self.route_ready_event)
-        hidden_states.record_stream(shortcut_stream)
         with torch.cuda.stream(shortcut_stream):
             with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
                 compute_output = self._forward_compute_atomic(
@@ -666,7 +672,7 @@ class ShortcutMoEBlock(MegatronModule):
             combined_output = self._launch_combine(routed_output, async_op=False)
 
         main_stream.wait_event(self.mixer_done_event)
-        _record_stream_tree((shared_expert_output, residual, mlp_state), main_stream)
+        del shortcut_stream_inputs
         with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
             return self._postprocess(
                 residual=residual,

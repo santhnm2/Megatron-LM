@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Sequence
 
 import torch
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
@@ -67,6 +68,61 @@ def _record_stream_tree(value, stream: torch.cuda.Stream) -> None:
     elif isinstance(value, dict):
         for item in value.values():
             _record_stream_tree(item, stream)
+
+
+class _OutputLayout:
+    """The tensor layout of a (nested) tuple/list/dict, to allocate same-layout buffers before it
+    is produced. Tensors that appear more than once share one buffer."""
+
+    def __init__(self, spec, slots, metas):
+        self.spec, self.slots, self.metas = spec, slots, metas
+
+    @staticmethod
+    def of(value) -> "_OutputLayout | None":
+        """The layout of ``value``, or None if it holds a tensor subclass."""
+        leaves, spec = tree_flatten(value)
+        slots, metas, seen = [], [], {}
+        for leaf in leaves:
+            if not isinstance(leaf, torch.Tensor):
+                slots.append(None)
+                continue
+            if type(leaf) is not torch.Tensor:
+                return None
+            if id(leaf) not in seen:
+                seen[id(leaf)] = len(metas)
+                metas.append((leaf.size(), leaf.stride(), leaf.dtype, leaf.device))
+            slots.append(seen[id(leaf)])
+        return _OutputLayout(spec, slots, metas)
+
+    def allocate(self) -> list[torch.Tensor]:
+        """Uninitialized buffers on the current stream."""
+        return [
+            torch.empty_strided(size, stride, dtype=dtype, device=device)
+            for size, stride, dtype, device in self.metas
+        ]
+
+    def copy_into(self, buffers: list[torch.Tensor], value):
+        """``value`` with each tensor copied (on the current stream) into its buffer, or None if
+        ``value`` does not have this layout."""
+        layout = _OutputLayout.of(value)
+        if layout is None or (layout.spec, layout.slots, layout.metas) != (
+            self.spec,
+            self.slots,
+            self.metas,
+        ):
+            return None
+        leaves, _ = tree_flatten(value)
+        copied = set()
+        out = []
+        for leaf, slot in zip(leaves, self.slots):
+            if slot is None:
+                out.append(leaf)
+                continue
+            if slot not in copied:
+                buffers[slot].copy_(leaf)
+                copied.add(slot)
+            out.append(buffers[slot])
+        return tree_unflatten(out, self.spec)
 
 
 def group_layers_into_shortcut_blocks(
@@ -251,6 +307,9 @@ class ShortcutMoEBlock(MegatronModule):
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
         self.mixer_done_event = torch.cuda.Event() if self.overlap_mode else None
+        # TP=1 overlap: layout of the shortcut stream's outputs per input shape (see
+        # `_overlap_mixer_on_shortcut_stream`).
+        self._shortcut_output_layouts: dict = {}
 
     def setup_inference_overlap(self) -> None:
         """Create synchronization state and check stream ownership before graph capture.
@@ -630,10 +689,30 @@ class ShortcutMoEBlock(MegatronModule):
 
         Fork after the shortcut read and the router, which read the residual stream the mixer may
         update; join before the residual write.
+
+        Every tensor that crosses the two streams is owned by the main stream, so no
+        ``record_stream`` is needed. (Under CUDA-graph capture the caching allocator cannot reuse
+        a block with recorded stream uses until no capture is underway, so record_stream'd
+        cross-stream tensors would stay reserved for the rest of each capture.)
+
+        - Outputs: before the fork, the main stream allocates buffers with the layout this block's
+          shortcut-stream outputs had at this input shape, and the shortcut stream copies its
+          outputs (the shared expert's output and the residual state) into them. They are freed on
+          the main stream after its consumers; the shortcut stream wrote them before the join.
+          The shortcut stream's own tensors are freed on the shortcut stream after its last use
+          there. The first call at an input shape (an eager warmup forward before capture) learns
+          the layout and record_streams its outputs instead.
+        - Input: the main-stream tensor the shortcut stream reads (the layer input) is held until
+          the join is enqueued, so any main-stream reuse of its block runs after every
+          shortcut-stream read.
         """
+        # Held until the join: the main-stream tensor the shortcut stream reads (see above).
+        shortcut_stream_inputs = hidden_states
+        layout_key = (tuple(hidden_states.shape), hidden_states.dtype)
+        layout = self._shortcut_output_layouts.get(layout_key)
+        output_buffers = layout.allocate() if layout is not None else None
         self.route_ready_event.record(main_stream)
         shortcut_stream.wait_event(self.route_ready_event)
-        hidden_states.record_stream(shortcut_stream)
         with torch.cuda.stream(shortcut_stream):
             with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
                 compute_output = self._forward_compute_atomic(
@@ -654,6 +733,15 @@ class ShortcutMoEBlock(MegatronModule):
                         recompute_context=None,
                     )
                 )
+            outputs = (shared_expert_output, residual, mlp_state)
+            owned = layout.copy_into(output_buffers, outputs) if layout is not None else None
+            if owned is None:
+                layout = _OutputLayout.of(outputs)
+                if layout is not None:
+                    self._shortcut_output_layouts[layout_key] = layout
+            else:
+                outputs = owned
+            del compute_output, shared_expert_output, residual, mlp_state, output_buffers
         self.mixer_done_event.record(shortcut_stream)
 
         with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
@@ -666,7 +754,10 @@ class ShortcutMoEBlock(MegatronModule):
             combined_output = self._launch_combine(routed_output, async_op=False)
 
         main_stream.wait_event(self.mixer_done_event)
-        _record_stream_tree((shared_expert_output, residual, mlp_state), main_stream)
+        del shortcut_stream_inputs
+        if owned is None:
+            _record_stream_tree(outputs, main_stream)
+        shared_expert_output, residual, mlp_state = outputs
         with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
             return self._postprocess(
                 residual=residual,

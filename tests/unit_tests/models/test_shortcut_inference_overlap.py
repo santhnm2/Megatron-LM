@@ -312,3 +312,108 @@ def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch, tp_si
         assert streams[name] == main, name
     for name in on_side:
         assert streams[name] == side, name
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tp1_overlap_captures_without_cross_stream_record_stream(monkeypatch):
+    """At TP=1 tensors cross between the main and the shortcut stream. A record_stream'd block
+    freed during CUDA-graph capture cannot be reused until no capture is underway, so captures
+    must not record stream uses; back-to-back captures into one pool then reserve no more."""
+    config = _shortcut_config()
+    config.transformer_impl = "inference_optimized"
+    config.mlp_chunks_for_prefill = 1
+    context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=True),
+        is_dynamic_batching=lambda: True,
+        is_decode_only=lambda: True,
+        num_speculative_tokens=0,
+    )
+
+    class Dispatcher:
+        pass
+
+    class Compute(_FakeCompute):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states * 2 + 1
+
+    monkeypatch.setattr(shortcut_module, "MambaLayer", Compute)
+    monkeypatch.setattr(shortcut_module, "NVLSAllGatherVDispatcher", Dispatcher)
+    block = ShortcutMoEBlock(Compute(config), _FakeMoE(config), overlap_a2a=False).eval().cuda()
+    block.setup_inference_overlap()
+    monkeypatch.setattr(shortcut_module, "get_pg_size", lambda group: 1)
+    block.moe_layer.mlp.token_dispatcher = Dispatcher()
+    side = torch.cuda.Stream()
+    monkeypatch.setattr(ShortcutMoEBlock, "_parallel_stream", side)
+    monkeypatch.setattr(block, "_read_shortcut_hidden", lambda hidden, **kwargs: hidden)
+    monkeypatch.setattr(
+        block,
+        "_moe_router_preprocess",
+        lambda shortcut_hidden, **kwargs: (shortcut_hidden * 3, torch.ones_like(shortcut_hidden)),
+    )
+    monkeypatch.setattr(block, "_launch_dispatch", lambda h, p, *, async_op=False: (h * 2, p))
+    monkeypatch.setattr(block, "_launch_combine", lambda out, *, async_op=False: out * 4)
+    block.moe_layer.mlp.routed_experts_compute = lambda h, p: (h + p, None)
+    monkeypatch.setattr(
+        block,
+        "_moe_shared_experts",
+        lambda hidden_states, **kwargs: (hidden_states * 3, None, hidden_states + 1, None),
+    )
+    monkeypatch.setattr(
+        block,
+        "_postprocess",
+        lambda residual, combined_output, shared_expert_output, *args, **kwargs: combined_output
+        + shared_expert_output
+        + residual,
+    )
+    captured_record_streams = []
+    record_stream = torch.Tensor.record_stream
+
+    def counting_record_stream(tensor, stream):
+        if torch.cuda.is_current_stream_capturing():
+            captured_record_streams.append(tuple(tensor.shape))
+        return record_stream(tensor, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", counting_record_stream)
+    # 2 MiB per activation: the allocator's large-block pool, as in real prefill graphs.
+    hidden = torch.randn(1 << 16, 1, config.hidden_size, device="cuda")
+    kwargs = dict(
+        hidden_states=hidden,
+        attention_mask=None,
+        inference_context=context,
+        rotary_pos_emb=None,
+        sequence_len_offset=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        quant_context_factory=lambda *args: nullcontext(),
+    )
+
+    def pool_reserved(pool):
+        return sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if tuple(segment.get("segment_pool_id") or ()) == tuple(pool)
+        )
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    pool = torch.cuda.graph_pool_handle()
+    graphs, reserved = [], []
+    with torch.inference_mode(), InferenceMode.active():
+        with torch.cuda.stream(capture_stream):
+            expected = block(**kwargs)
+            block(**kwargs)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        for _ in range(4):
+            # Like the engine's graph loop: each graph keeps the pool, earlier outputs are dropped.
+            output = None
+            graphs.append(torch.cuda.CUDAGraph())
+            with torch.cuda.graph(graphs[-1], pool=pool, stream=capture_stream):
+                output = block(**kwargs)
+            reserved.append(pool_reserved(pool))
+        torch.cuda.synchronize()
+        graphs[-1].replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert not captured_record_streams
+    assert reserved[1:] == reserved[:1] * 3, reserved
